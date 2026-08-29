@@ -71,6 +71,14 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.exam_id IS NOT DISTINCT FROM NEW.exam_id
+       AND OLD.session_id IS NOT DISTINCT FROM NEW.session_id
+       AND OLD.owner_id IS NOT DISTINCT FROM NEW.owner_id
+       AND OLD.course_id IS NOT DISTINCT FROM NEW.course_id THEN
+        RETURN NEW;
+    END IF;
+
     DELETE FROM ai_jobs job
     USING exam_resources resource
     WHERE job.exam_resource_id = resource.id
@@ -86,6 +94,9 @@ BEGIN
       AND page.owner_id = OLD.owner_id
       AND page.course_id = OLD.course_id
       AND page.session_id = OLD.session_id;
+    IF TG_OP = 'UPDATE' THEN
+        RETURN NEW;
+    END IF;
     RETURN OLD;
 END;
 $$;
@@ -93,6 +104,29 @@ $$;
 CREATE TRIGGER exam_session_members_dependents_cleanup
 AFTER DELETE ON exam_session_members
 FOR EACH ROW EXECUTE FUNCTION delete_exam_session_dependents();
+
+CREATE TRIGGER exam_session_members_dependents_update_cleanup
+AFTER UPDATE OF exam_id, session_id, owner_id, course_id ON exam_session_members
+FOR EACH ROW EXECUTE FUNCTION delete_exam_session_dependents();
+
+CREATE FUNCTION delete_exam_resource_dependents_on_exam_change()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.exam_id IS NOT DISTINCT FROM NEW.exam_id THEN
+        RETURN NEW;
+    END IF;
+
+    DELETE FROM ai_jobs WHERE exam_resource_id = OLD.id;
+    DELETE FROM document_pages WHERE exam_resource_id = OLD.id;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER exam_resources_dependents_update_cleanup
+AFTER UPDATE OF exam_id ON exam_resources
+FOR EACH ROW EXECUTE FUNCTION delete_exam_resource_dependents_on_exam_change();
 
 CREATE TABLE device_tokens (
     id uuid PRIMARY KEY,

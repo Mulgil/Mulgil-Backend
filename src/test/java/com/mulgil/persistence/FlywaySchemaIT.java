@@ -89,7 +89,9 @@ class FlywaySchemaIT {
                         SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN (
                             'document_pages_exam_session_check', 'content_blocks_source_check',
                             'content_blocks_exam_session_check', 'ai_jobs_exam_session_check',
-                            'exam_session_members_dependents_cleanup', 'quiz_attempts_immutable')
+                            'exam_session_members_dependents_cleanup',
+                            'exam_session_members_dependents_update_cleanup',
+                            'exam_resources_dependents_update_cleanup', 'quiz_attempts_immutable')
                         """).query(Integer.class).single();
 
         assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008");
@@ -98,7 +100,7 @@ class FlywaySchemaIT {
         assertThat(jobColumns).isEqualTo(6);
         assertThat(nullableSourceParents).isEqualTo(4);
         assertThat(requiredConstraints).isEqualTo(6);
-        assertThat(requiredTriggers).isEqualTo(6);
+        assertThat(requiredTriggers).isEqualTo(8);
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
                         + "jobColumns=%d nullablePageBlockParents=%d result=PASS%n", versions, requiredTables,
                 requiredIndexes.size(), requiredConstraints, requiredTriggers, jobColumns, nullableSourceParents);
@@ -144,15 +146,36 @@ class FlywaySchemaIT {
 
     @Test
     void removesPastExamData_whenSelectedSessionMembershipIsRemoved() {
-        UUID pageId = fixture.insertPastExamPage(UUID.randomUUID(), 1);
-        fixture.insertPastExamBlockAndChunk(pageId);
-        fixture.insertExamResourceJob(UUID.randomUUID(), fixture.sessionId(), "selected-session");
+        fixture.insertPastExamDependents();
 
         fixture.deleteExamSessionMembership();
 
         assertThat(fixture.examSessionMembershipCount()).isZero();
-        assertThat(fixture.orphanPastExamDependentCount()).isZero();
+        assertThat(fixture.pastExamDependentCount()).isZero();
         System.out.println("SCHEMA_LIFECYCLE scenario=selectedSessionRemoval dependents=0 result=PASS");
+    }
+
+    @Test
+    void removesPastExamData_whenSelectedSessionMembershipChanges() {
+        fixture.insertPastExamDependents();
+        UUID newSessionId = fixture.createUnselectedSession();
+
+        fixture.updateExamSessionMembership(newSessionId);
+
+        assertThat(fixture.examSessionMembershipCount()).isZero();
+        assertThat(fixture.examSessionMembershipCount(newSessionId)).isOne();
+        assertThat(fixture.pastExamDependentCount()).isZero();
+        System.out.println("SCHEMA_LIFECYCLE scenario=selectedSessionUpdate dependents=0 result=PASS");
+    }
+
+    @Test
+    void removesPastExamData_whenExamResourceMovesToAnotherExam() {
+        fixture.insertPastExamDependents();
+
+        fixture.moveExamResourceToNewExam();
+
+        assertThat(fixture.pastExamDependentCount()).isZero();
+        System.out.println("SCHEMA_LIFECYCLE scenario=examResourceExamUpdate dependents=0 result=PASS");
     }
 
     @Test

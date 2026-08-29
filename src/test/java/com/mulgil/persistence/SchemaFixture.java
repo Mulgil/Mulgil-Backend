@@ -86,6 +86,12 @@ final class SchemaFixture {
                 .param("hash", "5".repeat(64)).param("now", now()).update();
     }
 
+    void insertPastExamDependents() {
+        UUID pageId = insertPastExamPage(UUID.randomUUID(), 1);
+        insertPastExamBlockAndChunk(pageId);
+        insertExamResourceJob(UUID.randomUUID(), sessionId, "selected-session-" + UUID.randomUUID());
+    }
+
     UUID createUnselectedSession() {
         UUID id = UUID.randomUUID();
         jdbc.sql("""
@@ -211,37 +217,47 @@ final class SchemaFixture {
                 .param("exam", examId).param("session", sessionId).update();
     }
 
-    int examSessionMembershipCount() {
-        return jdbc.sql("SELECT count(*) FROM exam_session_members WHERE exam_id = :exam AND session_id = :session")
-                .param("exam", examId).param("session", sessionId).query(Integer.class).single();
+    void updateExamSessionMembership(UUID targetSessionId) {
+        jdbc.sql("""
+                        UPDATE exam_session_members SET session_id = :target
+                        WHERE exam_id = :exam AND session_id = :session
+                        """).param("target", targetSessionId).param("exam", examId).param("session", sessionId)
+                .update();
     }
 
-    int orphanPastExamDependentCount() {
+    void moveExamResourceToNewExam() {
+        UUID newExamId = UUID.randomUUID();
+        jdbc.sql("""
+                        INSERT INTO exams (id, owner_id, course_id, title, exam_at, created_at, updated_at)
+                        VALUES (:id, :owner, :course, 'Moved Exam', :now, :now, :now)
+                        """).param("id", newExamId).param("owner", ownerId).param("course", courseId)
+                .param("now", now()).update();
+        jdbc.sql("UPDATE exam_resources SET exam_id = :newExam WHERE id = :resource")
+                .param("newExam", newExamId).param("resource", examResourceId).update();
+    }
+
+    int examSessionMembershipCount() {
+        return examSessionMembershipCount(sessionId);
+    }
+
+    int examSessionMembershipCount(UUID targetSessionId) {
+        return jdbc.sql("SELECT count(*) FROM exam_session_members WHERE exam_id = :exam AND session_id = :session")
+                .param("exam", examId).param("session", targetSessionId).query(Integer.class).single();
+    }
+
+    int pastExamDependentCount() {
         return jdbc.sql("""
                         SELECT
                             (SELECT count(*) FROM document_pages dp
-                             WHERE dp.exam_resource_id = :examResource
-                               AND NOT EXISTS (
-                                   SELECT 1 FROM exam_session_members esm
-                                   WHERE esm.exam_id = :exam AND esm.session_id = dp.session_id))
+                             WHERE dp.exam_resource_id = :examResource)
                           + (SELECT count(*) FROM ai_jobs j
-                             WHERE j.exam_resource_id = :examResource
-                               AND NOT EXISTS (
-                                   SELECT 1 FROM exam_session_members esm
-                                   WHERE esm.exam_id = :exam AND esm.session_id = j.session_id))
+                             WHERE j.exam_resource_id = :examResource)
                           + (SELECT count(*) FROM content_blocks block
-                             WHERE block.exam_resource_id = :examResource
-                               AND NOT EXISTS (
-                                   SELECT 1 FROM exam_session_members esm
-                                   WHERE esm.exam_id = :exam AND esm.session_id = block.session_id))
+                             WHERE block.exam_resource_id = :examResource)
                           + (SELECT count(*) FROM chunks chunk
                              JOIN content_blocks block ON block.id = chunk.content_block_id
-                             WHERE block.exam_resource_id = :examResource
-                               AND NOT EXISTS (
-                                   SELECT 1 FROM exam_session_members esm
-                                   WHERE esm.exam_id = :exam AND esm.session_id = chunk.session_id))
-                        """).param("examResource", examResourceId).param("exam", examId)
-                .query(Integer.class).single();
+                             WHERE block.exam_resource_id = :examResource)
+                        """).param("examResource", examResourceId).query(Integer.class).single();
     }
 
     UUID insertQuizAttempt() {
