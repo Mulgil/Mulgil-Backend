@@ -40,12 +40,12 @@ final class ResourceUploadController {
     }
 
     @PostMapping("/materials/{materialId}/upload-complete")
-    ResponseEntity<Void> materialUploadComplete(
+    ResponseEntity<com.mulgil.job.JobQueue.JobAccepted> materialUploadComplete(
             @PathVariable UUID materialId,
             @Valid @RequestBody UploadCompleteRequest request
     ) {
-        service.finalizeMaterial(CurrentUser.id(), materialId, request.checksumSha256());
-        return ResponseEntity.noContent().build();
+        return ResponseEntity.accepted()
+                .body(service.finalizeMaterial(CurrentUser.id(), materialId, request.checksumSha256()));
     }
 
     @GetMapping("/sessions/{sessionId}/materials")

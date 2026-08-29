@@ -90,8 +90,15 @@ class ResourceUploadApiIT {
         storage.directPut(materialId, "application/pdf", 1024, PDF_CHECKSUM);
         probe.pdf(materialId, 12, PDF_CHECKSUM);
 
-        successful(post("/api/v1/materials/" + materialId + "/upload-complete",
-                owner, Map.of("checksumSha256", PDF_CHECKSUM)), 204);
+        JsonNode materialJob = successful(post("/api/v1/materials/" + materialId + "/upload-complete",
+                owner, Map.of("checksumSha256", PDF_CHECKSUM)), 202);
+        assertThat(materialJob.path("jobId").isTextual()).isTrue();
+        assertThat(materialJob.path("status").asText()).isEqualTo("queued");
+        JsonNode polled = successful(get("/api/v1/jobs/" + materialJob.path("jobId").asText(), owner), 200);
+        assertThat(polled.path("type").asText()).isEqualTo("pdf_extract");
+        assertThat(successful(get("/api/v1/sessions/" + ids.sessionId() + "/jobs", owner), 200)).hasSize(1);
+        assertError(get("/api/v1/jobs/" + materialJob.path("jobId").asText(), login("job-foreigner")),
+                404, "JOB_NOT_FOUND");
         JsonNode materials = successful(get("/api/v1/sessions/" + ids.sessionId() + "/materials", owner), 200);
         assertThat(materials).hasSize(1);
         assertThat(materials.get(0).path("status").asText()).isEqualTo("uploaded");
@@ -116,8 +123,41 @@ class ResourceUploadApiIT {
         assertThat(examResource.toString()).doesNotContain("objectKey").doesNotContain("owner/");
 
         assertThat(storage.apiBodyBytes()).isZero();
-        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isZero();
-        recordHttp("directPdfAndPastExam", "201,204,200", "uploaded;noObjectKey;noJob;apiBodyBytes=0");
+        assertThat(jdbc.sql("""
+                        SELECT count(*) FROM ai_jobs WHERE job_type='pdf_extract' AND status='queued'
+                          AND (material_id=:material OR exam_resource_id=:examResource)
+                        """).param("material", java.util.UUID.fromString(materialId))
+                .param("examResource", java.util.UUID.fromString(examResourceId))
+                .query(Integer.class).single()).isEqualTo(2);
+        jdbc.sql("""
+                        UPDATE ai_jobs SET status='failed', attempt_count=max_attempts,
+                            error_code='PROVIDER_TIMEOUT', error_message='Provider timed out.', finished_at=now()
+                        WHERE id=:id
+                        """).param("id", java.util.UUID.fromString(materialJob.path("jobId").asText())).update();
+        assertError(post("/api/v1/jobs/" + materialJob.path("jobId").asText() + "/retry", owner, Map.of()),
+                409, "JOB_NOT_RETRYABLE");
+        recordHttp("directPdfAndPastExam", "201,202,200,409",
+                "uploaded;noObjectKey;twoPdfExtractJobs;ownerPolling;retryCeiling;apiBodyBytes=0");
+    }
+
+    @Test
+    void keepsExamResourcePending_whenCompletionCannotEnqueue() throws Exception {
+        String owner = login("orphaned-exam-resource-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        String resourceId = successful(post("/api/v1/exams/" + ids.examId() + "/resources", owner,
+                Map.of("filename", "past-exam.pdf", "mimeType", "application/pdf", "byteSize", 100)), 201)
+                .path("id").asText();
+        jdbc.sql("DELETE FROM exam_session_members WHERE exam_id=:exam")
+                .param("exam", java.util.UUID.fromString(ids.examId())).update();
+        storage.directPut(resourceId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(resourceId, 1, PDF_CHECKSUM);
+
+        assertError(post("/api/v1/exam-resources/" + resourceId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 404, "JOB_NOT_FOUND");
+
+        assertThat(jdbc.sql("SELECT status FROM exam_resources WHERE id=:id")
+                .param("id", java.util.UUID.fromString(resourceId)).query(String.class).single())
+                .isEqualTo("created");
     }
 
     @Test

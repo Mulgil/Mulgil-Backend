@@ -2,6 +2,7 @@ package com.mulgil.resource;
 
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.common.error.ApiException;
+import com.mulgil.job.JobQueue;
 import com.mulgil.storage.CloudStoragePort;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -25,14 +26,16 @@ class ResourceUploadService {
     private final CloudStoragePort storage;
     private final MulgilProperties properties;
     private final Clock clock;
+    private final JobQueue jobs;
 
     ResourceUploadService(ResourceRepository repository, ResourceFinalizationService finalization,
-                          CloudStoragePort storage, MulgilProperties properties, Clock clock) {
+                          CloudStoragePort storage, MulgilProperties properties, Clock clock, JobQueue jobs) {
         this.repository = repository;
         this.finalization = finalization;
         this.storage = storage;
         this.properties = properties;
         this.clock = clock;
+        this.jobs = jobs;
     }
 
     @Transactional
@@ -51,13 +54,15 @@ class ResourceUploadService {
         return uploadUrl(material.id(), material.objectKey(), material.mimeType(), material.byteSize());
     }
 
-    void finalizeMaterial(UUID ownerId, UUID materialId, String checksum) {
+    @Transactional
+    JobQueue.JobAccepted finalizeMaterial(UUID ownerId, UUID materialId, String checksum) {
         ResourceRepository.Material material = repository.material(ownerId, materialId)
                 .orElseThrow(ResourceUploadService::notFound);
         ResourceContentProbe.PdfInspection inspection = finalization.finalizePdf(
                 descriptor(material.objectKey(), material.mimeType(), material.byteSize()), checksum);
         validatePages(inspection.pageCount());
         repository.finalizeMaterial(ownerId, materialId, inspection.pageCount(), checksum.toLowerCase(), clock.instant());
+        return jobs.enqueuePdfMaterial(ownerId, materialId);
     }
 
     List<Material> materials(UUID ownerId, UUID sessionId) {
@@ -84,14 +89,17 @@ class ResourceUploadService {
         return uploadUrl(resource.id(), resource.objectKey(), resource.mimeType(), resource.byteSize());
     }
 
+    @Transactional
     ExamResource finalizeExamResource(UUID ownerId, UUID resourceId, String checksum) {
         ResourceRepository.ExamResource resource = repository.examResource(ownerId, resourceId)
                 .orElseThrow(ResourceUploadService::notFound);
         ResourceContentProbe.PdfInspection inspection = finalization.finalizePdf(
                 descriptor(resource.objectKey(), resource.mimeType(), resource.byteSize()), checksum);
         validatePages(inspection.pageCount());
-        return examResource(repository.finalizeExamResource(ownerId, resourceId, inspection.pageCount(),
-                checksum.toLowerCase(), clock.instant()));
+        ExamResource completed = examResource(repository.finalizeExamResource(ownerId, resourceId,
+                inspection.pageCount(), checksum.toLowerCase(), clock.instant()));
+        jobs.enqueuePdfExamResource(ownerId, resourceId);
+        return completed;
     }
 
     UploadUrl issueRecordingUpload(UUID ownerId, RecordingUpload request) {
