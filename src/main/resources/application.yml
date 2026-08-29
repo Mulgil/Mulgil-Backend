@@ -1,0 +1,62 @@
+spring:
+  application:
+    name: mulgil-backend
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/mulgil}
+    username: ${DATABASE_USERNAME:}
+    password: ${DATABASE_PASSWORD:}
+    hikari:
+      connection-init-sql: SET TIME ZONE 'UTC'
+  jackson:
+    time-zone: UTC
+  flyway:
+    enabled: true
+
+mulgil:
+  jwt:
+    secret-base64: ${JWT_HS256_SECRET_BASE64}
+    issuer: ${JWT_ISSUER:mulgil-api}
+    audience: ${JWT_AUDIENCE:mulgil-mobile}
+    key-id: ${JWT_KEY_ID:demo-v1}
+    access-ttl-seconds: ${JWT_ACCESS_TTL_SECONDS:900}
+    refresh-ttl-days: ${JWT_REFRESH_TTL_DAYS:14}
+  google:
+    oauth-client-id: ${GOOGLE_OAUTH_CLIENT_ID}
+    cloud-project: ${GOOGLE_CLOUD_PROJECT}
+    cloud-location: ${GOOGLE_CLOUD_LOCATION:global}
+  gcs:
+    bucket: ${GCS_BUCKET}
+    signed-url-ttl-seconds: ${GCS_SIGNED_URL_TTL_SECONDS:900}
+  vision:
+    feature: ${VISION_FEATURE:DOCUMENT_TEXT_DETECTION}
+  speech:
+    location: ${SPEECH_LOCATION:us}
+    api-endpoint: ${SPEECH_API_ENDPOINT:us-speech.googleapis.com}
+    model: ${SPEECH_MODEL:chirp_3}
+  vertex:
+    generation-model: ${VERTEX_GENERATION_MODEL:gemini-2.5-flash}
+    embedding-model: ${VERTEX_EMBEDDING_MODEL:text-multilingual-embedding-002}
+  fcm:
+    enabled: ${FCM_ENABLED:true}
+  ocr:
+    min-embedded-text-characters: ${MIN_EMBEDDED_TEXT_CHARACTERS:80}
+    image-coverage-threshold: ${OCR_IMAGE_COVERAGE_THRESHOLD:0.50}
+    handwriting-confidence-threshold: ${HANDWRITING_OCR_CONFIDENCE_THRESHOLD:0.80}
+  jobs:
+    max-retry: ${MAX_JOB_RETRY:2}
+    lease-seconds: ${JOB_LEASE_SECONDS:60}
+    provider-timeout-seconds: ${PROVIDER_TIMEOUT_SECONDS:60}
+  uploads:
+    max-pdf-bytes: ${MAX_PDF_BYTES:52428800}
+    max-pdf-pages: ${MAX_PDF_PAGES:150}
+    max-pdfs-per-session: ${MAX_PDFS_PER_SESSION:5}
+    max-audio-duration-seconds: ${MAX_AUDIO_DURATION_SECONDS:10800}
+    stt-segment-duration-seconds: ${STT_SEGMENT_DURATION_SECONDS:1140}
+    recording-mime-types: ${APP_RECORDING_MIME_TYPES:audio/mp4,audio/m4a}
+    ffmpeg-path: ${FFMPEG_PATH:ffmpeg}
+  demo:
+    cache-enabled: ${DEMO_AI_CACHE_ENABLED:true}
+    max-ai-jobs-per-day: ${MAX_AI_JOBS_PER_DAY:30}
+  notifications:
+    post-class-reminder-hours: ${POST_CLASS_REMINDER_HOURS:3}
+    exam-reminder-days: ${EXAM_REMINDER_DAYS:14,2,1}

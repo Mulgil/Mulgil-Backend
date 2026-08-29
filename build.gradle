@@ -1,0 +1,63 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.5'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.mulgil'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    set('testcontainers.version', '1.21.3')
+    set('googleCloudLibrariesVersion', '26.67.0')
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "com.google.cloud:libraries-bom:${googleCloudLibrariesVersion}"
+        mavenBom "org.testcontainers:testcontainers-bom:${property('testcontainers.version')}"
+    }
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.flywaydb:flyway-database-postgresql'
+    implementation 'org.postgresql:postgresql'
+    implementation 'com.pgvector:pgvector:0.1.6'
+    implementation 'org.apache.pdfbox:pdfbox:3.0.5'
+    implementation 'com.nimbusds:nimbus-jose-jwt:10.5'
+    implementation 'com.google.api-client:google-api-client:2.8.1'
+    implementation 'com.google.cloud:google-cloud-storage'
+    implementation 'com.google.cloud:google-cloud-vision'
+    implementation 'com.google.cloud:google-cloud-speech'
+    implementation 'com.google.cloud:google-cloud-vertexai'
+    implementation 'com.google.firebase:firebase-admin:9.5.0'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.boot:spring-boot-testcontainers'
+    testImplementation 'org.testcontainers:junit-jupiter'
+    testImplementation 'org.testcontainers:postgresql'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    systemProperty 'api.version', '1.40'
+    testLogging {
+        events 'passed', 'failed'
+        showStandardStreams = true
+    }
+}

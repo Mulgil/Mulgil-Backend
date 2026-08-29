@@ -1,0 +1,15 @@
+spring:
+  docker:
+    compose:
+      enabled: false
+
+mulgil:
+  jwt:
+    secret-base64: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+  google:
+    oauth-client-id: smoke-google-client
+    cloud-project: smoke-project
+  gcs:
+    bucket: smoke-bucket
+  fcm:
+    enabled: false
