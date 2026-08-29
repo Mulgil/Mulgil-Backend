@@ -116,12 +116,7 @@ class ResourceUploadApiIT {
         assertThat(examResource.toString()).doesNotContain("objectKey").doesNotContain("owner/");
 
         assertThat(storage.apiBodyBytes()).isZero();
-        assertThat(jdbc.sql("""
-                        SELECT EXISTS (
-                            SELECT 1 FROM information_schema.tables
-                            WHERE table_schema = 'public' AND table_name = 'ai_jobs'
-                        )
-                        """).query(Boolean.class).single()).isFalse();
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isZero();
         recordHttp("directPdfAndPastExam", "201,204,200", "uploaded;noObjectKey;noJob;apiBodyBytes=0");
     }
 
