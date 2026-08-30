@@ -176,9 +176,13 @@ class GenerationWorkflowIT {
         runOne("chunk_embed");
         UUID exam = createExam();
 
+        error(send("GET", "/api/v1/exams/" + exam + "/summary", null),
+                404, "GENERATION_NOT_FOUND");
         JsonNode summaryJob = ok(send("POST", "/api/v1/exams/" + exam + "/summary/generate", Map.of()), 202);
         assertThat(summaryJob.path("status").asText()).isEqualTo("queued");
         runOne("exam_summary_generate");
+        assertThat(ok(send("GET", "/api/v1/exams/" + exam + "/summary", null), 200)
+                .path("type").asText()).isEqualTo("exam");
         assertThat(jdbc.sql("SELECT count(*) FROM summaries WHERE exam_id=:exam AND status='succeeded'")
                 .param("exam", exam).query(Integer.class).single()).isOne();
 
@@ -187,6 +191,7 @@ class GenerationWorkflowIT {
         JsonNode quizJob = ok(send("POST", "/api/v1/exams/" + exam + "/predicted-quiz/generate", Map.of()), 202);
         assertThat(quizJob.path("status").asText()).isEqualTo("queued");
         runOne("exam_quiz_generate");
+        assertThat(ok(send("GET", "/api/v1/exams/" + exam + "/predicted-quiz", null), 200)).hasSize(1);
         assertThat(jdbc.sql("SELECT count(*) FROM quiz_questions WHERE exam_id=:exam "
                         + "AND quiz_scope='past_exam_based' AND status='succeeded'")
                 .param("exam", exam).query(Integer.class).single()).isOne();

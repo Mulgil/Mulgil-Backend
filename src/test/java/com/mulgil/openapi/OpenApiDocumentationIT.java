@@ -54,7 +54,7 @@ class OpenApiDocumentationIT {
         JsonNode document = objectMapper.readTree(response.body());
         assertThat(document.at("/info/title").asText()).isEqualTo("Mulgil MVP Backend API");
         assertThat(document.at("/components/securitySchemes/bearerAuth/type").asText()).isEqualTo("http");
-        assertThat(documentedMvpOperationCount(document)).isEqualTo(40);
+        assertThat(documentedMvpOperationCount(document)).isEqualTo(42);
         assertThat(document.at("/paths/~1api~1v1~1sessions~1{sessionId}~1quiz/get/summary").asText()).isNotBlank();
         assertThat(document.at("/paths/~1api~1v1~1exams~1{examId}~1predicted-quiz~1generate/post/description").asText())
                 .contains("past_exam");
