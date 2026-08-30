@@ -145,34 +145,34 @@ class RecordingWorkflowIT {
     }
 
     @Test
-    void keepsBatchInputsAndStartsOneOperation_whenFirstProviderWaitTimesOut() throws Exception {
+    void startsOneResumableOperationPerSegment_whenRecordingExceeds19Minutes() throws Exception {
         UUID recording = recording(1_200, "uploaded");
         mappings.confirm(owner, recording, session);
 
         runAll("stt");
 
-        assertThat(speech.starts()).isOne();
-        assertThat(speech.polls()).isEqualTo(2);
+        assertThat(speech.starts()).isEqualTo(2);
+        assertThat(speech.polls()).isEqualTo(3);
         assertThat(speech.inputsPresentDuringTimeout()).isTrue();
         assertThat(temporaryObjects.deletes()).isEqualTo(2);
         assertThat(jdbc.sql("SELECT provider_request_id FROM ai_jobs WHERE recording_id=:recording")
-                .param("recording", recording).query(String.class).single()).isEqualTo("operations/fake-1");
+                .param("recording", recording).query(String.class).single()).isEqualTo("done|1");
         assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE recording_id=:recording")
                 .param("recording", recording).query(String.class).single()).isEqualTo("succeeded");
-        System.out.println("RECORDING_WORKFLOW scenario=provider_wait_timeout observable=one_operation_inputs_deleted_after_terminal result=PASS");
+        System.out.println("RECORDING_WORKFLOW scenario=multi_segment_timeout observable=one_operation_per_segment_no_duplicate_terminal_cleanup result=PASS");
     }
 
     @Test
     void resumesPersistedProviderOperation_withoutStartingAnotherPaidOperation() throws Exception {
         UUID recording = recording(1_200, "uploaded");
         JobQueue.JobAccepted accepted = mappings.confirm(owner, recording, session);
-        jdbc.sql("UPDATE ai_jobs SET provider_request_id='operations/existing' WHERE id=:id")
+        jdbc.sql("UPDATE ai_jobs SET provider_request_id='operation|1|operations/existing' WHERE id=:id")
                 .param("id", accepted.jobId()).update();
 
         runAll("stt");
 
         assertThat(speech.starts()).isZero();
-        assertThat(speech.awaitedOperation()).isEqualTo("operations/existing");
+        assertThat(speech.awaitedOperations()).contains("operations/existing");
         assertThat(temporaryObjects.deletes()).isEqualTo(2);
         System.out.println("RECORDING_WORKFLOW scenario=provider_operation_resume observable=zero_duplicate_starts_terminal_cleanup result=PASS");
     }
@@ -263,35 +263,35 @@ class RecordingWorkflowIT {
         private final AtomicInteger starts = new AtomicInteger();
         private final AtomicInteger polls = new AtomicInteger();
         private boolean inputsPresentDuringTimeout;
-        private String awaitedOperation;
+        private final List<String> awaitedOperations = new java.util.ArrayList<>();
 
         FakeSpeech(FakeTemporaryObjects objects) { this.objects = objects; }
 
-        @Override public String start(List<Input> inputs) {
-            starts.incrementAndGet();
-            return "operations/fake-1";
+        @Override public String start(Input input) {
+            return "operations/fake-" + starts.incrementAndGet();
         }
 
-        @Override public Optional<Transcript> await(String operationId, List<Input> inputs, Duration pollTimeout) {
-            awaitedOperation = operationId;
+        @Override public Optional<Transcript> await(String operationId, Input input, Duration pollTimeout) {
+            awaitedOperations.add(operationId);
             if (polls.incrementAndGet() == 1) {
                 inputsPresentDuringTimeout = objects.active() == 2;
                 return Optional.empty();
             }
+            long offset = input.offset().toMillis();
             return Optional.of(new Transcript(List.of(
-                    new Segment(100, 500, "segment 0", null),
-                    new Segment(1_140_100, 1_140_500, "segment 1140", null)), "fake-chirp", "chirp_3"));
+                    new Segment(offset + 100, offset + 500, "segment " + input.offset().toSeconds(), null)),
+                    "fake-chirp", "chirp_3"));
         }
 
         int starts() { return starts.get(); }
         int polls() { return polls.get(); }
         boolean inputsPresentDuringTimeout() { return inputsPresentDuringTimeout; }
-        String awaitedOperation() { return awaitedOperation; }
+        List<String> awaitedOperations() { return List.copyOf(awaitedOperations); }
         void reset() {
             starts.set(0);
             polls.set(0);
             inputsPresentDuringTimeout = false;
-            awaitedOperation = null;
+            awaitedOperations.clear();
         }
     }
 }

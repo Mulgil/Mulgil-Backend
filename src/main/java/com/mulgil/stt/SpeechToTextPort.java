@@ -6,9 +6,9 @@ import java.util.List;
 import java.util.Optional;
 
 public interface SpeechToTextPort {
-    String start(List<Input> inputs);
+    String start(Input input);
 
-    Optional<Transcript> await(String operationId, List<Input> inputs, Duration pollTimeout);
+    Optional<Transcript> await(String operationId, Input input, Duration pollTimeout);
 
     record Input(URI objectUri, Duration offset) {}
 

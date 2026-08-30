@@ -8,15 +8,18 @@ import com.mulgil.stt.SpeechToTextPort;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.net.URI;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 @Component
@@ -30,11 +33,13 @@ final class RecordingSttJobHandler implements JobHandler {
     private final ObjectProvider<SpeechToTextPort> speech;
     private final MulgilProperties properties;
     private final Clock clock;
+    private final TransactionTemplate transactions;
 
     RecordingSttJobHandler(JdbcClient jdbc, ContentIndexingService indexing,
                            ObjectProvider<RecordingSegmenter> segmenters,
                            ObjectProvider<SpeechTemporaryObjectPort> temporaryObjects,
-                           ObjectProvider<SpeechToTextPort> speech, MulgilProperties properties, Clock clock) {
+                           ObjectProvider<SpeechToTextPort> speech, MulgilProperties properties, Clock clock,
+                           TransactionTemplate transactions) {
         this.jdbc = jdbc;
         this.indexing = indexing;
         this.segmenters = segmenters;
@@ -42,6 +47,7 @@ final class RecordingSttJobHandler implements JobHandler {
         this.speech = speech;
         this.properties = properties;
         this.clock = clock;
+        this.transactions = transactions;
     }
 
     @Override
@@ -71,47 +77,58 @@ final class RecordingSttJobHandler implements JobHandler {
         } catch (RuntimeException exception) {
             throw new JobExecutionException("AUDIO_SEGMENT_FAILED", "Audio segmentation failed.", false);
         }
-        List<PreparedSegment> prepared = new ArrayList<>();
         List<URI> inputUris = new ArrayList<>();
-        boolean terminal = false;
+        Set<URI> deletedInputUris = new HashSet<>();
+        boolean allInputsTerminal = false;
         try {
             for (int index = 0; index < segments.size(); index++) {
                 inputUris.add(objects.put(job.id(), index, segments.get(index).path()));
             }
-            List<SpeechToTextPort.Input> inputs = java.util.stream.IntStream.range(0, segments.size())
-                    .mapToObj(index -> new SpeechToTextPort.Input(inputUris.get(index), segments.get(index).offset()))
-                    .toList();
-            String operationId = providerRequestId(job.id());
-            if (operationId == null) {
-                try {
-                    operationId = transcriber.start(inputs);
-                    persistProviderRequestId(job, operationId);
-                } catch (RuntimeException exception) {
-                    throw new JobExecutionException("PROVIDER_START_UNKNOWN",
-                            "Speech operation start could not be confirmed.", false);
+            ProviderState state = ProviderState.parse(providerRequestId(job.id()));
+            for (int index = 0; index < segments.size(); index++) {
+                URI inputUri = inputUris.get(index);
+                if (state.completedThrough(index)) {
+                    objects.delete(inputUri);
+                    deletedInputUris.add(inputUri);
+                    continue;
                 }
-            }
-            Optional<SpeechToTextPort.Transcript> result;
-            do {
-                result = transcriber.await(operationId, inputs,
-                        Duration.ofSeconds(properties.jobs().providerTimeoutSeconds()));
-            } while (result.isEmpty());
-            terminal = true;
-            SpeechToTextPort.Transcript transcript = result.orElseThrow();
-            for (SpeechToTextPort.Segment value : transcript.segments()) {
-                prepared.add(new PreparedSegment(value.startMs(), value.endMs(), value.text(), value.confidence(),
-                        transcript.provider(), transcript.model()));
+                SpeechToTextPort.Input input = new SpeechToTextPort.Input(inputUri, segments.get(index).offset());
+                String operationId;
+                if (state.resumes(index)) {
+                    operationId = state.operationId();
+                } else {
+                    try {
+                        operationId = transcriber.start(input);
+                        persistProviderRequestId(job, state.raw(), ProviderState.active(index, operationId).raw());
+                        state = ProviderState.active(index, operationId);
+                    } catch (RuntimeException exception) {
+                        throw new JobExecutionException("PROVIDER_START_UNKNOWN",
+                                "Speech operation start could not be confirmed.", false);
+                    }
+                }
+                Optional<SpeechToTextPort.Transcript> result;
+                do {
+                    result = transcriber.await(operationId, input,
+                            Duration.ofSeconds(properties.jobs().providerTimeoutSeconds()));
+                } while (result.isEmpty());
+                SpeechToTextPort.Transcript transcript = result.orElseThrow();
+                ProviderState completed = ProviderState.completed(index);
+                checkpoint(job, state.raw(), completed.raw(), transcript);
+                state = completed;
+                objects.delete(inputUri);
+                deletedInputUris.add(inputUri);
             }
         } catch (SpeechToTextPort.TerminalOperationException exception) {
-            terminal = true;
+            allInputsTerminal = true;
             throw new JobExecutionException("PROVIDER_FAILED", "Speech provider rejected the operation.", false);
         } catch (RuntimeException exception) {
             throw new JobExecutionException("PROVIDER_UNAVAILABLE", "Speech provider failed.", true);
         } finally {
-            if (terminal) inputUris.forEach(objects::delete);
+            if (allInputsTerminal) inputUris.stream().filter(uri -> !deletedInputUris.contains(uri))
+                    .forEach(objects::delete);
             segmenter.cleanup(segments);
         }
-        return () -> publish(job, prepared);
+        return () -> publish(job);
     }
 
     private String providerRequestId(UUID jobId) {
@@ -119,35 +136,61 @@ final class RecordingSttJobHandler implements JobHandler {
                 .param("id", jobId).query(String.class).optional().orElse(null);
     }
 
-    private void persistProviderRequestId(JobQueue.ClaimedJob job, String operationId) {
+    private void persistProviderRequestId(JobQueue.ClaimedJob job, String expected, String operationId) {
         int updated = jdbc.sql("""
                         UPDATE ai_jobs SET provider_request_id=:operation
-                        WHERE id=:id AND status='running' AND claimed_by=:worker AND provider_request_id IS NULL
+                        WHERE id=:id AND status='running' AND claimed_by=:worker
+                          AND provider_request_id IS NOT DISTINCT FROM :expected
                         """).param("operation", operationId).param("id", job.id())
-                .param("worker", job.claimedBy()).update();
+                .param("worker", job.claimedBy()).param("expected", expected).update();
         if (updated != 1) throw new IllegalStateException("Could not persist speech operation ID.");
     }
 
-    private void publish(JobQueue.ClaimedJob job, List<PreparedSegment> segments) {
-        jdbc.sql("DELETE FROM transcript_segments WHERE recording_id=:recording")
-                .param("recording", job.recordingId()).update();
+    private void checkpoint(JobQueue.ClaimedJob job, String expected, String completed,
+                            SpeechToTextPort.Transcript transcript) {
+        transactions.executeWithoutResult(ignored -> {
+            for (SpeechToTextPort.Segment value : transcript.segments()) {
+                insertTranscript(job, new PreparedSegment(value.startMs(), value.endMs(), value.text(),
+                        value.confidence(), transcript.provider(), transcript.model()));
+            }
+            persistProviderRequestId(job, expected, completed);
+        });
+    }
+
+    private void insertTranscript(JobQueue.ClaimedJob job, PreparedSegment segment) {
+        String hash = ContentIndexingService.sha256(job.recordingId() + ":" + segment.startMs() + ":"
+                + segment.endMs() + ":" + segment.text());
+        UUID id = UUID.nameUUIDFromBytes((job.recordingId() + ":" + segment.startMs() + ":"
+                + segment.endMs()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        jdbc.sql("""
+                INSERT INTO transcript_segments
+                    (id,owner_id,course_id,session_id,recording_id,start_ms,end_ms,text_content,
+                     confidence,provider,model_id,source_hash,created_at)
+                VALUES (:id,:owner,:course,:session,:recording,:start,:end,:text,
+                        :confidence,:provider,:model,:hash,:now)
+                ON CONFLICT (id) DO UPDATE SET text_content=EXCLUDED.text_content,
+                    confidence=EXCLUDED.confidence,provider=EXCLUDED.provider,
+                    model_id=EXCLUDED.model_id,source_hash=EXCLUDED.source_hash
+                """).param("id", id).param("owner", job.ownerId()).param("course", job.courseId())
+                .param("session", job.sessionId()).param("recording", job.recordingId())
+                .param("start", segment.startMs()).param("end", segment.endMs()).param("text", segment.text())
+                .param("confidence", segment.confidence()).param("provider", segment.provider())
+                .param("model", segment.model()).param("hash", hash)
+                .param("now", Timestamp.from(clock.instant())).update();
+    }
+
+    private void publish(JobQueue.ClaimedJob job) {
+        List<PreparedSegment> segments = jdbc.sql("""
+                        SELECT start_ms,end_ms,text_content,confidence,provider,model_id
+                        FROM transcript_segments WHERE recording_id=:recording ORDER BY start_ms,id
+                        """).param("recording", job.recordingId())
+                .query((row, ignored) -> new PreparedSegment(row.getLong("start_ms"), row.getLong("end_ms"),
+                        row.getString("text_content"), row.getBigDecimal("confidence") == null ? null
+                        : row.getBigDecimal("confidence").doubleValue(),
+                        row.getString("provider"), row.getString("model_id"))).list();
         for (PreparedSegment segment : segments) {
-            String hash = ContentIndexingService.sha256(job.recordingId() + ":" + segment.startMs() + ":"
-                    + segment.endMs() + ":" + segment.text());
             UUID id = UUID.nameUUIDFromBytes((job.recordingId() + ":" + segment.startMs() + ":"
                     + segment.endMs()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            jdbc.sql("""
-                    INSERT INTO transcript_segments
-                        (id,owner_id,course_id,session_id,recording_id,start_ms,end_ms,text_content,
-                         confidence,provider,model_id,source_hash,created_at)
-                    VALUES (:id,:owner,:course,:session,:recording,:start,:end,:text,
-                            :confidence,:provider,:model,:hash,:now)
-                    """).param("id", id).param("owner", job.ownerId()).param("course", job.courseId())
-                    .param("session", job.sessionId()).param("recording", job.recordingId())
-                    .param("start", segment.startMs()).param("end", segment.endMs()).param("text", segment.text())
-                    .param("confidence", segment.confidence()).param("provider", segment.provider())
-                    .param("model", segment.model()).param("hash", hash)
-                    .param("now", Timestamp.from(clock.instant())).update();
             indexing.index(new ContentIndexingService.IndexRequest("transcript", Map.of(
                     "sourceType", "transcript", "recordingId", job.recordingId().toString(),
                     "transcriptSegmentId", id.toString(), "startMs", segment.startMs(), "endMs", segment.endMs(),
@@ -167,4 +210,37 @@ final class RecordingSttJobHandler implements JobHandler {
     private record Recording(String objectKey, long durationSeconds) {}
     private record PreparedSegment(long startMs, long endMs, String text, Double confidence,
                                    String provider, String model) {}
+
+    private record ProviderState(String raw, Integer completedIndex, Integer activeIndex, String operationId) {
+        static ProviderState parse(String raw) {
+            if (raw == null) return new ProviderState(null, null, null, null);
+            String[] parts = raw.split("\\|", 3);
+            try {
+                if (parts.length == 2 && parts[0].equals("done")) {
+                    return completed(Integer.parseInt(parts[1]));
+                }
+                if (parts.length == 3 && parts[0].equals("operation") && !parts[2].isBlank()) {
+                    return new ProviderState(raw, null, Integer.parseInt(parts[1]), parts[2]);
+                }
+            } catch (NumberFormatException ignored) {
+            }
+            throw new IllegalStateException("Invalid persisted speech operation state.");
+        }
+
+        static ProviderState active(int index, String operationId) {
+            return new ProviderState("operation|" + index + "|" + operationId, null, index, operationId);
+        }
+
+        static ProviderState completed(int index) {
+            return new ProviderState("done|" + index, index, null, null);
+        }
+
+        boolean completedThrough(int index) {
+            return (completedIndex != null && completedIndex >= index) || (activeIndex != null && activeIndex > index);
+        }
+
+        boolean resumes(int index) {
+            return activeIndex != null && activeIndex == index;
+        }
+    }
 }

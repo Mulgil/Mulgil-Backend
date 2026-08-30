@@ -37,18 +37,19 @@ final class GoogleChirpSpeechToTextAdapter implements SpeechToTextPort {
     }
 
     @Override
-    public String start(List<Input> inputs) {
+    public String start(Input input) {
         try (SpeechClient client = SpeechClient.create(SpeechSettings.newBuilder()
                 .setEndpoint(properties.speech().apiEndpoint()).build())) {
-            BatchRecognizeRequest.Builder request = BatchRecognizeRequest.newBuilder()
+            BatchRecognizeRequest request = BatchRecognizeRequest.newBuilder()
                     .setRecognizer("projects/%s/locations/%s/recognizers/_".formatted(
                             properties.google().cloudProject(), properties.speech().location()))
                     .setConfig(config())
                     .setRecognitionOutputConfig(RecognitionOutputConfig.newBuilder()
-                            .setInlineResponseConfig(InlineOutputConfig.newBuilder().build()).build());
-            inputs.forEach(input -> request.addFiles(BatchRecognizeFileMetadata.newBuilder()
-                    .setUri(input.objectUri().toString()).build()));
-            return client.batchRecognizeAsync(request.build()).getName();
+                            .setInlineResponseConfig(InlineOutputConfig.newBuilder().build()).build())
+                    .addFiles(BatchRecognizeFileMetadata.newBuilder()
+                            .setUri(input.objectUri().toString()).build())
+                    .build();
+            return client.batchRecognizeAsync(request).getName();
         } catch (Exception exception) {
             if (exception instanceof InterruptedException) Thread.currentThread().interrupt();
             throw new IllegalStateException("Could not start regional Chirp transcription.", exception);
@@ -56,7 +57,7 @@ final class GoogleChirpSpeechToTextAdapter implements SpeechToTextPort {
     }
 
     @Override
-    public Optional<Transcript> await(String operationId, List<Input> inputs, Duration pollTimeout) {
+    public Optional<Transcript> await(String operationId, Input input, Duration pollTimeout) {
         try (SpeechClient client = SpeechClient.create(SpeechSettings.newBuilder()
                 .setEndpoint(properties.speech().apiEndpoint()).build())) {
             com.google.protobuf.Duration timeout = com.google.protobuf.Duration.newBuilder()
@@ -67,12 +68,10 @@ final class GoogleChirpSpeechToTextAdapter implements SpeechToTextPort {
             if (operation.hasError()) throw new TerminalOperationException(operation.getError().getMessage());
             BatchRecognizeResponse response = operation.getResponse().unpack(BatchRecognizeResponse.class);
             List<Segment> segments = new ArrayList<>();
-            for (Input input : inputs) {
-                BatchRecognizeFileResult file = response.getResultsMap().get(input.objectUri().toString());
-                if (file == null || file.hasError()) throw new TerminalOperationException(
-                        file == null ? "Chirp returned no transcript." : file.getError().getMessage());
-                appendSegments(segments, file, input.offset());
-            }
+            BatchRecognizeFileResult file = response.getResultsMap().get(input.objectUri().toString());
+            if (file == null || file.hasError()) throw new TerminalOperationException(
+                    file == null ? "Chirp returned no transcript." : file.getError().getMessage());
+            appendSegments(segments, file, input.offset());
             return Optional.of(new Transcript(segments, "google-chirp", properties.speech().model()));
         } catch (TerminalOperationException exception) {
             throw exception;
