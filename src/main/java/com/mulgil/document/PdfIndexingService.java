@@ -84,6 +84,7 @@ final class PdfIndexingService {
             if (needsOcr(page)) {
                 needsOcr = true;
             } else if (!page.text().isBlank()) {
+                reconcileBlocks(job, page.number(), 1);
                 upsertBlockAndIndex(job, page.number(), 0, page.text(), FULL_PAGE,
                         "pdfbox", "pdfbox-3", null);
             }
@@ -93,13 +94,15 @@ final class PdfIndexingService {
 
     void publishOcr(JobQueue.ClaimedJob job, PreparedOcr prepared) {
         for (OcrPage page : prepared.pages()) {
-            String pageText = page.result().blocks().stream().map(VisionOcrPort.OcrBlock::text)
+            List<VisionOcrPort.OcrBlock> blocks = page.result().blocks().stream()
+                    .filter(block -> block.text() != null && !block.text().isBlank()).toList();
+            String pageText = blocks.stream().map(VisionOcrPort.OcrBlock::text)
                     .filter(text -> text != null && !text.isBlank()).map(String::strip)
                     .reduce((left, right) -> left + "\n" + right).orElse("");
             upsertPage(job, page.number(), pageText, "ocr");
+            reconcileBlocks(job, page.number(), blocks.size());
             int index = 0;
-            for (VisionOcrPort.OcrBlock block : page.result().blocks()) {
-                if (block.text() == null || block.text().isBlank()) continue;
+            for (VisionOcrPort.OcrBlock block : blocks) {
                 VisionOcrPort.NormalizedBox box = block.box();
                 Map<String, Double> bbox = Map.of("x", box.x(), "y", box.y(),
                         "width", box.width(), "height", box.height());
@@ -149,7 +152,7 @@ final class PdfIndexingService {
     private void upsertBlockAndIndex(JobQueue.ClaimedJob job, int pageNumber, int blockIndex, String text,
                                      Map<String, Double> bbox, String provider, String model, Double confidence) {
         UUID pageId = pageId(job, pageNumber);
-        UUID blockId = UUID.nameUUIDFromBytes((pageId + ":" + blockIndex).getBytes(StandardCharsets.UTF_8));
+        UUID blockId = blockId(pageId, blockIndex);
         String sourceHash = ContentIndexingService.sha256(job.sourceHash() + ":" + pageNumber + ":" + text);
         jdbc.sql("""
                         INSERT INTO content_blocks
@@ -178,6 +181,25 @@ final class PdfIndexingService {
         reference.put("inputVersion", job.inputVersion());
         indexing.index(new ContentIndexingService.IndexRequest(reference.get("sourceType").toString(), reference,
                 job.ownerId(), job.courseId(), job.sessionId(), job.inputVersion(), text));
+    }
+
+    private void reconcileBlocks(JobQueue.ClaimedJob job, int pageNumber, int count) {
+        UUID pageId = pageId(job, pageNumber);
+        var statement = jdbc.sql("""
+                        DELETE FROM content_blocks
+                        WHERE owner_id=:owner AND course_id=:course AND session_id=:session AND page_id=:page
+                        """ + (count == 0 ? "" : " AND id NOT IN (:ids)"))
+                .param("owner", job.ownerId()).param("course", job.courseId())
+                .param("session", job.sessionId()).param("page", pageId);
+        if (count > 0) {
+            statement.param("ids", java.util.stream.IntStream.range(0, count)
+                    .mapToObj(index -> blockId(pageId, index)).toList());
+        }
+        statement.update();
+    }
+
+    private static UUID blockId(UUID pageId, int blockIndex) {
+        return UUID.nameUUIDFromBytes((pageId + ":" + blockIndex).getBytes(StandardCharsets.UTF_8));
     }
 
     private void enqueueOcr(JobQueue.ClaimedJob job) {

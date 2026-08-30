@@ -176,6 +176,55 @@ class PdfIndexingIT {
         assertThat(indexing.chunks(UUID.randomUUID(), course, session)).isEmpty();
     }
 
+    @Test
+    void rejectsStaleEmbeddingPublication_whenChunkSnapshotChangesAfterClaim() throws Exception {
+        UUID material = insertMaterial(pdf("x".repeat(80), false));
+        jobs.enqueuePdfMaterial(owner, material);
+        runAll("pdf_extract");
+        JobQueue.ClaimedJob job = jobs.claim("pdf-it", Set.of("chunk_embed"));
+        JobHandler.JobPublication stalePublication = handler("chunk_embed").handle(job);
+        UUID chunk = jdbc.sql("SELECT id FROM chunks WHERE owner_id=:owner")
+                .param("owner", owner).query(UUID.class).single();
+        jdbc.sql("""
+                UPDATE chunks SET text_content='new current text', source_hash=:hash,
+                    source_ref=jsonb_set(source_ref, '{inputVersion}', '2'::jsonb)
+                WHERE id=:id
+                """).param("hash", "b".repeat(64)).param("id", chunk).update();
+
+        assertThat(jobs.complete(job, stalePublication)).isTrue();
+        assertThat(jdbc.sql("SELECT embedding IS NULL FROM chunks WHERE id=:id")
+                .param("id", chunk).query(Boolean.class).single()).isTrue();
+        assertThat(jdbc.sql("SELECT text_content FROM chunks WHERE id=:id")
+                .param("id", chunk).query(String.class).single()).isEqualTo("new current text");
+    }
+
+    @Test
+    void removesObsoleteBlocksAndChunks_whenPageIsRematerializedWithFewerBlocks() throws Exception {
+        byte[] pdf = pdf("x".repeat(79), false);
+        UUID material = insertMaterial(pdf);
+        vision.blocks("first", "obsolete");
+        jobs.enqueuePdfMaterial(owner, material);
+        runAll("pdf_extract");
+        runAll("pdf_ocr");
+        assertThat(jdbc.sql("SELECT count(*) FROM content_blocks WHERE material_id=:id")
+                .param("id", material).query(Integer.class).single()).isEqualTo(2);
+        assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE content_block_id IN "
+                        + "(SELECT id FROM content_blocks WHERE material_id=:id)")
+                .param("id", material).query(Integer.class).single()).isEqualTo(2);
+        jdbc.sql("UPDATE materials SET version=2 WHERE id=:id").param("id", material).update();
+        vision.blocks("first");
+
+        jobs.enqueuePdfMaterial(owner, material);
+        runAll("pdf_extract");
+        runAll("pdf_ocr");
+
+        assertThat(jdbc.sql("SELECT text_content FROM content_blocks WHERE material_id=:id")
+                .param("id", material).query(String.class).list()).containsExactly("first");
+        assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE content_block_id IN "
+                        + "(SELECT id FROM content_blocks WHERE material_id=:id)")
+                .param("id", material).query(Integer.class).single()).isOne();
+    }
+
     private UUID insertMaterial(byte[] pdf) throws Exception {
         UUID id = UUID.randomUUID();
         String key = "material/" + id;
@@ -202,11 +251,15 @@ class PdfIndexingIT {
     }
 
     private void runAll(String type) throws Exception {
-        JobHandler handler = handlers.stream().filter(value -> value.jobType().equals(type)).findFirst().orElseThrow();
+        JobHandler handler = handler(type);
         JobQueue.ClaimedJob job;
         while ((job = jobs.claim("pdf-it", Set.of(type))) != null) {
             jobs.complete(job, handler.handle(job));
         }
+    }
+
+    private JobHandler handler(String type) {
+        return handlers.stream().filter(value -> value.jobType().equals(type)).findFirst().orElseThrow();
     }
 
     private static byte[] pdf(String text, boolean halfPageImage) throws Exception {
@@ -262,12 +315,22 @@ class PdfIndexingIT {
 
     static final class FakeVision implements VisionOcrPort {
         private final AtomicInteger calls = new AtomicInteger();
+        private List<OcrBlock> blocks = List.of(block("recognized text", 0));
         @Override public OcrResult extract(byte[] image) {
             calls.incrementAndGet();
-            return new OcrResult(List.of(new OcrBlock("recognized text", 0.91,
-                    new NormalizedBox(0.1, 0.2, 0.7, 0.2))), "fake-vision", "fake-ocr");
+            return new OcrResult(blocks, "fake-vision", "fake-ocr");
         }
         int calls() { return calls.get(); }
-        void reset() { calls.set(0); }
+        void blocks(String... texts) {
+            blocks = java.util.stream.IntStream.range(0, texts.length)
+                    .mapToObj(index -> block(texts[index], index)).toList();
+        }
+        void reset() {
+            calls.set(0);
+            blocks = List.of(block("recognized text", 0));
+        }
+        private static OcrBlock block(String text, int index) {
+            return new OcrBlock(text, 0.91, new NormalizedBox(0.1, 0.1 + index * 0.2, 0.7, 0.15));
+        }
     }
 }
