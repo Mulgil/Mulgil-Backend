@@ -46,17 +46,34 @@ final class ChunkEmbedJobHandler implements JobHandler {
                 .query((row, ignored) -> new PendingChunk(row.getObject("id", UUID.class),
                         row.getString("text_content"), row.getString("source_hash"),
                         row.getString("source_ref"))).list();
-        List<EmbeddedChunk> results = chunks.stream().map(chunk -> {
-            ChunkEmbeddingPort.Embedding embedding = usage.observe(job, "vertex.embed", "vertex",
-                    properties.vertex().embeddingModel(), "unicode_code_point",
-                    chunk.text().codePoints().count(),
-                    () -> port.embed(chunk.text()));
-            if (embedding.values().size() != 768) throw new IllegalArgumentException("Embedding must have 768 values.");
-            float[] values = new float[embedding.values().size()];
-            for (int index = 0; index < values.length; index++) values[index] = embedding.values().get(index);
-            return new EmbeddedChunk(chunk.id(), chunk.text(), chunk.sourceHash(), chunk.sourceReference(),
-                    new PGvector(values), embedding.model());
-        }).toList();
+        List<AiProviderUsageLedger.UsageHandle> usages = chunks.stream().map(chunk -> usage.begin(
+                job.id(), job.ownerId(), "vertex.embed", "vertex", properties.vertex().embeddingModel(),
+                "unicode_code_point", chunk.text().codePoints().count())).toList();
+        List<EmbeddedChunk> results;
+        try {
+            List<ChunkEmbeddingPort.Embedding> embeddings = port.embedAll(
+                    chunks.stream().map(PendingChunk::text).toList());
+            if (embeddings.size() != chunks.size()) {
+                throw new IllegalArgumentException("Embedding count must match chunk count.");
+            }
+            results = java.util.stream.IntStream.range(0, chunks.size()).mapToObj(index -> {
+                PendingChunk chunk = chunks.get(index);
+                ChunkEmbeddingPort.Embedding embedding = embeddings.get(index);
+                if (embedding.values().size() != 768) {
+                    throw new IllegalArgumentException("Embedding must have 768 values.");
+                }
+                float[] values = new float[embedding.values().size()];
+                for (int valueIndex = 0; valueIndex < values.length; valueIndex++) {
+                    values[valueIndex] = embedding.values().get(valueIndex);
+                }
+                return new EmbeddedChunk(chunk.id(), chunk.text(), chunk.sourceHash(), chunk.sourceReference(),
+                        new PGvector(values), embedding.model());
+            }).toList();
+        } catch (RuntimeException exception) {
+            usages.forEach(handle -> usage.fail(handle, "PROVIDER_FAILED"));
+            throw exception;
+        }
+        usages.forEach(usage::succeed);
         return () -> results.forEach(result -> jdbc.sql("""
                         UPDATE chunks SET embedding=:embedding, embedding_model=:model
                         WHERE id=:id AND owner_id=:owner AND course_id=:course AND session_id=:session
