@@ -62,9 +62,10 @@ class QuizProgressIT {
 
     @BeforeEach
     void seed() throws Exception {
-        jdbc.sql("DELETE FROM users").update();
-        ownerToken = login("quiz-owner-" + UUID.randomUUID());
-        owner = jdbc.sql("SELECT id FROM users ORDER BY created_at DESC LIMIT 1").query(UUID.class).single();
+        String ownerSubject = "quiz-owner-" + UUID.randomUUID();
+        ownerToken = login(ownerSubject);
+        owner = jdbc.sql("SELECT id FROM users WHERE provider_subject=:subject")
+                .param("subject", ownerSubject).query(UUID.class).single();
         foreignToken = login("quiz-foreign-" + UUID.randomUUID());
         course = UUID.fromString(ok(send("POST", "/api/v1/courses", ownerToken,
                 Map.of("name", "Quiz")), 201).path("id").asText());
@@ -149,7 +150,8 @@ class QuizProgressIT {
         int currentQuizSize = ok(send("GET", "/api/v1/sessions/" + session + "/quiz",
                 ownerToken, null), 200).size();
         assertThat(currentQuizSize).isOne();
-        assertThat(jdbc.sql("SELECT count(*) FROM quiz_attempts").query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT count(*) FROM quiz_attempts WHERE owner_id=:owner")
+                .param("owner", owner).query(Integer.class).single()).isZero();
 
         Files.createDirectories(EVIDENCE);
         Files.writeString(EVIDENCE.resolve("quiz-attempt-failure.txt"), String.join("\n",
@@ -184,6 +186,53 @@ class QuizProgressIT {
             jdbc.sql("DROP FUNCTION test_reject_progress()").update();
         }
         System.out.println("QUIZ_PROGRESS scenario=atomicity observable=progress-failure-rolls-back-attempt result=PASS");
+    }
+
+    @Test
+    void rejectsAmbiguousTextAnswers_butKeepsIntegerCorrectIndex() throws Exception {
+        UUID duplicateText = insertQuestion("multiple_choice", List.of("A", "A", "C", "D"), "A",
+                "Duplicate label");
+        UUID numericText = insertQuestion("multiple_choice", List.of("A", "1", "C", "D"), "1",
+                "Numeric label");
+        UUID integerIndex = insertQuestion("multiple_choice", List.of("A", "1", "C", "D"), 1,
+                "Integer index");
+
+        error(send("POST", "/api/v1/quiz/questions/" + duplicateText + "/attempts",
+                ownerToken, Map.of("answer", 0)), 422);
+        error(send("POST", "/api/v1/quiz/questions/" + numericText + "/attempts",
+                ownerToken, Map.of("answer", 1)), 422);
+        JsonNode accepted = ok(send("POST", "/api/v1/quiz/questions/" + integerIndex + "/attempts",
+                ownerToken, Map.of("answer", 1)), 201);
+        JsonNode available = ok(send("GET", "/api/v1/sessions/" + session + "/quiz", ownerToken, null), 200);
+
+        assertThat(accepted.path("isCorrect").asBoolean()).isTrue();
+        assertThat(available.findValuesAsText("id")).doesNotContain(duplicateText.toString(), numericText.toString())
+                .contains(integerIndex.toString());
+        assertThat(jdbc.sql("SELECT count(*) FROM quiz_attempts WHERE owner_id=:owner")
+                .param("owner", owner).query(Integer.class).single()).isOne();
+        System.out.println("QUIZ_PROGRESS scenario=ambiguous-generated-answer observable=duplicate-and-numeric-text-unavailable-integer-index-valid result=PASS");
+    }
+
+    @Test
+    void keepsProgressTimestampsMonotonic_whenOlderAttemptFinishesAfterNewerProjection() throws Exception {
+        Instant newer = Instant.now().plusSeconds(3600);
+        jdbc.sql("""
+                        INSERT INTO progress_status
+                            (id,owner_id,course_id,session_id,quiz_question_id,state,correct_count,
+                             incorrect_count,last_attempt_at,updated_at)
+                        VALUES (:id,:owner,:course,:session,NULL,'in_progress',0,0,:newer,:newer)
+                        """).param("id", UUID.randomUUID()).param("owner", owner).param("course", course)
+                .param("session", session).param("newer", Timestamp.from(newer)).update();
+
+        JsonNode result = ok(send("POST", "/api/v1/quiz/questions/" + trueFalse + "/attempts",
+                ownerToken, Map.of("answer", true)), 201);
+
+        assertThat(Instant.parse(result.path("progress").path("lastAttemptAt").asText())).isEqualTo(newer);
+        assertThat(Instant.parse(result.path("progress").path("updatedAt").asText())).isEqualTo(newer);
+        assertThat(result.path("progress").path("correctCount").asInt()).isOne();
+        assertThat(jdbc.sql("SELECT count(*) FROM quiz_attempts WHERE owner_id=:owner")
+                .param("owner", owner).query(Integer.class).single()).isOne();
+        System.out.println("QUIZ_PROGRESS scenario=timestamp-race observable=older-finisher-counted-without-time-regression result=PASS");
     }
 
     private CompletableFuture<JsonNode> attemptAsync(UUID question, Object answer) {

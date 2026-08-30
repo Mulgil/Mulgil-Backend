@@ -34,12 +34,15 @@ class QuizProgressService {
                         """).param("owner", ownerId).param("session", sessionId).query(Boolean.class).single();
         if (!sessionExists) throw notFound();
         List<QuizQuestion> questions = jdbc.sql("""
-                        SELECT id,question_type,question_json::text FROM quiz_questions
+                        SELECT id,question_type,question_json::text,answer_json::text FROM quiz_questions
                         WHERE owner_id=:owner AND session_id=:session AND quiz_scope='practice'
                           AND status='succeeded' ORDER BY created_at,id
                         """).param("owner", ownerId).param("session", sessionId)
-                .query((row, ignored) -> publicQuestion(row.getObject("id", UUID.class),
-                        row.getString("question_type"), parse(row.getString("question_json")))).list();
+                .query((row, ignored) -> new PublicQuestion(row.getObject("id", UUID.class),
+                        row.getString("question_type"), parse(row.getString("question_json")),
+                        parse(row.getString("answer_json")))).list().stream()
+                .map(value -> publicQuestion(value.id(), value.type(), value.question(), value.answer()))
+                .filter(java.util.Objects::nonNull).toList();
         if (questions.isEmpty()) {
             throw new ApiException(HttpStatus.CONFLICT, "QUIZ_NOT_READY", "Quiz is not available yet.");
         }
@@ -83,7 +86,8 @@ class QuizProgressService {
                                 THEN 'needs_restudy' ELSE 'in_progress' END,
                             correct_count=progress_status.correct_count + EXCLUDED.correct_count,
                             incorrect_count=progress_status.incorrect_count + EXCLUDED.incorrect_count,
-                            last_attempt_at=EXCLUDED.last_attempt_at,updated_at=EXCLUDED.updated_at
+                            last_attempt_at=GREATEST(progress_status.last_attempt_at,EXCLUDED.last_attempt_at),
+                            updated_at=GREATEST(progress_status.updated_at,EXCLUDED.updated_at)
                         RETURNING correct_count,incorrect_count,last_attempt_at,updated_at
                         """).param("id", UUID.randomUUID()).param("owner", ownerId)
                 .param("course", question.courseId()).param("session", question.sessionId())
@@ -99,10 +103,7 @@ class QuizProgressService {
         JsonNode expected = question.answer().path("value");
         if (question.type().equals("true_false")) {
             if (!submitted.isBoolean()) throw validation();
-            boolean expectedValue = expected.isBoolean() ? expected.booleanValue()
-                    : expected.isTextual() && expected.asText().equalsIgnoreCase("true") ? true
-                    : expected.isTextual() && expected.asText().equalsIgnoreCase("false") ? false
-                    : invalidStoredAnswer();
+            boolean expectedValue = expectedBoolean(expected);
             return new Grading(submitted.booleanValue() == expectedValue, answer(question, expectedValue));
         }
         JsonNode options = question.question().path("options");
@@ -119,11 +120,24 @@ class QuizProgressService {
         if (expected.isIntegralNumber() && expected.canConvertToInt()
                 && expected.intValue() >= 0 && expected.intValue() <= 3) return expected.intValue();
         if (expected.isTextual()) {
+            String value = expected.asText();
+            if (value.strip().matches("[+-]?\\d+(\\.\\d+)?")) return invalidStoredAnswer();
+            int match = -1;
             for (int index = 0; index < options.size(); index++) {
-                if (expected.asText().equals(options.get(index).asText())) return index;
+                if (value.equals(options.get(index).asText())) {
+                    if (match >= 0) return invalidStoredAnswer();
+                    match = index;
+                }
             }
-            if (expected.asText().matches("[0-3]")) return Integer.parseInt(expected.asText());
+            if (match >= 0) return match;
         }
+        return invalidStoredAnswer();
+    }
+
+    private boolean expectedBoolean(JsonNode expected) {
+        if (expected.isBoolean()) return expected.booleanValue();
+        if (expected.isTextual() && expected.asText().equalsIgnoreCase("true")) return true;
+        if (expected.isTextual() && expected.asText().equalsIgnoreCase("false")) return false;
         return invalidStoredAnswer();
     }
 
@@ -137,12 +151,20 @@ class QuizProgressService {
         throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "QUIZ_INVALID", "Stored quiz answer is invalid.");
     }
 
-    private QuizQuestion publicQuestion(UUID id, String type, JsonNode question) {
+    private QuizQuestion publicQuestion(UUID id, String type, JsonNode question, JsonNode answer) {
         JsonNode options = question.path("options");
         if (!question.path("text").isTextual() || question.path("text").asText().isBlank()
                 || !question.path("sourceRefs").isArray() || question.path("sourceRefs").isEmpty()
                 || (type.equals("multiple_choice") && !fourTextOptions(options))) {
             throw validation();
+        }
+        try {
+            if (type.equals("true_false")) expectedBoolean(answer.path("value"));
+            else if (type.equals("multiple_choice")) expectedIndex(answer.path("value"), options);
+            else return null;
+        } catch (ApiException exception) {
+            if (exception.code().equals("QUIZ_INVALID")) return null;
+            throw exception;
         }
         return new QuizQuestion(id, type, question.path("text").asText(),
                 type.equals("multiple_choice") ? options : null, question.path("sourceRefs"));
@@ -188,5 +210,6 @@ class QuizProgressService {
                     Instant lastAttemptAt, Instant updatedAt) {}
     private record StoredQuestion(UUID courseId, UUID sessionId, String type, JsonNode question,
                                   JsonNode answer, JsonNode explanation) {}
+    private record PublicQuestion(UUID id, String type, JsonNode question, JsonNode answer) {}
     private record Grading(boolean correct, JsonNode answer) {}
 }
