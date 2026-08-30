@@ -21,6 +21,7 @@ import java.time.Instant;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.util.UUID;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -68,6 +69,7 @@ class JobQueueIT {
     UUID courseId;
     UUID sessionId;
     UUID materialId;
+    UUID recordingId;
 
     @BeforeEach
     void seed() {
@@ -77,6 +79,7 @@ class JobQueueIT {
         courseId = UUID.randomUUID();
         sessionId = UUID.randomUUID();
         materialId = UUID.randomUUID();
+        recordingId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         jdbc.sql("INSERT INTO users VALUES (:id, 'google', :subject, :email, 'Owner', :now)")
                 .param("id", ownerId).param("subject", ownerId.toString())
@@ -98,6 +101,15 @@ class JobQueueIT {
                 """).param("id", materialId).param("owner", ownerId).param("course", courseId)
                 .param("session", sessionId).param("key", "job/" + materialId).param("hash", HASH)
                 .param("now", now).update();
+        jdbc.sql("""
+                INSERT INTO audio_recordings
+                    (id,owner_id,course_id,session_id,object_key,original_filename,mime_type,byte_size,
+                     checksum,started_at,duration_seconds,version,status,created_at,updated_at)
+                VALUES (:id,:owner,:course,:session,:key,'source.m4a','audio/m4a',10,:hash,
+                        :now,10,1,'uploaded',:now,:now)
+                """).param("id", recordingId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("key", "job/" + recordingId).param("hash", HASH)
+                .param("now", now).update();
     }
 
     @Test
@@ -110,6 +122,38 @@ class JobQueueIT {
             assertThat(first.get().id()).isEqualTo(second.get().id());
         }
         assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void rejectsEveryBillableJobTypeAfterThirtyCanonicalJobs_withoutChargingDuplicate() {
+        JobQueue.AiJob first = queue.enqueue(billable("chunk_embed", 0));
+        JobQueue.ClaimedJob claimed = queue.claim("quota-retry", Set.of("chunk_embed"));
+        queue.fail(claimed, "PROVIDER_TIMEOUT", "Provider timed out.", true);
+        for (int index = 1; index < 30; index++) queue.enqueue(billable("chunk_embed", index));
+
+        assertThat(queue.retry(ownerId, first.id()).status()).isEqualTo("queued");
+        assertThat(queue.enqueue(billable("chunk_embed", 0)).id()).isEqualTo(first.id());
+        for (String type : Set.of("pdf_ocr", "handwriting_ocr", "stt", "chunk_embed", "review_generate")) {
+            assertThatThrownBy(() -> queue.enqueue(billable(type, 100)))
+                    .isInstanceOf(ApiException.class)
+                    .extracting(value -> ((ApiException) value).code())
+                    .isEqualTo("AI_DAILY_LIMIT_REACHED");
+        }
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isEqualTo(30);
+    }
+
+    @Test
+    void admitsOnlyOneBillableJob_whenTwoEnqueuesRaceAtDailyBoundary() throws Exception {
+        for (int index = 0; index < 29; index++) queue.enqueue(billable("chunk_embed", index));
+
+        try (var workers = Executors.newFixedThreadPool(2)) {
+            var first = workers.submit(() -> enqueueResult(billable("stt", 100)));
+            var second = workers.submit(() -> enqueueResult(billable("pdf_ocr", 101)));
+
+            assertThat(List.of(first.get(), second.get()))
+                    .containsExactlyInAnyOrder("accepted", "AI_DAILY_LIMIT_REACHED");
+        }
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isEqualTo(30);
     }
 
     @Test
@@ -302,6 +346,24 @@ class JobQueueIT {
     private JobQueue.EnqueueRequest request() {
         return JobQueue.EnqueueRequest.material("pdf_extract", ownerId, courseId, sessionId,
                 materialId, 1, HASH, "pdfbox", "pdfbox-3", "none");
+    }
+
+    private JobQueue.EnqueueRequest billable(String type, int index) {
+        if (type.equals("stt")) {
+            return new JobQueue.EnqueueRequest(type, ownerId, courseId, sessionId, null, null, null,
+                    recordingId, null, index + 1, "%064x".formatted(index + 1), "fake", "fake-v1", "none");
+        }
+        return JobQueue.EnqueueRequest.material(type, ownerId, courseId, sessionId, materialId,
+                index + 1, "%064x".formatted(index + 1), "fake", "fake-v1", "none");
+    }
+
+    private String enqueueResult(JobQueue.EnqueueRequest request) {
+        try {
+            queue.enqueue(request);
+            return "accepted";
+        } catch (ApiException exception) {
+            return exception.code();
+        }
     }
 
     @TestConfiguration

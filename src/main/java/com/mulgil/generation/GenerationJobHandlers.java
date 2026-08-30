@@ -10,6 +10,8 @@ import com.mulgil.job.JobQueue;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.Timestamp;
 import java.nio.charset.StandardCharsets;
@@ -17,6 +19,7 @@ import java.time.Clock;
 import java.util.UUID;
 
 abstract class GenerationJobHandler implements JobHandler {
+    private static final Logger log = LoggerFactory.getLogger(GenerationJobHandler.class);
     private final JdbcClient jdbc;
     private final GenerationSnapshotService snapshots;
     private final GenerationOutputValidator validator;
@@ -50,11 +53,26 @@ abstract class GenerationJobHandler implements JobHandler {
         try {
             raw = model.generateJson(prompt(snapshot), schema());
         } catch (RuntimeException exception) {
+            log.atWarn().addKeyValue("event", "generation.provider.failed")
+                    .addKeyValue("jobId", job.id()).addKeyValue("jobType", job.type())
+                    .addKeyValue("failureType", exception.getClass().getSimpleName())
+                    .log("generation provider failed");
             throw new JobExecutionException("PROVIDER_UNAVAILABLE", "Generation provider failed.", true);
         }
         boolean session = job.examId() == null;
         boolean quiz = job.type().equals("exam_quiz_generate");
-        GenerationOutputValidator.Output output = validator.parse(raw, snapshot, session, quiz);
+        GenerationOutputValidator.Output output;
+        try {
+            output = validator.parse(raw, snapshot, session, quiz);
+        } catch (JobExecutionException exception) {
+            log.atWarn().addKeyValue("event", "generation.output.rejected")
+                    .addKeyValue("jobId", job.id()).addKeyValue("jobType", job.type())
+                    .addKeyValue("errorCode", exception.code()).log("generation output rejected");
+            throw exception;
+        }
+        log.atInfo().addKeyValue("event", "generation.provider.completed")
+                .addKeyValue("jobId", job.id()).addKeyValue("jobType", job.type())
+                .addKeyValue("sourceHash", job.sourceHash()).log("generation provider completed");
         return () -> publish(job, output);
     }
 
