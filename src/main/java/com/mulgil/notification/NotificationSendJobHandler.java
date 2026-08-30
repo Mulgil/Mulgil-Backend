@@ -3,6 +3,7 @@ package com.mulgil.notification;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
 import org.springframework.beans.factory.ObjectProvider;
@@ -20,12 +21,15 @@ final class NotificationSendJobHandler implements JobHandler {
     private final ObjectProvider<FcmPort> providers;
     private final ObjectMapper json;
     private final Clock clock;
+    private final boolean fcmEnabled;
 
-    NotificationSendJobHandler(JdbcClient jdbc, ObjectProvider<FcmPort> providers, ObjectMapper json, Clock clock) {
+    NotificationSendJobHandler(JdbcClient jdbc, ObjectProvider<FcmPort> providers, ObjectMapper json, Clock clock,
+                               MulgilProperties properties) {
         this.jdbc = jdbc;
         this.providers = providers;
         this.json = json;
         this.clock = clock;
+        this.fcmEnabled = properties.fcm().enabled();
     }
 
     @Override
@@ -38,6 +42,10 @@ final class NotificationSendJobHandler implements JobHandler {
         Delivery delivery = find(job);
         if (delivery == null) throw new JobExecutionException(
                 "NOTIFICATION_NOT_FOUND", "Notification is unavailable.", false);
+        if (!fcmEnabled) return () -> jdbc.sql("""
+                        UPDATE notifications SET status='cancelled'
+                        WHERE id=:id AND owner_id=:owner AND status IN ('scheduled','failed')
+                        """).param("id", delivery.id()).param("owner", job.ownerId()).update();
         if (delivery.deviceToken() == null) {
             fail(delivery.id());
             throw new JobExecutionException("DEVICE_TOKEN_UNAVAILABLE", "Device token is unavailable.", false);

@@ -52,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @ActiveProfiles("test")
 @ExtendWith(OutputCaptureExtension.class)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
-        "mulgil.demo.cache-enabled=true", "mulgil.demo.max-ai-jobs-per-day=30",
+        "mulgil.demo.cache-enabled=true", "mulgil.demo.max-ai-jobs-per-day=30", "mulgil.fcm.enabled=true",
         "JOB_POLL_INTERVAL_MILLIS=600000", "NOTIFICATION_POLL_INTERVAL_MILLIS=600000"})
 @Import({FinalIntegrationFakes.class, FinalRecordingTestFakes.class})
 class FinalIntegrationQaTest {
