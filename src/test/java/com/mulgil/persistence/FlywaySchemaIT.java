@@ -48,7 +48,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV009_whenDatabaseIsFresh() {
+    void appliesV001ThroughV010_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -57,13 +57,14 @@ class FlywaySchemaIT {
                             'annotation_documents', 'ink_strokes', 'emphasis_regions', 'handwriting_blocks',
                             'document_pages', 'content_blocks', 'transcript_segments', 'chunks', 'summaries',
                             'mindmaps', 'quiz_questions', 'quiz_attempts', 'progress_status', 'ai_jobs',
-                            'device_tokens', 'notifications')
+                            'device_tokens', 'notifications', 'speech_input_cleanups')
                         """).query(Integer.class).single();
         List<String> requiredIndexes = jdbc.sql("""
                         SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname IN (
                             'document_pages_material_page_uidx', 'document_pages_exam_session_page_uidx',
                             'chunks_embedding_hnsw_idx', 'ai_jobs_queued_claim_idx',
-                            'ai_jobs_expired_running_idx', 'notifications_scheduled_idx') ORDER BY indexname
+                            'ai_jobs_expired_running_idx', 'notifications_scheduled_idx',
+                            'speech_input_cleanups_due_idx', 'speech_input_cleanups_owner_idx') ORDER BY indexname
                         """).query(String.class).list();
         Integer jobColumns = jdbc.sql("""
                         SELECT count(*) FROM information_schema.columns
@@ -94,9 +95,9 @@ class FlywaySchemaIT {
                             'exam_resources_dependents_update_cleanup', 'quiz_attempts_immutable')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009");
-        assertThat(requiredTables).isEqualTo(16);
-        assertThat(requiredIndexes).hasSize(6);
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010");
+        assertThat(requiredTables).isEqualTo(17);
+        assertThat(requiredIndexes).hasSize(8);
         assertThat(jobColumns).isEqualTo(6);
         assertThat(nullableSourceParents).isEqualTo(4);
         assertThat(requiredConstraints).isEqualTo(6);
@@ -104,6 +105,22 @@ class FlywaySchemaIT {
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
                         + "jobColumns=%d nullablePageBlockParents=%d result=PASS%n", versions, requiredTables,
                 requiredIndexes.size(), requiredConstraints, requiredTriggers, jobColumns, nullableSourceParents);
+    }
+
+    @Test
+    void retainsOwnerScopedSpeechCleanup_whenOwnerGraphIsDeleted() {
+        UUID jobId = UUID.randomUUID();
+        jdbc.sql("""
+                        INSERT INTO speech_input_cleanups
+                            (job_id,owner_id,object_uris,not_before,created_at)
+                        VALUES (:job,:owner,ARRAY['gs://bucket/temporary/stt/input.m4a'],now()+interval '25 hours',now())
+                        """).param("job", jobId).param("owner", fixture.ownerId()).update();
+
+        fixture.deleteOwner();
+
+        assertThat(jdbc.sql("SELECT owner_id FROM speech_input_cleanups WHERE job_id=:job")
+                .param("job", jobId).query(UUID.class).single()).isEqualTo(fixture.ownerId());
+        System.out.println("SCHEMA_LIFECYCLE scenario=owner_deletion speechCleanupRetained=1 result=PASS");
     }
 
     @Test

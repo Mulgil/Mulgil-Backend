@@ -32,6 +32,14 @@ final class SchemaFixture {
         return sessionId;
     }
 
+    UUID ownerId() {
+        return ownerId;
+    }
+
+    void deleteOwner() {
+        jdbc.sql("DELETE FROM users WHERE id=:owner").param("owner", ownerId).update();
+    }
+
     UUID createAnnotationDocument() {
         UUID id = UUID.randomUUID();
         jdbc.sql("""
