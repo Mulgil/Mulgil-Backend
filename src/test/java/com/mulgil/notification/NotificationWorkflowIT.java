@@ -42,7 +42,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @Testcontainers
 @ActiveProfiles("test")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        classes = {com.mulgil.MulgilApplication.class, NotificationWorkflowIT.FixedTime.class})
+        classes = {com.mulgil.MulgilApplication.class, NotificationWorkflowIT.FixedTime.class},
+        properties = "mulgil.fcm.enabled=true")
 class NotificationWorkflowIT {
     private static final Instant NOW = Instant.parse("2026-09-01T03:00:00Z");
     private static final Path EVIDENCE = Path.of(".omo/evidence/mvp-backend-implementation/task-9");

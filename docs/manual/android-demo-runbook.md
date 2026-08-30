@@ -39,11 +39,18 @@ Never paste values into screenshots, tickets, chat, the repository, or the Andro
 
 ## FCM verification
 
-1. Grant notification permission on the device.
-2. Sign in and verify the device registers its current FCM token without printing it.
-3. Complete one background generation job.
-4. Confirm one notification arrives, opens a `mulgil://` deep link, and navigates to the expected owner-scoped result.
-5. Confirm lock-screen text contains no transcript, note body, filename, access token, or credential.
+Status: **NOT RUN — requires an approved Firebase project, ADC credentials, and a physical Android device.**
+
+1. Install the approved debug build on a physical Android device and grant notification permission.
+2. Sign in, allow the app to obtain its current FCM registration token, and verify `PUT /api/v1/devices/fcm-token` succeeds. Do not print, copy, screenshot, or otherwise record the token value.
+3. Set `FCM_ENABLED=true`, start the backend with ADC scoped to the approved demo project, and confirm `GOOGLE_CLOUD_PROJECT` names that same project.
+4. Complete exactly one session or exam processing job that emits `processing_complete`.
+5. Confirm exactly one notification appears with the expected title and body. Capture a redacted screenshot showing the notification and device time; the token and notification data payload must not appear.
+6. Tap the notification. Confirm its `mulgil://sessions/{sessionId}` or `mulgil://exams/{examId}` deep link opens the matching owner-scoped session or exam result, then capture a redacted screenshot of that target screen.
+7. Confirm the notification delivery is `sent`, the associated `notification_send` job is `succeeded`, and no duplicate queued or failed retry exists. Record identifiers and statuses only.
+8. Confirm lock-screen text contains no transcript, note body, filename, access token, credential, token, source content, or signed URL.
+
+Expected evidence: one redacted arrival screenshot, one redacted target-screen screenshot, and a status receipt containing only notification/job identifiers plus `delivery=sent`, `job=succeeded`, and `retry=none`.
 
 ## Device flow
 
