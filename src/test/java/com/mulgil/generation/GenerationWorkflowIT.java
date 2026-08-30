@@ -138,12 +138,35 @@ class GenerationWorkflowIT {
     void rejectsInsufficientSessionAndPredictedExamSources_throughDocumentedApis() throws Exception {
         error(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null),
                 409, "INSUFFICIENT_SOURCE_DATA");
+        sources.addReviewNote("indexed normal exam source", 0);
+        runOne("chunk_embed");
         UUID exam = UUID.fromString(ok(send("POST", "/api/v1/courses/" + course + "/exams", Map.of(
                 "title", "Midterm", "examAt", "2026-10-01T00:00:00Z", "sessionIds", List.of(session))), 201)
                 .path("id").asText());
+        UUID otherExam = UUID.fromString(ok(send("POST", "/api/v1/courses/" + course + "/exams", Map.of(
+                "title", "Other", "examAt", "2026-11-01T00:00:00Z", "sessionIds", List.of(session))), 201)
+                .path("id").asText());
+        sources.addPastExam(otherExam, "other exam source");
+        runOne("chunk_embed");
         error(send("POST", "/api/v1/exams/" + exam + "/predicted-quiz/generate", Map.of()),
                 409, "INSUFFICIENT_SOURCE_DATA");
         System.out.println("GENERATION_WORKFLOW scenario=insufficient_sources observable=session_get_409_predicted_post_409 result=PASS");
+    }
+
+    @Test
+    void waitsForRelevantPdfJob_whenItsChunkIsAlreadyIndexed() throws Exception {
+        UUID material = sources.addPreviewMaterial("partially processed preview");
+        jobs.enqueue(JobQueue.EnqueueRequest.material("pdf_extract", owner, course, session, material, 1,
+                ContentIndexingService.sha256("partially processed preview"), "pdfbox", "pdfbox-3", "none"));
+
+        runOne("chunk_embed");
+        assertThat(jobCount("preview_generate")).isZero();
+        jdbc.sql("UPDATE ai_jobs SET status='succeeded' WHERE material_id=:material AND job_type='pdf_extract'")
+                .param("material", material).update();
+        runCompletionReplay();
+
+        assertThat(jobCount("preview_generate")).isOne();
+        System.out.println("GENERATION_WORKFLOW scenario=partial_pdf observable=queued_pdf_blocks_generation_until_terminal_success result=PASS");
     }
 
     @Test

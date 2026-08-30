@@ -45,7 +45,7 @@ final class GenerationSourceFixtures {
                 "paragraphOffset", 0, "inputVersion", 1), owner, course, session, 1, text));
     }
 
-    void addPreviewMaterial(String text) {
+    UUID addPreviewMaterial(String text) {
         UUID material = UUID.randomUUID();
         UUID page = UUID.randomUUID();
         UUID block = UUID.randomUUID();
@@ -65,6 +65,7 @@ final class GenerationSourceFixtures {
                 "sourceType", "pdf_text", "materialId", material.toString(),
                 "contentBlockId", block.toString(), "pageNumber", 1, "inputVersion", 1),
                 owner, course, session, 1, text));
+        return material;
     }
 
     void addPastExam(UUID exam, String text) {

@@ -15,10 +15,12 @@ import java.util.UUID;
 final class GenerationSnapshotService {
     private final JdbcClient jdbc;
     private final ObjectMapper json;
+    private final GenerationReadinessService readiness;
 
-    GenerationSnapshotService(JdbcClient jdbc, ObjectMapper json) {
+    GenerationSnapshotService(JdbcClient jdbc, ObjectMapper json, GenerationReadinessService readiness) {
         this.jdbc = jdbc;
         this.json = json;
+        this.readiness = readiness;
     }
 
     Snapshot session(UUID ownerId, UUID courseId, UUID sessionId, String phase) {
@@ -49,9 +51,9 @@ final class GenerationSnapshotService {
                         row.getObject("source_id", UUID.class), row.getInt("input_version"),
                         row.getString("source_hash"), row.getString("text_content"),
                         row.getString("source_ref"), row.getBoolean("indexed"))).list();
-        int expected = expectedSessionSources(ownerId, courseId, sessionId, phase);
-        boolean blocked = blockedSessionSources(ownerId, courseId, sessionId, phase);
-        return snapshot(phase, ownerId, courseId, sessionId, null, sources, expected, blocked);
+        GenerationReadinessService.Readiness state = readiness.session(ownerId, courseId, sessionId, phase);
+        return snapshot(phase, ownerId, courseId, sessionId, null, sources,
+                state.expectedSources(), state.blocked());
     }
 
     Snapshot exam(UUID ownerId, UUID examId, boolean predicted) {
@@ -80,7 +82,7 @@ final class GenerationSnapshotService {
                         LEFT JOIN audio_recordings r ON r.id=ts.recording_id
                         LEFT JOIN exam_resources er ON er.id=cb.exam_resource_id
                         WHERE member.exam_id=:exam AND c.owner_id=:owner
-                          AND ((:predicted AND er.resource_type='past_exam'
+                          AND ((:predicted AND er.exam_id=:exam AND er.resource_type='past_exam'
                                 AND er.status NOT IN ('cancelled','outdated')) OR
                                (er.id IS NULL AND (
                                  (m.id IS NOT NULL AND m.status NOT IN ('cancelled','outdated'))
@@ -94,98 +96,12 @@ final class GenerationSnapshotService {
                         row.getString("source_hash"), row.getString("text_content"),
                         row.getString("source_ref"), row.getBoolean("indexed"))).list();
         String phase = predicted ? "exam_quiz" : "exam_summary";
-        int expected = expectedExamSources(ownerId, examId, predicted);
-        boolean blocked = blockedExamSources(ownerId, examId, predicted);
-        return snapshot(phase, ownerId, scope.courseId(), scope.sessionId(), examId,
-                sources, expected, blocked);
-    }
-
-    private int expectedSessionSources(UUID owner, UUID course, UUID session, String phase) {
-        return jdbc.sql("""
-                        SELECT count(*) FROM (
-                          SELECT id FROM materials WHERE owner_id=:owner AND course_id=:course AND session_id=:session
-                           AND source_phase=:materialPhase AND status NOT IN ('cancelled','outdated')
-                          UNION ALL SELECT id FROM notes WHERE :phase='review' AND owner_id=:owner
-                           AND course_id=:course AND session_id=:session AND last_left_version=version
-                          UNION ALL SELECT id FROM handwriting_blocks WHERE :phase='review' AND owner_id=:owner
-                           AND course_id=:course AND session_id=:session AND status='confirmed'
-                          UNION ALL SELECT id FROM audio_recordings WHERE :phase='review' AND owner_id=:owner
-                           AND course_id=:course AND session_id=:session AND status NOT IN ('cancelled','outdated')
-                        ) eligible
-                        """).param("owner", owner).param("course", course).param("session", session)
-                .param("phase", phase).param("materialPhase", phase + "_pdf")
-                .query(Integer.class).single();
-    }
-
-    private boolean blockedSessionSources(UUID owner, UUID course, UUID session, String phase) {
-        return jdbc.sql("""
-                        SELECT EXISTS(
-                          SELECT 1 FROM materials WHERE owner_id=:owner AND course_id=:course AND session_id=:session
-                           AND source_phase=:materialPhase AND status IN ('queued','running','failed','needs_user_review')
-                          UNION ALL SELECT 1 FROM handwriting_blocks WHERE :phase='review' AND owner_id=:owner
-                           AND course_id=:course AND session_id=:session
-                           AND status IN ('queued','succeeded','failed','needs_user_review')
-                          UNION ALL SELECT 1 FROM audio_recordings WHERE :phase='review' AND owner_id=:owner
-                           AND course_id=:course AND session_id=:session
-                           AND status IN ('queued','running','failed','needs_user_review')
-                        )
-                        """).param("owner", owner).param("course", course).param("session", session)
-                .param("phase", phase).param("materialPhase", phase + "_pdf")
-                .query(Boolean.class).single();
-    }
-
-    private int expectedExamSources(UUID owner, UUID exam, boolean predicted) {
-        return jdbc.sql("""
-                        SELECT count(*) FROM (
-                          SELECT m.id FROM exam_session_members member JOIN materials m
-                            ON m.owner_id=member.owner_id AND m.course_id=member.course_id
-                           AND m.session_id=member.session_id
-                           WHERE member.owner_id=:owner AND member.exam_id=:exam
-                             AND m.status NOT IN ('cancelled','outdated')
-                          UNION ALL SELECT n.id FROM exam_session_members member JOIN notes n
-                            ON n.owner_id=member.owner_id AND n.course_id=member.course_id
-                           AND n.session_id=member.session_id
-                           WHERE member.owner_id=:owner AND member.exam_id=:exam AND n.last_left_version=n.version
-                          UNION ALL SELECT h.id FROM exam_session_members member JOIN handwriting_blocks h
-                            ON h.owner_id=member.owner_id AND h.course_id=member.course_id
-                           AND h.session_id=member.session_id
-                           WHERE member.owner_id=:owner AND member.exam_id=:exam AND h.status='confirmed'
-                          UNION ALL SELECT r.id FROM exam_session_members member JOIN audio_recordings r
-                            ON r.owner_id=member.owner_id AND r.course_id=member.course_id
-                           AND r.session_id=member.session_id
-                           WHERE member.owner_id=:owner AND member.exam_id=:exam
-                             AND r.status NOT IN ('cancelled','outdated')
-                          UNION ALL SELECT er.id FROM exam_resources er WHERE :predicted AND er.owner_id=:owner
-                           AND er.exam_id=:exam AND er.resource_type='past_exam'
-                           AND er.status NOT IN ('cancelled','outdated')
-                        ) eligible
-                        """).param("owner", owner).param("exam", exam).param("predicted", predicted)
-                .query(Integer.class).single();
-    }
-
-    private boolean blockedExamSources(UUID owner, UUID exam, boolean predicted) {
-        return jdbc.sql("""
-                        SELECT EXISTS(
-                          SELECT 1 FROM exam_session_members member JOIN materials m
-                            ON m.owner_id=member.owner_id AND m.course_id=member.course_id
-                           AND m.session_id=member.session_id
-                           WHERE member.owner_id=:owner AND member.exam_id=:exam
-                             AND m.status IN ('queued','running','failed','needs_user_review')
-                          UNION ALL SELECT 1 FROM exam_session_members member JOIN handwriting_blocks h
-                            ON h.owner_id=member.owner_id AND h.course_id=member.course_id
-                           AND h.session_id=member.session_id
-                           WHERE member.owner_id=:owner AND member.exam_id=:exam
-                             AND h.status IN ('queued','succeeded','failed','needs_user_review')
-                          UNION ALL SELECT 1 FROM exam_session_members member JOIN audio_recordings r
-                            ON r.owner_id=member.owner_id AND r.course_id=member.course_id
-                           AND r.session_id=member.session_id
-                           WHERE member.owner_id=:owner AND member.exam_id=:exam
-                             AND r.status IN ('queued','running','failed','needs_user_review')
-                          UNION ALL SELECT 1 FROM exam_resources er WHERE :predicted AND er.owner_id=:owner
-                           AND er.exam_id=:exam AND er.status IN ('queued','running','failed','needs_user_review')
-                        )
-                        """).param("owner", owner).param("exam", exam).param("predicted", predicted)
-                .query(Boolean.class).single();
+        GenerationReadinessService.Readiness state = readiness.exam(ownerId, examId, predicted);
+        Snapshot snapshot = snapshot(phase, ownerId, scope.courseId(), scope.sessionId(), examId,
+                sources, state.expectedSources(), state.blocked());
+        boolean indexedPastExam = sources.stream().anyMatch(source ->
+                source.type().equals("past_exam") && source.indexed());
+        return predicted && !indexedPastExam ? snapshot.withReady(false) : snapshot;
     }
 
     private Snapshot snapshot(String phase, UUID owner, UUID course, UUID session, UUID exam,
@@ -209,7 +125,12 @@ final class GenerationSnapshotService {
     }
 
     record Snapshot(String phase, UUID ownerId, UUID courseId, UUID sessionId, UUID examId,
-                    List<Source> sources, String canonical, String snapshotHash, boolean ready) {}
+                    List<Source> sources, String canonical, String snapshotHash, boolean ready) {
+        Snapshot withReady(boolean value) {
+            return new Snapshot(phase, ownerId, courseId, sessionId, examId,
+                    sources, canonical, snapshotHash, value);
+        }
+    }
 
     record Source(String type, UUID sourceId, int inputVersion, String sourceHash, String text,
                   JsonNode sourceReference, boolean indexed) {
