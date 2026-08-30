@@ -1,5 +1,6 @@
 package com.mulgil.annotation;
 
+import com.mulgil.ocr.OcrProviderException;
 import com.mulgil.ocr.VisionOcrPort;
 
 import javax.imageio.ImageIO;
@@ -13,6 +14,7 @@ final class FakeHandwritingVision implements VisionOcrPort {
     private int height;
     private int inkPixels;
     private int whitePixels;
+    private OcrProviderException failure;
 
     void result(String text, double confidence) {
         result = new OcrResult(List.of(new OcrBlock(text, confidence,
@@ -21,7 +23,10 @@ final class FakeHandwritingVision implements VisionOcrPort {
         height = 0;
         inkPixels = 0;
         whitePixels = 0;
+        failure = null;
     }
+
+    void fail(OcrProviderException value) { failure = value; }
 
     int width() { return width; }
     int height() { return height; }
@@ -30,6 +35,7 @@ final class FakeHandwritingVision implements VisionOcrPort {
 
     @Override
     public OcrResult extract(byte[] image) {
+        if (failure != null) throw failure;
         try {
             BufferedImage raster = ImageIO.read(new ByteArrayInputStream(image));
             width = raster.getWidth();

@@ -2,8 +2,11 @@ package com.mulgil.annotation;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.job.JobWorkerTestDriver;
+import com.mulgil.ocr.OcrProviderException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -57,6 +60,7 @@ class AnnotationWorkflowIT {
     @Autowired JobQueue jobs;
     @Autowired List<JobHandler> handlers;
     @Autowired FakeHandwritingVision vision;
+    @Autowired MulgilProperties properties;
     private final HttpClient http = HttpClient.newHttpClient();
 
     @BeforeEach
@@ -130,6 +134,10 @@ class AnnotationWorkflowIT {
         assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE content_block_id IN "
                         + "(SELECT id FROM content_blocks WHERE handwriting_block_id=:id)")
                 .param("id", handwriting).query(Integer.class).single()).isOne();
+        assertThat(jdbc.sql("SELECT provider||':'||model_id||':'||length(source_hash) "
+                        + "FROM content_blocks WHERE handwriting_block_id=:id")
+                .param("id", handwriting).query(String.class).single())
+                .isEqualTo("user:confirmed:64");
 
         Map<String, Object> changedBox = box(0.40, 0.40, 0.10, 0.10);
         vision.result("auto accepted", 0.80);
@@ -167,6 +175,33 @@ class AnnotationWorkflowIT {
         error(send("PATCH", "/api/v1/handwriting-blocks/" + automatic + "/confirm", owner,
                 Map.of("confirmedText", "not reviewable")), 409, "VERSION_CONFLICT");
         System.out.println("ANNOTATION_WORKFLOW scenario=stroke-raster-dirty-current-confirm observable=strokePng600x500,changedPagePng400x300,changed-page-full-union,ink-on-white,unchanged-page-preserved-current,prior-output-invalidated,review-only-confirm result=PASS");
+    }
+
+    @Test
+    void preservesProviderFailureCode_whenHandwritingOcrFails() throws Exception {
+        String owner = login("annotation-owner");
+        String session = session(owner);
+        UUID material = material(owner, session);
+        ok(send("PUT", "/api/v1/materials/" + material + "/annotations", owner,
+                Map.of("expectedVersion", 0, "inkStrokes", List.of(stroke(UUID.randomUUID(), "pen",
+                        box(0.1, 0.1, 0.2, 0.2), 1)), "emphasisRegions", List.of())), 200);
+        ok(send("POST", "/api/v1/materials/" + material + "/annotations/leave", owner,
+                Map.of("changedVersion", 1)), 202);
+        vision.fail(new OcrProviderException("PROVIDER_TIMEOUT", "Vision request timed out.", true));
+        UUID ownerId = jdbc.sql("SELECT id FROM users WHERE provider_subject='annotation-owner'")
+                .query(UUID.class).single();
+        UUID jobId = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='handwriting_ocr'")
+                .query(UUID.class).single();
+
+        JobWorkerTestDriver.poll(jobs, handlers.stream()
+                .filter(value -> value.jobType().equals("handwriting_ocr")).findFirst().orElseThrow(), properties);
+
+        assertThat(jobs.get(ownerId, jobId).status()).isEqualTo("failed");
+        assertThat(jobs.get(ownerId, jobId).errorCode()).isEqualTo("PROVIDER_TIMEOUT");
+        assertThat(jobs.retry(ownerId, jobId).status()).isEqualTo("queued");
+        assertThat(jdbc.sql("SELECT count(*) FROM content_blocks block JOIN handwriting_blocks handwriting "
+                        + "ON handwriting.id=block.handwriting_block_id WHERE handwriting.input_version=1")
+                .query(Integer.class).single()).isZero();
     }
 
     private Map<String, Object> stroke(UUID id, String tool, Map<String, Object> bbox, int page) {
