@@ -23,15 +23,13 @@ class HandwritingService {
 
     private final JdbcClient jdbc;
     private final ContentIndexingService indexing;
-    private final JobQueue jobs;
     private final Clock clock;
     private final ObjectMapper json;
 
-    HandwritingService(JdbcClient jdbc, ContentIndexingService indexing, JobQueue jobs, Clock clock,
+    HandwritingService(JdbcClient jdbc, ContentIndexingService indexing, Clock clock,
                        ObjectMapper json) {
         this.jdbc = jdbc;
         this.indexing = indexing;
-        this.jobs = jobs;
         this.clock = clock;
         this.json = json;
     }
@@ -99,13 +97,8 @@ class HandwritingService {
         Map<String, Object> reference = Map.of("sourceType", "handwriting", "handwritingBlockId", block.id(),
                 "contentBlockId", contentBlockId, "materialId", block.materialId(),
                 "pageNumber", block.page(), "bboxNorm", bbox(block.bbox()), "inputVersion", block.inputVersion());
-        indexing.index(new ContentIndexingService.IndexRequest("handwriting", reference, block.ownerId(),
-                block.courseId(), block.sessionId(), block.inputVersion(), text));
-        String chunkHash = ContentIndexingService.sha256(contentBlockId + ":" + text);
-        JobQueue.AiJob job = jobs.enqueue(new JobQueue.EnqueueRequest("chunk_embed", block.ownerId(),
-                block.courseId(), block.sessionId(), null, null, null, null, null, block.inputVersion(),
-                chunkHash, "embedding", "configured", "none"));
-        return new JobQueue.JobAccepted(job.id(), job.status());
+        return indexing.index(new ContentIndexingService.IndexRequest("handwriting", reference, block.ownerId(),
+                block.courseId(), block.sessionId(), block.inputVersion(), text)).job();
     }
 
     private JsonNode bbox(String value) {

@@ -10,6 +10,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -54,6 +55,9 @@ class JobQueueIT {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("mulgil.jobs.lease-seconds", () -> 1);
+        registry.add("mulgil.demo.cache-enabled", () -> true);
+        registry.add("mulgil.ai-rates.vision-image-microusd", () -> 7);
+        registry.add("mulgil.ai-rates.generation-character-microusd", () -> Long.MAX_VALUE);
     }
 
     @Autowired
@@ -65,6 +69,12 @@ class JobQueueIT {
     @Autowired
     MulgilProperties properties;
 
+    @Autowired
+    AiProviderUsageLedger usage;
+
+    @Autowired
+    TransactionTemplate transactions;
+
     UUID ownerId;
     UUID courseId;
     UUID sessionId;
@@ -73,6 +83,7 @@ class JobQueueIT {
 
     @BeforeEach
     void seed() {
+        jdbc.sql("DELETE FROM ai_provider_usage").update();
         jdbc.sql("DELETE FROM users").update();
         COMPLETIONS.clear();
         ownerId = UUID.randomUUID();
@@ -122,6 +133,117 @@ class JobQueueIT {
             assertThat(first.get().id()).isEqualTo(second.get().id());
         }
         assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void reusesSucceededJob_whenCacheEnabledAndIdentityMatches() {
+        JobQueue.EnqueueRequest request = new JobQueue.EnqueueRequest("handwriting_ocr", ownerId, courseId,
+                sessionId, null, null, null, null, null, 1, HASH, "google-vision", "document-text", "none");
+        JobQueue.AiJob first = queue.enqueue(request);
+        JobQueue.ClaimedJob claimed = queue.claim("cache-worker", Set.of("handwriting_ocr"));
+        queue.complete(claimed, () -> {});
+
+        JobQueue.AiJob cached = queue.enqueue(request);
+
+        assertThat(cached.id()).isEqualTo(first.id());
+        assertThat(cached.status()).isEqualTo("succeeded");
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void reusesSucceededGeneration_whenOnlyAllocatedArtifactVersionChanges() {
+        JobQueue.EnqueueRequest firstRequest = new JobQueue.EnqueueRequest("review_generate", ownerId, courseId,
+                sessionId, null, null, null, null, null, 1, HASH, "vertex", "generation-v1", "prompt-v1");
+        JobQueue.AiJob first = queue.enqueue(firstRequest);
+        queue.complete(queue.claim("generation-cache", Set.of("review_generate")), () -> {});
+
+        JobQueue.AiJob replay = queue.enqueue(new JobQueue.EnqueueRequest("review_generate", ownerId, courseId,
+                sessionId, null, null, null, null, null, 2, HASH, "vertex", "generation-v1", "prompt-v1"));
+
+        assertThat(replay.id()).isEqualTo(first.id());
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type='review_generate'")
+                .query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void preservesProviderUsageAcrossPublicationRollback_withoutSensitivePayloadColumns() {
+        JobQueue.AiJob job = queue.enqueue(billable("chunk_embed", 0));
+        JobQueue.ClaimedJob claimed = queue.claim("usage-worker", Set.of("chunk_embed"));
+
+        transactions.executeWithoutResult(status -> {
+            usage.observe(claimed, "vision.ocr", "google-vision", "document-text", "image", 2L,
+                    () -> "provider-response");
+            status.setRollbackOnly();
+        });
+
+        assertThat(jdbc.sql("""
+                        SELECT status||':'||unit_type||':'||unit_count||':'||estimated_cost_microusd
+                        FROM ai_provider_usage WHERE job_id=:job
+                        """).param("job", job.id()).query(String.class).single())
+                .isEqualTo("succeeded:image:2:14");
+        assertThat(jdbc.sql("""
+                        SELECT count(*) FROM information_schema.columns
+                        WHERE table_name='ai_provider_usage'
+                          AND column_name IN ('source','raw_source','ocr_text','transcript','prompt','answer',
+                                              'signed_url','token','credential','secret')
+                        """).query(Integer.class).single()).isZero();
+    }
+
+    @Test
+    void leavesStartedUsageForInterruptedCall_andMakesOverflowCostUnknown() {
+        JobQueue.AiJob job = queue.enqueue(billable("chunk_embed", 0));
+        JobQueue.ClaimedJob claimed = queue.claim("interrupted-worker", Set.of("chunk_embed"));
+
+        AiProviderUsageLedger.UsageHandle interrupted = usage.begin(claimed.id(), claimed.ownerId(),
+                "vertex.embed", "vertex", "embedding-v1", "unicode_code_point", null);
+        AiProviderUsageLedger.UsageHandle overflow = usage.begin(claimed.id(), claimed.ownerId(),
+                "vertex.generate", "vertex", "generation-v1", "unicode_code_point", 2L);
+        usage.succeed(overflow, 2L);
+
+        assertThat(jdbc.sql("SELECT status FROM ai_provider_usage WHERE id=:id")
+                .param("id", interrupted.id()).query(String.class).single()).isEqualTo("started");
+        assertThat(jdbc.sql("SELECT estimated_cost_microusd FROM ai_provider_usage WHERE id=:id")
+                .param("id", overflow.id()).query(Long.class).optional()).isEmpty();
+    }
+
+    @Test
+    void leavesStartedUsageUnfinished_whenFinalLeaseExpiresWithoutHandlerReturn() {
+        JobQueue.AiJob job = queue.enqueue(billable("chunk_embed", 0));
+        JobQueue.ClaimedJob claimed = queue.claim("crashed-provider-worker", Set.of("chunk_embed"));
+        AiProviderUsageLedger.UsageHandle started = usage.begin(claimed.id(), claimed.ownerId(),
+                "vertex.embed", "vertex", "embedding-v1", "unicode_code_point", 4L);
+        jdbc.sql("""
+                UPDATE ai_jobs SET attempt_count=max_attempts,
+                    last_heartbeat_at=now()-interval '2 seconds', lease_expires_at=now()-interval '1 second'
+                WHERE id=:id
+                """).param("id", job.id()).update();
+
+        assertThat(queue.claim("recovery-worker", Set.of("chunk_embed"))).isNull();
+
+        assertThat(jdbc.sql("SELECT status||':'||error_code FROM ai_jobs WHERE id=:id")
+                .param("id", job.id()).query(String.class).single()).isEqualTo("failed:LEASE_EXPIRED");
+        assertThat(jdbc.sql("SELECT status||':'||(finished_at IS NULL) FROM ai_provider_usage WHERE id=:id")
+                .param("id", started.id()).query(String.class).single()).isEqualTo("started:true");
+    }
+
+    @Test
+    void missesCache_whenSourceModelOrPromptChanges() {
+        JobQueue.EnqueueRequest base = billable("chunk_embed", 0);
+        queue.enqueue(base);
+
+        queue.enqueue(new JobQueue.EnqueueRequest(base.type(), base.ownerId(), base.courseId(), base.sessionId(),
+                base.materialId(), base.examResourceId(), base.noteId(), base.recordingId(), base.examId(),
+                base.inputVersion(), "b".repeat(64), base.provider(), base.model(), base.promptVersion()));
+        queue.enqueue(new JobQueue.EnqueueRequest(base.type(), base.ownerId(), base.courseId(), base.sessionId(),
+                base.materialId(), base.examResourceId(), base.noteId(), base.recordingId(), base.examId(),
+                base.inputVersion(), base.sourceHash(), base.provider(), "fake-v2", base.promptVersion()));
+        queue.enqueue(new JobQueue.EnqueueRequest(base.type(), base.ownerId(), base.courseId(), base.sessionId(),
+                base.materialId(), base.examResourceId(), base.noteId(), base.recordingId(), base.examId(),
+                base.inputVersion(), base.sourceHash(), base.provider(), base.model(), "prompt-v2"));
+
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isEqualTo(4);
+        assertThat(jdbc.sql("SELECT count(DISTINCT cache_fingerprint) FROM ai_jobs")
+                .query(Integer.class).single()).isEqualTo(4);
     }
 
     @Test

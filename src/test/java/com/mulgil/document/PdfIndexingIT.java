@@ -135,6 +135,11 @@ class PdfIndexingIT {
                 .param("id", material).query(String.class).single()).isEqualTo("fake-vision:fake-ocr");
         assertThat(jdbc.sql("SELECT source_hash FROM content_blocks WHERE material_id=:id")
                 .param("id", material).query(String.class).single()).hasSize(64);
+        assertThat(jdbc.sql("""
+                        SELECT status||':'||unit_type||':'||unit_count FROM ai_provider_usage
+                        WHERE job_id=(SELECT id FROM ai_jobs WHERE material_id=:id AND job_type='pdf_ocr')
+                        """).param("id", material).query(String.class).single())
+                .isEqualTo("succeeded:image:1");
     }
 
     @Test

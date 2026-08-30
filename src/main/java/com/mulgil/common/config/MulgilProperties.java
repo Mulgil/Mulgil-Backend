@@ -25,6 +25,7 @@ public record MulgilProperties(
         @Valid Jobs jobs,
         @Valid Uploads uploads,
         @Valid Demo demo,
+        @Valid AiRates aiRates,
         @Valid Notifications notifications
 ) {
     public record Jwt(
@@ -83,6 +84,13 @@ public record MulgilProperties(
     }
 
     public record Demo(boolean cacheEnabled, @Min(1) int maxAiJobsPerDay) {}
+
+    public record AiRates(
+            @Min(0) long visionImageMicrousd,
+            @Min(0) long speechSecondMicrousd,
+            @Min(0) long embeddingCharacterMicrousd,
+            @Min(0) long generationCharacterMicrousd
+    ) {}
 
     public record Notifications(
             @Min(1) int postClassReminderHours,

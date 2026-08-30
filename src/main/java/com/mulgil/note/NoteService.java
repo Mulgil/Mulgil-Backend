@@ -18,13 +18,11 @@ import java.util.UUID;
 class NoteService {
     private final JdbcClient jdbc;
     private final ContentIndexingService indexing;
-    private final JobQueue jobs;
     private final Clock clock;
 
-    NoteService(JdbcClient jdbc, ContentIndexingService indexing, JobQueue jobs, Clock clock) {
+    NoteService(JdbcClient jdbc, ContentIndexingService indexing, Clock clock) {
         this.jdbc = jdbc;
         this.indexing = indexing;
-        this.jobs = jobs;
         this.clock = clock;
     }
 
@@ -84,14 +82,10 @@ class NoteService {
                     .param("offset", offset).param("hash", blockHash).param("now", Timestamp.from(clock.instant())).update();
             Map<String, Object> reference = Map.of("sourceType", "note", "noteId", noteId,
                     "contentBlockId", blockId, "paragraphOffset", offset, "inputVersion", changedVersion);
-            indexing.index(new ContentIndexingService.IndexRequest("note", reference, ownerId, note.courseId(),
-                    note.sessionId(), changedVersion, text));
+            ContentIndexingService.IndexResult indexed = indexing.index(new ContentIndexingService.IndexRequest(
+                    "note", reference, ownerId, note.courseId(), note.sessionId(), changedVersion, text));
             if (accepted == null) {
-                String chunkHash = ContentIndexingService.sha256(blockId + ":" + text);
-                JobQueue.AiJob job = jobs.enqueue(new JobQueue.EnqueueRequest("chunk_embed", ownerId,
-                        note.courseId(), note.sessionId(), null, null, noteId, null, null, changedVersion,
-                        chunkHash, "embedding", "configured", "none"));
-                accepted = new JobQueue.JobAccepted(job.id(), job.status());
+                accepted = indexed.job();
             }
             offset += text.length();
         }

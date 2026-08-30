@@ -198,6 +198,11 @@ class AnnotationWorkflowIT {
 
         assertThat(jobs.get(ownerId, jobId).status()).isEqualTo("failed");
         assertThat(jobs.get(ownerId, jobId).errorCode()).isEqualTo("PROVIDER_TIMEOUT");
+        assertThat(jdbc.sql("""
+                        SELECT status||':'||error_code FROM ai_provider_usage
+                        WHERE job_id=:job AND operation='vision.ocr'
+                        """).param("job", jobId).query(String.class).single())
+                .isEqualTo("failed:PROVIDER_TIMEOUT");
         assertThat(jobs.retry(ownerId, jobId).status()).isEqualTo("queued");
         assertThat(jdbc.sql("SELECT count(*) FROM content_blocks block JOIN handwriting_blocks handwriting "
                         + "ON handwriting.id=block.handwriting_block_id WHERE handwriting.input_version=1")

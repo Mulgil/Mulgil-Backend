@@ -29,6 +29,8 @@ public class JobQueue {
     private static final String PDF_PROVIDER = "pdfbox";
     private static final String PDF_MODEL = "pdfbox-3";
     private static final String NO_PROMPT = "none";
+    private static final Set<String> GENERATION_TYPES = Set.of(
+            "preview_generate", "review_generate", "exam_summary_generate", "exam_quiz_generate");
 
     private final JdbcClient jdbc;
     private final MulgilProperties properties;
@@ -84,43 +86,25 @@ public class JobQueue {
 
     @Transactional
     public AiJob enqueue(EnqueueRequest request) {
-        String key = idempotencyKey(request);
-        admission.admit(request.ownerId(), request.type(), key);
+        String fingerprint = idempotencyKey(request);
+        admission.lockOwner(request.ownerId());
+        boolean reuseSucceeded = properties.demo().cacheEnabled() || !admission.isBillable(request.type());
+        AiJob existing = reusable(request.ownerId(), fingerprint, reuseSucceeded);
+        if (existing != null) return existing;
+        AiJob retryable = retryable(request.ownerId(), fingerprint);
+        if (retryable != null) return retryOnEnqueue(retryable);
+        admission.admitNew(request.ownerId(), request.type());
+        String key = idempotencyKey(fingerprint + "\u001f" + UUID.randomUUID());
         Instant now = clock.instant();
         return jdbc.sql("""
                         INSERT INTO ai_jobs
                             (id, owner_id, course_id, session_id, job_type, status, input_version,
                              idempotency_key, attempt_count, max_attempts, material_id, exam_resource_id,
-                             note_id, recording_id, exam_id, source_hash, created_at)
+                             note_id, recording_id, exam_id, source_hash, cache_fingerprint, created_at)
                         VALUES
                             (:id, :ownerId, :courseId, :sessionId, :type, 'queued', :version,
                              :key, 0, :maxAttempts, :materialId, :examResourceId,
-                             :noteId, :recordingId, :examId, :sourceHash, :now)
-                        ON CONFLICT (idempotency_key) DO UPDATE
-                            SET status = CASE
-                                    WHEN ai_jobs.status = 'failed'
-                                     AND ai_jobs.attempt_count < ai_jobs.max_attempts
-                                     AND ai_jobs.error_code IN
-                                         ('PROVIDER_TIMEOUT','PROVIDER_RATE_LIMIT','PROVIDER_UNAVAILABLE','LEASE_EXPIRED')
-                                    THEN 'queued' ELSE ai_jobs.status END,
-                                error_code = CASE
-                                    WHEN ai_jobs.status = 'failed'
-                                     AND ai_jobs.attempt_count < ai_jobs.max_attempts
-                                     AND ai_jobs.error_code IN
-                                         ('PROVIDER_TIMEOUT','PROVIDER_RATE_LIMIT','PROVIDER_UNAVAILABLE','LEASE_EXPIRED')
-                                    THEN NULL ELSE ai_jobs.error_code END,
-                                error_message = CASE
-                                    WHEN ai_jobs.status = 'failed'
-                                     AND ai_jobs.attempt_count < ai_jobs.max_attempts
-                                     AND ai_jobs.error_code IN
-                                         ('PROVIDER_TIMEOUT','PROVIDER_RATE_LIMIT','PROVIDER_UNAVAILABLE','LEASE_EXPIRED')
-                                    THEN NULL ELSE ai_jobs.error_message END,
-                                finished_at = CASE
-                                    WHEN ai_jobs.status = 'failed'
-                                     AND ai_jobs.attempt_count < ai_jobs.max_attempts
-                                     AND ai_jobs.error_code IN
-                                         ('PROVIDER_TIMEOUT','PROVIDER_RATE_LIMIT','PROVIDER_UNAVAILABLE','LEASE_EXPIRED')
-                                    THEN NULL ELSE ai_jobs.finished_at END
+                             :noteId, :recordingId, :examId, :sourceHash, :fingerprint, :now)
                         RETURNING *
                         """)
                 .param("id", UUID.randomUUID()).param("ownerId", request.ownerId())
@@ -129,8 +113,43 @@ public class JobQueue {
                 .param("maxAttempts", properties.jobs().maxRetry() + 1).param("materialId", request.materialId())
                 .param("examResourceId", request.examResourceId()).param("noteId", request.noteId())
                 .param("recordingId", request.recordingId()).param("examId", request.examId())
-                .param("sourceHash", request.sourceHash()).param("now", Timestamp.from(now))
+                .param("sourceHash", request.sourceHash()).param("fingerprint", fingerprint)
+                .param("now", Timestamp.from(now))
                 .query((row, ignored) -> job(row)).single();
+    }
+
+    private AiJob reusable(UUID ownerId, String fingerprint, boolean reuseSucceeded) {
+        return jdbc.sql("""
+                        SELECT * FROM ai_jobs
+                        WHERE owner_id=:owner AND cache_fingerprint=:fingerprint
+                          AND (status IN ('queued','running') OR (:reuseSucceeded AND status='succeeded'))
+                        ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1
+                                             ELSE 2 END,
+                                 created_at DESC
+                        LIMIT 1
+                        FOR UPDATE
+                        """).param("owner", ownerId).param("fingerprint", fingerprint)
+                .param("reuseSucceeded", reuseSucceeded)
+                .query((row, ignored) -> job(row)).optional().orElse(null);
+    }
+
+    private AiJob retryable(UUID ownerId, String fingerprint) {
+        return jdbc.sql("""
+                        SELECT * FROM ai_jobs
+                        WHERE owner_id=:owner AND cache_fingerprint=:fingerprint AND status='failed'
+                          AND attempt_count < max_attempts AND error_code IN (:errors)
+                        ORDER BY created_at DESC LIMIT 1 FOR UPDATE
+                        """).param("owner", ownerId).param("fingerprint", fingerprint)
+                .param("errors", RETRYABLE_ERRORS).query((row, ignored) -> job(row)).optional().orElse(null);
+    }
+
+    private AiJob retryOnEnqueue(AiJob existing) {
+        if (!existing.status().equals("failed") || existing.attemptCount() >= existing.maxAttempts()
+                || !RETRYABLE_ERRORS.contains(existing.errorCode())) return existing;
+        return jdbc.sql("""
+                        UPDATE ai_jobs SET status='queued',error_code=NULL,error_message=NULL,finished_at=NULL
+                        WHERE id=:id RETURNING *
+                        """).param("id", existing.id()).query((row, ignored) -> job(row)).single();
     }
 
     @Transactional
@@ -320,8 +339,12 @@ public class JobQueue {
                 : request.examId() != null ? request.examId().toString()
                 : request.sessionId() + ":" + request.sourceHash();
         String canonical = String.join("\u001f", request.type(), resource, request.sessionId().toString(),
-                Integer.toString(request.inputVersion()), request.sourceHash(), request.provider(),
-                request.model(), request.promptVersion());
+                GENERATION_TYPES.contains(request.type()) ? "generated" : Integer.toString(request.inputVersion()),
+                request.sourceHash(), request.provider(), request.model(), request.promptVersion());
+        return idempotencyKey(canonical);
+    }
+
+    private static String idempotencyKey(String canonical) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                     .digest(canonical.getBytes(StandardCharsets.UTF_8)));
@@ -358,7 +381,8 @@ public class JobQueue {
         AiJob job = job(row);
         return new ClaimedJob(job.id(), job.type(), job.ownerId(), job.courseId(), job.sessionId(),
                 job.materialId(), job.examResourceId(), job.noteId(), job.recordingId(), job.examId(),
-                job.inputVersion(), job.sourceHash(), job.attemptCount(), row.getString("claimed_by"));
+                job.inputVersion(), job.sourceHash(), job.attemptCount(), job.maxAttempts(),
+                row.getString("claimed_by"));
     }
 
     private static Instant instant(ResultSet row, String column) throws SQLException {
@@ -377,7 +401,8 @@ public class JobQueue {
                         String errorCode, Instant createdAt, Instant finishedAt) {}
     public record ClaimedJob(UUID id, String type, UUID ownerId, UUID courseId, UUID sessionId,
                              UUID materialId, UUID examResourceId, UUID noteId, UUID recordingId, UUID examId,
-                             int inputVersion, String sourceHash, int attemptCount, String claimedBy) {}
+                             int inputVersion, String sourceHash, int attemptCount, int maxAttempts,
+                             String claimedBy) {}
     public record CompletionEvent(UUID jobId, String type, UUID ownerId, UUID courseId, UUID sessionId,
                                   UUID materialId, UUID examResourceId, UUID noteId, UUID recordingId, UUID examId,
                                   int inputVersion, String sourceHash) {}

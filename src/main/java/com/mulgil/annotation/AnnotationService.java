@@ -2,6 +2,7 @@ package com.mulgil.annotation;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.common.error.ApiException;
 import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.job.JobQueue;
@@ -24,11 +25,13 @@ class AnnotationService {
     private final JobQueue jobs;
     private final ObjectMapper json;
     private final Clock clock;
+    private final MulgilProperties properties;
     private final HandwritingRevisionUpdater handwritingRevisions;
 
-    AnnotationService(JdbcClient jdbc, JobQueue jobs, ObjectMapper json, Clock clock) {
+    AnnotationService(JdbcClient jdbc, JobQueue jobs, MulgilProperties properties, ObjectMapper json, Clock clock) {
         this.jdbc = jdbc;
         this.jobs = jobs;
+        this.properties = properties;
         this.json = json;
         this.clock = clock;
         this.handwritingRevisions = new HandwritingRevisionUpdater(jdbc);
@@ -106,7 +109,7 @@ class AnnotationService {
         String sourceHash = ContentIndexingService.sha256(document.id() + ":" + changedVersion);
         JobQueue.AiJob job = jobs.enqueue(new JobQueue.EnqueueRequest("handwriting_ocr", ownerId,
                 document.courseId(), document.sessionId(), null, null, null, null, null, changedVersion,
-                sourceHash, "vision", "configured", "none"));
+                sourceHash, "google-vision", properties.vision().feature(), "none"));
         return new JobQueue.JobAccepted(job.id(), job.status());
     }
 

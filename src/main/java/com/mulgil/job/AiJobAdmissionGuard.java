@@ -2,7 +2,6 @@ package com.mulgil.job;
 
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.common.error.ApiException;
-import com.mulgil.indexing.ContentIndexingService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -27,19 +26,17 @@ public final class AiJobAdmissionGuard {
         this.properties = properties;
     }
 
-    public String generationKey(String sourceHash, String provider, String modelId,
-                                String promptVersion, String scope) {
-        String cacheKey = ContentIndexingService.sha256(String.join("\u001f",
-                sourceHash, provider, modelId, promptVersion));
-        return ContentIndexingService.sha256(cacheKey + "\u001f" + scope);
+    public boolean isBillable(String jobType) {
+        return BILLABLE_TYPES.contains(jobType);
     }
 
-    public void admit(UUID ownerId, String jobType, String idempotencyKey) {
+    public void lockOwner(UUID ownerId) {
         jdbc.sql("SELECT 1 FROM pg_advisory_xact_lock(hashtextextended(:owner,0))")
                 .param("owner", ownerId.toString()).query(Integer.class).single();
-        boolean existing = jdbc.sql("SELECT EXISTS(SELECT 1 FROM ai_jobs WHERE idempotency_key=:key)")
-                .param("key", idempotencyKey).query(Boolean.class).single();
-        if (existing || !BILLABLE_TYPES.contains(jobType)) return;
+    }
+
+    public void admitNew(UUID ownerId, String jobType) {
+        if (!isBillable(jobType)) return;
         int jobsToday = jdbc.sql("""
                         SELECT count(*) FROM ai_jobs
                         WHERE owner_id=:owner
@@ -49,8 +46,8 @@ public final class AiJobAdmissionGuard {
                 .query(Integer.class).single();
         if (jobsToday < properties.demo().maxAiJobsPerDay()) return;
         log.atWarn().addKeyValue("event", "ai.job.quota.rejected")
-                .addKeyValue("ownerId", ownerId).addKeyValue("jobType", jobType)
-                .addKeyValue("jobsToday", jobsToday).log("AI job quota rejected");
+                .addKeyValue("operation", jobType).addKeyValue("status", "rejected")
+                .log("AI job quota rejected");
         throw new ApiException(HttpStatus.TOO_MANY_REQUESTS, "AI_DAILY_LIMIT_REACHED",
                 "Daily AI job limit reached.");
     }
