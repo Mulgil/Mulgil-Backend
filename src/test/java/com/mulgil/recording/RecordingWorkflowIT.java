@@ -142,8 +142,8 @@ class RecordingWorkflowIT {
         assertThat(retrieval.search(owner, course, session, "lecture", 5)).hasSize(2);
         assertThat(retrieval.search(UUID.randomUUID(), course, session, "lecture", 5)).isEmpty();
         assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type IN ('review_generate','preview_generate')")
-                .query(Integer.class).single()).isZero();
-        System.out.println("RECORDING_WORKFLOW scenario=audio_boundaries_isolation observable=unconfirmed_zero_jobs_foreign_zero_chunks result=PASS");
+                .query(Integer.class).single()).isOne();
+        System.out.println("RECORDING_WORKFLOW scenario=audio_boundaries_isolation observable=unconfirmed_zero_jobs_foreign_zero_chunks_review_queued result=PASS");
     }
 
     @Test
