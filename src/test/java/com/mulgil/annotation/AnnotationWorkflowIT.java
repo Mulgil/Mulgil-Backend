@@ -73,19 +73,21 @@ class AnnotationWorkflowIT {
         Map<String, Object> boxA = box(0.10, 0.20, 0.20, 0.20);
         Map<String, Object> boxB = box(0.50, 0.10, 0.20, 0.50);
         Map<String, Object> highlightBox = box(0.80, 0.80, 0.10, 0.10);
+        UUID stablePen = UUID.randomUUID();
         UUID penA = UUID.randomUUID();
         UUID penB = UUID.randomUUID();
 
         JsonNode document = ok(send("PUT", "/api/v1/materials/" + material + "/annotations", owner,
                 Map.of("expectedVersion", 0, "inkStrokes", List.of(
-                                stroke(penA, "pen", boxA), stroke(penB, "pen", boxB),
-                                stroke(UUID.randomUUID(), "highlight", highlightBox)),
+                                stroke(stablePen, "pen", box(0.05, 0.05, 0.10, 0.10), 1),
+                                stroke(penA, "pen", boxA, 2), stroke(penB, "pen", boxB, 2),
+                                stroke(UUID.randomUUID(), "highlight", highlightBox, 2)),
                         "emphasisRegions", List.of(Map.of("id", UUID.randomUUID(), "pageNumber", 1,
                                 "bboxNorm", box(0.3, 0.3, 0.1, 0.1), "tapCount", 4)))), 200);
         assertThat(document.path("version").asInt()).isEqualTo(1);
         assertThat(jdbc.sql("SELECT tool FROM ink_strokes WHERE annotation_document_id=:id ORDER BY tool,id")
                 .param("id", UUID.fromString(document.path("id").asText())).query(String.class).list())
-                .containsExactly("highlight", "pen", "pen");
+                .containsExactly("highlight", "pen", "pen", "pen");
         assertThat(jdbc.sql("SELECT tap_count FROM emphasis_regions WHERE annotation_document_id=:id")
                 .param("id", UUID.fromString(document.path("id").asText())).query(Integer.class).single())
                 .isEqualTo(4);
@@ -97,7 +99,7 @@ class AnnotationWorkflowIT {
                 409, "VERSION_CONFLICT");
         error(send("PUT", "/api/v1/materials/" + material + "/annotations", owner,
                 Map.of("expectedVersion", 1, "inkStrokes", List.of(stroke(UUID.randomUUID(), "pen",
-                        box(0.9, 0.9, 0.2, 0.2))), "emphasisRegions", List.of())),
+                        box(0.9, 0.9, 0.2, 0.2), 2)), "emphasisRegions", List.of())),
                 422, "VALIDATION_FAILED");
 
         ok(send("POST", "/api/v1/materials/" + material + "/annotations/leave", owner,
@@ -106,8 +108,12 @@ class AnnotationWorkflowIT {
                 Map.of("changedVersion", 1)), 204);
         runAll("handwriting_ocr");
 
-        UUID handwriting = jdbc.sql("SELECT id FROM handwriting_blocks WHERE annotation_document_id=:id")
-                .param("id", UUID.fromString(document.path("id").asText())).query(UUID.class).single();
+        UUID handwriting = jdbc.sql("SELECT id FROM handwriting_blocks WHERE annotation_document_id=:id "
+                        + "AND page_number=2").param("id", UUID.fromString(document.path("id").asText()))
+                .query(UUID.class).single();
+        UUID preserved = jdbc.sql("SELECT id FROM handwriting_blocks WHERE annotation_document_id=:id "
+                        + "AND page_number=1").param("id", UUID.fromString(document.path("id").asText()))
+                .query(UUID.class).single();
         assertThat(vision.width()).isEqualTo(600);
         assertThat(vision.height()).isEqualTo(500);
         assertThat(vision.inkPixels()).isPositive();
@@ -119,6 +125,8 @@ class AnnotationWorkflowIT {
 
         ok(send("PATCH", "/api/v1/handwriting-blocks/" + handwriting + "/confirm", owner,
                 Map.of("confirmedText", "confirmed writing")), 202);
+        ok(send("PATCH", "/api/v1/handwriting-blocks/" + preserved + "/confirm", owner,
+                Map.of("confirmedText", "preserved writing")), 202);
         assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE content_block_id IN "
                         + "(SELECT id FROM content_blocks WHERE handwriting_block_id=:id)")
                 .param("id", handwriting).query(Integer.class).single()).isOne();
@@ -129,8 +137,9 @@ class AnnotationWorkflowIT {
         vision.result("auto accepted", 0.80);
         ok(send("PUT", "/api/v1/materials/" + material + "/annotations", owner,
                 Map.of("expectedVersion", 1, "inkStrokes", List.of(
-                                stroke(penA, "pen", boxA), stroke(penB, "pen", changedBox),
-                                stroke(newPen, "pen", newBox)),
+                                stroke(stablePen, "pen", box(0.05, 0.05, 0.10, 0.10), 1),
+                                stroke(penA, "pen", boxA, 2), stroke(penB, "pen", changedBox, 2),
+                                stroke(newPen, "pen", newBox, 2)),
                         "emphasisRegions", List.of())), 200);
         ok(send("POST", "/api/v1/materials/" + material + "/annotations/leave", owner,
                 Map.of("changedVersion", 2)), 202);
@@ -138,15 +147,22 @@ class AnnotationWorkflowIT {
                 .query(String.class).single()).isEqualTo("outdated");
         assertThat(jdbc.sql("SELECT count(*) FROM content_blocks WHERE handwriting_block_id=:id")
                 .param("id", handwriting).query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT status||':'||input_version FROM handwriting_blocks WHERE id=:id")
+                .param("id", preserved).query(String.class).single()).isEqualTo("confirmed:2");
+        assertThat(jdbc.sql("SELECT source_ref->>'inputVersion' FROM chunks WHERE content_block_id IN "
+                        + "(SELECT id FROM content_blocks WHERE handwriting_block_id=:id)")
+                .param("id", preserved).query(String.class).single()).isEqualTo("2");
         error(send("PATCH", "/api/v1/handwriting-blocks/" + handwriting + "/confirm", owner,
                 Map.of("confirmedText", "stale rewrite")), 409, "VERSION_CONFLICT");
         String dirtyIds = jdbc.sql("SELECT stroke_ids::text FROM handwriting_blocks "
-                        + "WHERE annotation_document_id=:id AND input_version=2")
+                        + "WHERE annotation_document_id=:id AND input_version=2 AND page_number=2")
                 .param("id", UUID.fromString(document.path("id").asText())).query(String.class).single();
-        assertThat(dirtyIds).contains(penB.toString(), newPen.toString()).doesNotContain(penA.toString());
+        assertThat(dirtyIds).contains(penB.toString(), newPen.toString())
+                .doesNotContain(penA.toString(), stablePen.toString());
         runAll("handwriting_ocr");
         UUID automatic = jdbc.sql("SELECT id FROM handwriting_blocks WHERE annotation_document_id=:id "
-                        + "AND input_version=2").param("id", UUID.fromString(document.path("id").asText()))
+                        + "AND input_version=2 AND page_number=2")
+                .param("id", UUID.fromString(document.path("id").asText()))
                 .query(UUID.class).single();
         assertThat(jdbc.sql("SELECT status FROM handwriting_blocks WHERE id=:id").param("id", automatic)
                 .query(String.class).single()).isEqualTo("confirmed");
@@ -154,15 +170,15 @@ class AnnotationWorkflowIT {
         assertThat(vision.height()).isEqualTo(400);
         error(send("PATCH", "/api/v1/handwriting-blocks/" + automatic + "/confirm", owner,
                 Map.of("confirmedText", "not reviewable")), 409, "VERSION_CONFLICT");
-        System.out.println("ANNOTATION_WORKFLOW scenario=stroke-raster-dirty-current-confirm observable=strokePng600x500,dirtyPng400x400,new-and-modified-only,ink-on-white,prior-output-invalidated,review-only-confirm result=PASS");
+        System.out.println("ANNOTATION_WORKFLOW scenario=stroke-raster-dirty-current-confirm observable=strokePng600x500,dirtyPng400x400,new-and-modified-only,ink-on-white,unchanged-page-preserved-current,prior-output-invalidated,review-only-confirm result=PASS");
     }
 
-    private Map<String, Object> stroke(UUID id, String tool, Map<String, Object> bbox) {
+    private Map<String, Object> stroke(UUID id, String tool, Map<String, Object> bbox, int page) {
         double x = ((Number) bbox.get("x")).doubleValue();
         double y = ((Number) bbox.get("y")).doubleValue();
         double width = ((Number) bbox.get("width")).doubleValue();
         double height = ((Number) bbox.get("height")).doubleValue();
-        return Map.of("id", id, "pageNumber", 1, "tool", tool, "color", "#000000", "widthNorm", 0.01,
+        return Map.of("id", id, "pageNumber", page, "tool", tool, "color", "#000000", "widthNorm", 0.01,
                 "points", List.of(Map.of("x", x, "y", y), Map.of("x", x + width, "y", y + height)),
                 "bboxNorm", bbox);
     }
