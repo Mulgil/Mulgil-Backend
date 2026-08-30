@@ -34,12 +34,13 @@ final class RecordingSttJobHandler implements JobHandler {
     private final MulgilProperties properties;
     private final Clock clock;
     private final TransactionTemplate transactions;
+    private final SpeechInputCleanupScheduler inputCleanup;
 
     RecordingSttJobHandler(JdbcClient jdbc, ContentIndexingService indexing,
                            ObjectProvider<RecordingSegmenter> segmenters,
                            ObjectProvider<SpeechTemporaryObjectPort> temporaryObjects,
                            ObjectProvider<SpeechToTextPort> speech, MulgilProperties properties, Clock clock,
-                           TransactionTemplate transactions) {
+                           TransactionTemplate transactions, SpeechInputCleanupScheduler inputCleanup) {
         this.jdbc = jdbc;
         this.indexing = indexing;
         this.segmenters = segmenters;
@@ -48,6 +49,7 @@ final class RecordingSttJobHandler implements JobHandler {
         this.properties = properties;
         this.clock = clock;
         this.transactions = transactions;
+        this.inputCleanup = inputCleanup;
     }
 
     @Override
@@ -97,6 +99,7 @@ final class RecordingSttJobHandler implements JobHandler {
                 if (state.resumes(index)) {
                     operationId = state.operationId();
                 } else {
+                    inputCleanup.schedule(job.id(), job.ownerId(), inputUris);
                     try {
                         operationId = transcriber.start(input);
                         persistProviderRequestId(job, state.raw(), ProviderState.active(index, operationId).raw());
@@ -118,15 +121,21 @@ final class RecordingSttJobHandler implements JobHandler {
                 objects.delete(inputUri);
                 deletedInputUris.add(inputUri);
             }
+            inputCleanup.completed(job.id(), job.ownerId());
         } catch (SpeechToTextPort.TerminalOperationException exception) {
             allInputsTerminal = true;
             throw new JobExecutionException("PROVIDER_FAILED", "Speech provider rejected the operation.", false);
         } catch (RuntimeException exception) {
             throw new JobExecutionException("PROVIDER_UNAVAILABLE", "Speech provider failed.", true);
         } finally {
-            if (allInputsTerminal) inputUris.stream().filter(uri -> !deletedInputUris.contains(uri))
-                    .forEach(objects::delete);
-            segmenter.cleanup(segments);
+            try {
+                if (allInputsTerminal) {
+                    inputUris.stream().filter(uri -> !deletedInputUris.contains(uri)).forEach(objects::delete);
+                    inputCleanup.completed(job.id(), job.ownerId());
+                }
+            } finally {
+                segmenter.cleanup(segments);
+            }
         }
         return () -> publish(job);
     }

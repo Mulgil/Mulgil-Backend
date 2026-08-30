@@ -63,6 +63,7 @@ class RecordingWorkflowIT {
     @Autowired FakeSegmenter segmenter;
     @Autowired FakeTemporaryObjects temporaryObjects;
     @Autowired FakeSpeech speech;
+    @Autowired SpeechInputCleanupScheduler inputCleanup;
 
     UUID owner;
     UUID course;
@@ -70,6 +71,7 @@ class RecordingWorkflowIT {
 
     @BeforeEach
     void seed() {
+        jdbc.sql("DELETE FROM speech_input_cleanups").update();
         jdbc.sql("DELETE FROM users").update();
         segmenter.reset();
         temporaryObjects.reset();
@@ -177,6 +179,48 @@ class RecordingWorkflowIT {
         System.out.println("RECORDING_WORKFLOW scenario=provider_operation_resume observable=zero_duplicate_starts_terminal_cleanup result=PASS");
     }
 
+    @Test
+    void retainsInputsAfterAmbiguousStart_thenDeletesThemAfterProviderBound() throws Exception {
+        UUID recording = recording(1_200, "uploaded");
+        mappings.confirm(owner, recording, session);
+        speech.failNextStart();
+        JobHandler handler = handlers.stream().filter(value -> value.jobType().equals("stt"))
+                .findFirst().orElseThrow();
+        JobQueue.ClaimedJob job = jobs.claim("recording-it", Set.of("stt"));
+
+        try {
+            handler.handle(job);
+            throw new AssertionError("Expected ambiguous provider start failure.");
+        } catch (JobHandler.JobExecutionException exception) {
+            assertThat(exception.code()).isEqualTo("PROVIDER_START_UNKNOWN");
+            jobs.fail(job, exception.code(), exception.getMessage(), exception.retryable());
+        }
+
+        assertThat(temporaryObjects.deletes()).isZero();
+        assertThat(jdbc.sql("SELECT count(*) FROM speech_input_cleanups WHERE job_id=:job")
+                .param("job", job.id()).query(Integer.class).single()).isOne();
+        assertThat(jdbc.sql("""
+                        SELECT not_before>now()+interval '24 hours' AND cardinality(object_uris)=2
+                        FROM speech_input_cleanups WHERE job_id=:job
+                        """).param("job", job.id()).query(Boolean.class).single()).isTrue();
+        inputCleanup.cleanupDue();
+        assertThat(temporaryObjects.deletes()).isZero();
+        jdbc.sql("DELETE FROM ai_jobs WHERE id=:job").param("job", job.id()).update();
+        jdbc.sql("""
+                        UPDATE speech_input_cleanups
+                        SET created_at=now()-interval '26 hours',not_before=now()-interval '1 second'
+                        WHERE job_id=:job
+                        """)
+                .param("job", job.id()).update();
+
+        inputCleanup.cleanupDue();
+
+        assertThat(temporaryObjects.deletes()).isEqualTo(2);
+        assertThat(jdbc.sql("SELECT count(*) FROM speech_input_cleanups WHERE job_id=:job")
+                .param("job", job.id()).query(Integer.class).single()).isZero();
+        System.out.println("RECORDING_WORKFLOW scenario=ambiguous_start_cleanup observable=retained_before_24h_deleted_after_bound_without_job result=PASS");
+    }
+
     private String confirmAfter(CountDownLatch start, UUID recording) throws InterruptedException {
         start.await();
         try {
@@ -263,12 +307,18 @@ class RecordingWorkflowIT {
         private final AtomicInteger starts = new AtomicInteger();
         private final AtomicInteger polls = new AtomicInteger();
         private boolean inputsPresentDuringTimeout;
+        private boolean failNextStart;
         private final List<String> awaitedOperations = new java.util.ArrayList<>();
 
         FakeSpeech(FakeTemporaryObjects objects) { this.objects = objects; }
 
         @Override public String start(Input input) {
-            return "operations/fake-" + starts.incrementAndGet();
+            int start = starts.incrementAndGet();
+            if (failNextStart) {
+                failNextStart = false;
+                throw new IllegalStateException("Ambiguous provider start.");
+            }
+            return "operations/fake-" + start;
         }
 
         @Override public Optional<Transcript> await(String operationId, Input input, Duration pollTimeout) {
@@ -287,10 +337,12 @@ class RecordingWorkflowIT {
         int polls() { return polls.get(); }
         boolean inputsPresentDuringTimeout() { return inputsPresentDuringTimeout; }
         List<String> awaitedOperations() { return List.copyOf(awaitedOperations); }
+        void failNextStart() { failNextStart = true; }
         void reset() {
             starts.set(0);
             polls.set(0);
             inputsPresentDuringTimeout = false;
+            failNextStart = false;
             awaitedOperations.clear();
         }
     }
