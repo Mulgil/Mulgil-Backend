@@ -97,6 +97,10 @@ class QuizProgressIT {
         assertThat(incorrect.path("answer").path("value").asInt()).isEqualTo(2);
         assertThat(correct.path("answer").path("sourceRefs")).isNotEmpty();
         assertThat(incorrect.path("explanation").path("sourceRefs")).isNotEmpty();
+        assertThat(correct.path("progress").path("scopeType").asText()).isEqualTo("session");
+        assertThat(correct.path("progress").path("scopeId").asText()).isEqualTo(session.toString());
+        assertThat(correct.path("progress").has("sessionId")).isFalse();
+        assertThat(correct.path("progress").has("examId")).isFalse();
 
         CompletableFuture<JsonNode> repeatOne = attemptAsync(trueFalse, true);
         CompletableFuture<JsonNode> repeatTwo = attemptAsync(trueFalse, true);

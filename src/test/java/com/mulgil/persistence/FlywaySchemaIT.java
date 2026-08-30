@@ -1,5 +1,7 @@
 package com.mulgil.persistence;
 
+import org.flywaydb.core.Flyway;
+import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -7,6 +9,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -15,6 +18,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.util.List;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -48,7 +53,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV010_whenDatabaseIsFresh() {
+    void appliesV001ThroughV011_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -84,7 +89,10 @@ class FlywaySchemaIT {
                         SELECT count(*) FROM pg_constraint WHERE conname IN (
                             'exam_session_members_pkey', 'document_pages_exactly_one_parent',
                             'content_blocks_exactly_one_source', 'chunks_exactly_one_source',
-                            'ai_jobs_source_parent_check', 'ai_jobs_idempotency_key_key')
+                            'ai_jobs_source_parent_check', 'ai_jobs_idempotency_key_key',
+                            'quiz_attempts_exactly_one_scope', 'progress_status_exactly_one_scope',
+                            'quiz_attempts_session_question_fkey', 'quiz_attempts_exam_question_fkey',
+                            'progress_status_session_question_fkey', 'progress_status_exam_question_fkey')
                         """).query(Integer.class).single();
         Integer requiredTriggers = jdbc.sql("""
                         SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN (
@@ -95,16 +103,76 @@ class FlywaySchemaIT {
                             'exam_resources_dependents_update_cleanup', 'quiz_attempts_immutable')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010");
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011");
         assertThat(requiredTables).isEqualTo(17);
         assertThat(requiredIndexes).hasSize(8);
         assertThat(jobColumns).isEqualTo(6);
         assertThat(nullableSourceParents).isEqualTo(4);
-        assertThat(requiredConstraints).isEqualTo(6);
+        assertThat(requiredConstraints).isEqualTo(12);
         assertThat(requiredTriggers).isEqualTo(8);
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
                         + "jobColumns=%d nullablePageBlockParents=%d result=PASS%n", versions, requiredTables,
                 requiredIndexes.size(), requiredConstraints, requiredTriggers, jobColumns, nullableSourceParents);
+    }
+
+    @Test
+    void upgradesExistingSessionAttemptsAndProgress_toV011Scope() {
+        String schema = "upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        jdbc.sql("CREATE SCHEMA " + schema).update();
+        String url = POSTGRES.getJdbcUrl() + "&currentSchema=" + schema + ",public";
+        Flyway throughV010 = Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).target(MigrationVersion.fromVersion("010")).load();
+        throughV010.migrate();
+        JdbcClient upgrade = JdbcClient.create(new DriverManagerDataSource(
+                url, POSTGRES.getUsername(), POSTGRES.getPassword()));
+        SchemaFixture oldFixture = new SchemaFixture(upgrade);
+        UUID course = upgrade.sql("SELECT course_id FROM class_sessions WHERE owner_id=:owner AND id=:session")
+                .param("owner", oldFixture.ownerId()).param("session", oldFixture.sessionId())
+                .query(UUID.class).single();
+        UUID question = UUID.randomUUID();
+        UUID attempt = UUID.randomUUID();
+        UUID progress = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        upgrade.sql("""
+                        INSERT INTO quiz_questions
+                            (id,owner_id,course_id,session_id,quiz_scope,question_type,input_version,
+                             question_json,answer_json,explanation_json,status,model_id,prompt_version,created_at)
+                        VALUES (:id,:owner,:course,:session,'practice','true_false',1,
+                            '{"text":"q","sourceRefs":[{"sourceType":"note"}]}',
+                            '{"value":true,"sourceRefs":[{"sourceType":"note"}]}',
+                            '{"text":"e","sourceRefs":[{"sourceType":"note"}]}',
+                            'succeeded','fake','v1',:now)
+                        """).param("id", question).param("owner", oldFixture.ownerId()).param("course", course)
+                .param("session", oldFixture.sessionId()).param("now", now).update();
+        upgrade.sql("""
+                        INSERT INTO quiz_attempts
+                            (id,owner_id,quiz_question_id,submitted_answer,is_correct,submitted_at)
+                        VALUES (:id,:owner,:question,'{"value":true}',true,:now)
+                        """).param("id", attempt).param("owner", oldFixture.ownerId())
+                .param("question", question).param("now", now).update();
+        upgrade.sql("""
+                        INSERT INTO progress_status
+                            (id,owner_id,course_id,session_id,state,correct_count,incorrect_count,
+                             last_attempt_at,updated_at)
+                        VALUES (:id,:owner,:course,:session,'in_progress',1,0,:now,:now)
+                        """).param("id", progress).param("owner", oldFixture.ownerId()).param("course", course)
+                .param("session", oldFixture.sessionId()).param("now", now).update();
+
+        Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).load().migrate();
+
+        assertThat(upgrade.sql("""
+                        SELECT count(*) FROM quiz_attempts
+                        WHERE id=:id AND owner_id=:owner AND course_id=:course
+                          AND session_id=:session AND exam_id IS NULL AND quiz_question_id=:question
+                        """).param("id", attempt).param("owner", oldFixture.ownerId()).param("course", course)
+                .param("session", oldFixture.sessionId()).param("question", question)
+                .query(Integer.class).single()).isOne();
+        assertThat(upgrade.sql("SELECT count(*) FROM progress_status WHERE id=:id AND session_id=:session "
+                        + "AND exam_id IS NULL").param("id", progress).param("session", oldFixture.sessionId())
+                .query(Integer.class).single()).isOne();
+        assertThatThrownBy(() -> upgrade.sql("UPDATE quiz_attempts SET is_correct=false WHERE id=:id")
+                .param("id", attempt).update()).isInstanceOf(DataAccessException.class);
     }
 
     @Test
@@ -252,11 +320,40 @@ class FlywaySchemaIT {
 
     @Test
     void rejectsMutation_whenQuizAttemptAlreadyExists() {
-        UUID attemptId = fixture.insertQuizAttempt();
+        UUID attemptId = insertQuizAttempt();
 
         assertThatThrownBy(() -> jdbc.sql("UPDATE quiz_attempts SET is_correct = false WHERE id = :id")
                 .param("id", attemptId).update()).isInstanceOf(DataAccessException.class);
         recordFailure("immutableQuizAttempt");
+    }
+
+    private UUID insertQuizAttempt() {
+        UUID owner = fixture.ownerId();
+        UUID session = fixture.sessionId();
+        UUID course = jdbc.sql("SELECT course_id FROM class_sessions WHERE owner_id=:owner AND id=:session")
+                .param("owner", owner).param("session", session).query(UUID.class).single();
+        UUID question = UUID.randomUUID();
+        UUID attempt = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        jdbc.sql("""
+                        INSERT INTO quiz_questions
+                            (id,owner_id,course_id,session_id,quiz_scope,question_type,input_version,
+                             question_json,answer_json,explanation_json,status,model_id,prompt_version,created_at)
+                        VALUES (:id,:owner,:course,:session,'practice','true_false',1,
+                            '{"text":"q","sourceRefs":[{"sourceType":"note"}]}',
+                            '{"value":true,"sourceRefs":[{"sourceType":"note"}]}',
+                            '{"text":"e","sourceRefs":[{"sourceType":"note"}]}',
+                            'succeeded','fake','v1',:now)
+                        """).param("id", question).param("owner", owner).param("course", course)
+                .param("session", session).param("now", now).update();
+        jdbc.sql("""
+                        INSERT INTO quiz_attempts
+                            (id,owner_id,course_id,session_id,quiz_question_id,
+                             submitted_answer,is_correct,submitted_at)
+                        VALUES (:id,:owner,:course,:session,:question,'{"value":true}',true,:now)
+                        """).param("id", attempt).param("owner", owner).param("course", course)
+                .param("session", session).param("question", question).param("now", now).update();
+        return attempt;
     }
 
     private void recordFailure(String scenario) {
