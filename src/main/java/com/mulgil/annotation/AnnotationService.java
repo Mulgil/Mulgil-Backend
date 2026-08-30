@@ -55,8 +55,6 @@ class AnnotationService {
             int version = existing.version() + 1;
             jdbc.sql("UPDATE annotation_documents SET version=:version,updated_at=:now WHERE id=:id")
                     .param("version", version).param("now", now).param("id", existing.id()).update();
-            jdbc.sql("DELETE FROM ink_strokes WHERE annotation_document_id=:id")
-                    .param("id", existing.id()).update();
             jdbc.sql("DELETE FROM emphasis_regions WHERE annotation_document_id=:id")
                     .param("id", existing.id()).update();
             current = new StoredDocument(existing.id(), existing.courseId(), existing.sessionId(),
@@ -76,14 +74,27 @@ class AnnotationService {
         jdbc.sql("UPDATE annotation_documents SET last_left_version=:version,updated_at=:now WHERE id=:id")
                 .param("version", changedVersion).param("now", now).param("id", document.id()).update();
         jdbc.sql("""
-                UPDATE handwriting_blocks SET status='outdated',updated_at=:now
-                WHERE annotation_document_id=:id AND input_version<:version
-                  AND status IN ('queued','succeeded','needs_user_review','failed')
+                DELETE FROM content_blocks content
+                USING handwriting_blocks handwriting
+                WHERE content.handwriting_block_id=handwriting.id
+                  AND handwriting.annotation_document_id=:id AND handwriting.input_version<:version
+                """).param("id", document.id()).param("version", changedVersion).update();
+        jdbc.sql("""
+                UPDATE handwriting_blocks SET status='outdated',confirmed_text=NULL,updated_at=:now
+                WHERE annotation_document_id=:id AND input_version<:version AND status<>'outdated'
                 """).param("now", now).param("id", document.id()).param("version", changedVersion).update();
         List<Stroke> strokes = jdbc.sql("""
-                SELECT id,page_number,bbox_norm::text FROM ink_strokes
-                WHERE annotation_document_id=:id AND tool='pen' ORDER BY page_number,created_at,id
-                """).param("id", document.id()).query((row, ignored) -> new Stroke(
+                SELECT stroke.id,stroke.page_number,stroke.bbox_norm::text FROM ink_strokes stroke
+                WHERE stroke.annotation_document_id=:id AND stroke.tool='pen'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM handwriting_blocks prior
+                      WHERE prior.annotation_document_id=:id AND prior.input_version<:version
+                        AND prior.stroke_ids @> jsonb_build_array(stroke.id::text)
+                        AND prior.created_at>=stroke.created_at
+                  )
+                ORDER BY stroke.page_number,stroke.created_at,stroke.id
+                """).param("id", document.id()).param("version", changedVersion)
+                .query((row, ignored) -> new Stroke(
                         row.getObject("id", UUID.class), row.getInt("page_number"),
                         readBox(row.getString("bbox_norm")))).list();
         if (strokes.isEmpty()) return null;
@@ -111,11 +122,30 @@ class AnnotationService {
     }
 
     private void persist(UUID documentId, AnnotationController.Write request, Timestamp now) {
+        List<UUID> strokeIds = request.inkStrokes().stream().map(AnnotationController.InkStroke::id).toList();
+        if (strokeIds.isEmpty()) {
+            jdbc.sql("DELETE FROM ink_strokes WHERE annotation_document_id=:document")
+                    .param("document", documentId).update();
+        } else {
+            jdbc.sql("DELETE FROM ink_strokes WHERE annotation_document_id=:document AND id NOT IN (:ids)")
+                    .param("document", documentId).param("ids", strokeIds).update();
+        }
         for (AnnotationController.InkStroke stroke : request.inkStrokes()) {
             jdbc.sql("""
                     INSERT INTO ink_strokes
                         (id,annotation_document_id,page_number,tool,color,width_norm,points_json,bbox_norm,created_at)
                     VALUES (:id,:document,:page,:tool,:color,:width,CAST(:points AS jsonb),CAST(:bbox AS jsonb),:now)
+                    ON CONFLICT (id) DO UPDATE SET
+                        created_at=CASE WHEN ink_strokes.page_number=EXCLUDED.page_number
+                            AND ink_strokes.tool=EXCLUDED.tool AND ink_strokes.color=EXCLUDED.color
+                            AND ink_strokes.width_norm=EXCLUDED.width_norm
+                            AND ink_strokes.points_json=EXCLUDED.points_json
+                            AND ink_strokes.bbox_norm=EXCLUDED.bbox_norm
+                            THEN ink_strokes.created_at ELSE EXCLUDED.created_at END,
+                        page_number=EXCLUDED.page_number,tool=EXCLUDED.tool,color=EXCLUDED.color,
+                        width_norm=EXCLUDED.width_norm,points_json=EXCLUDED.points_json,
+                        bbox_norm=EXCLUDED.bbox_norm
+                    WHERE ink_strokes.annotation_document_id=EXCLUDED.annotation_document_id
                     """).param("id", stroke.id()).param("document", documentId).param("page", stroke.pageNumber())
                     .param("tool", stroke.tool().name()).param("color", stroke.color())
                     .param("width", stroke.widthNorm()).param("points", write(stroke.points()))

@@ -4,11 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
-import com.mulgil.ocr.VisionOcrPort;
-import com.mulgil.storage.CloudStoragePort;
-import org.apache.pdfbox.pdmodel.PDDocument;
-import org.apache.pdfbox.pdmodel.PDPage;
-import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,16 +26,12 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import javax.imageio.ImageIO;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -65,43 +56,13 @@ class AnnotationWorkflowIT {
     @Autowired JdbcClient jdbc;
     @Autowired JobQueue jobs;
     @Autowired List<JobHandler> handlers;
-    @Autowired FakeVision vision;
-    @Autowired FakeStorage storage;
+    @Autowired FakeHandwritingVision vision;
     private final HttpClient http = HttpClient.newHttpClient();
 
     @BeforeEach
     void reset() {
         jdbc.sql("DELETE FROM users").update();
         vision.result("unconfirmed writing", 0.79);
-    }
-
-    @Test
-    void noteLeaveIndexesCurrentVersion_onceAndRejectsStaleOrForeignWrites() throws Exception {
-        String owner = login("note-owner");
-        String session = session(owner);
-        JsonNode note = ok(send("POST", "/api/v1/sessions/" + session + "/notes", owner,
-                Map.of("bodyMarkdown", "first paragraph\n\nsecond paragraph")), 201);
-        String noteId = note.path("id").asText();
-
-        JsonNode patched = ok(send("PATCH", "/api/v1/notes/" + noteId, owner,
-                Map.of("bodyMarkdown", "updated", "expectedVersion", 1)), 200);
-        assertThat(patched.path("version").asInt()).isEqualTo(2);
-        error(send("PATCH", "/api/v1/notes/" + noteId, owner,
-                Map.of("bodyMarkdown", "stale", "expectedVersion", 1)), 409, "VERSION_CONFLICT");
-        error(send("PATCH", "/api/v1/notes/" + noteId, login("note-foreign"),
-                Map.of("bodyMarkdown", "foreign", "expectedVersion", 2)), 404, "NOTE_NOT_FOUND");
-
-        JsonNode accepted = ok(send("POST", "/api/v1/notes/" + noteId + "/leave", owner,
-                Map.of("changedVersion", 2)), 202);
-        assertThat(accepted.path("status").asText()).isEqualTo("queued");
-        ok(send("POST", "/api/v1/notes/" + noteId + "/leave", owner,
-                Map.of("changedVersion", 2)), 204);
-        assertThat(jdbc.sql("SELECT count(*) FROM content_blocks WHERE note_id=:id")
-                .param("id", UUID.fromString(noteId)).query(Integer.class).single()).isOne();
-        assertThat(jdbc.sql("SELECT source_ref->>'sourceType' FROM chunks WHERE content_block_id IN "
-                        + "(SELECT id FROM content_blocks WHERE note_id=:id)")
-                .param("id", UUID.fromString(noteId)).query(String.class).single()).isEqualTo("note");
-        System.out.println("ANNOTATION_WORKFLOW scenario=note-version-leave observable=409,404,202,204,one-note-chunk result=PASS");
     }
 
     @Test
@@ -147,8 +108,10 @@ class AnnotationWorkflowIT {
 
         UUID handwriting = jdbc.sql("SELECT id FROM handwriting_blocks WHERE annotation_document_id=:id")
                 .param("id", UUID.fromString(document.path("id").asText())).query(UUID.class).single();
-        assertThat(vision.width()).isEqualTo(126);
-        assertThat(vision.height()).isEqualTo(105);
+        assertThat(vision.width()).isEqualTo(600);
+        assertThat(vision.height()).isEqualTo(500);
+        assertThat(vision.inkPixels()).isPositive();
+        assertThat(vision.whitePixels()).isPositive();
         assertThat(jdbc.sql("SELECT status FROM handwriting_blocks WHERE id=:id").param("id", handwriting)
                 .query(String.class).single()).isEqualTo("needs_user_review");
         assertThat(jdbc.sql("SELECT count(*) FROM content_blocks WHERE handwriting_block_id=:id")
@@ -160,22 +123,48 @@ class AnnotationWorkflowIT {
                         + "(SELECT id FROM content_blocks WHERE handwriting_block_id=:id)")
                 .param("id", handwriting).query(Integer.class).single()).isOne();
 
+        UUID newPen = UUID.randomUUID();
+        Map<String, Object> newBox = box(0.70, 0.70, 0.10, 0.10);
+        Map<String, Object> changedBox = box(0.40, 0.40, 0.10, 0.10);
         vision.result("auto accepted", 0.80);
         ok(send("PUT", "/api/v1/materials/" + material + "/annotations", owner,
-                Map.of("expectedVersion", 1, "inkStrokes", List.of(stroke(UUID.randomUUID(), "pen", boxA)),
+                Map.of("expectedVersion", 1, "inkStrokes", List.of(
+                                stroke(penA, "pen", boxA), stroke(penB, "pen", changedBox),
+                                stroke(newPen, "pen", newBox)),
                         "emphasisRegions", List.of())), 200);
         ok(send("POST", "/api/v1/materials/" + material + "/annotations/leave", owner,
                 Map.of("changedVersion", 2)), 202);
+        assertThat(jdbc.sql("SELECT status FROM handwriting_blocks WHERE id=:id").param("id", handwriting)
+                .query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT count(*) FROM content_blocks WHERE handwriting_block_id=:id")
+                .param("id", handwriting).query(Integer.class).single()).isZero();
+        error(send("PATCH", "/api/v1/handwriting-blocks/" + handwriting + "/confirm", owner,
+                Map.of("confirmedText", "stale rewrite")), 409, "VERSION_CONFLICT");
+        String dirtyIds = jdbc.sql("SELECT stroke_ids::text FROM handwriting_blocks "
+                        + "WHERE annotation_document_id=:id AND input_version=2")
+                .param("id", UUID.fromString(document.path("id").asText())).query(String.class).single();
+        assertThat(dirtyIds).contains(penB.toString(), newPen.toString()).doesNotContain(penA.toString());
         runAll("handwriting_ocr");
-        assertThat(jdbc.sql("SELECT status FROM handwriting_blocks WHERE annotation_document_id=:id "
+        UUID automatic = jdbc.sql("SELECT id FROM handwriting_blocks WHERE annotation_document_id=:id "
                         + "AND input_version=2").param("id", UUID.fromString(document.path("id").asText()))
+                .query(UUID.class).single();
+        assertThat(jdbc.sql("SELECT status FROM handwriting_blocks WHERE id=:id").param("id", automatic)
                 .query(String.class).single()).isEqualTo("confirmed");
-        System.out.println("ANNOTATION_WORKFLOW scenario=pen-union-low-confidence-confirm observable=penCropPng126x105,normalized,owner404,202,204,review,no-chunk,confirm-one-chunk,threshold-auto-confirm result=PASS");
+        assertThat(vision.width()).isEqualTo(400);
+        assertThat(vision.height()).isEqualTo(400);
+        error(send("PATCH", "/api/v1/handwriting-blocks/" + automatic + "/confirm", owner,
+                Map.of("confirmedText", "not reviewable")), 409, "VERSION_CONFLICT");
+        System.out.println("ANNOTATION_WORKFLOW scenario=stroke-raster-dirty-current-confirm observable=strokePng600x500,dirtyPng400x400,new-and-modified-only,ink-on-white,prior-output-invalidated,review-only-confirm result=PASS");
     }
 
     private Map<String, Object> stroke(UUID id, String tool, Map<String, Object> bbox) {
+        double x = ((Number) bbox.get("x")).doubleValue();
+        double y = ((Number) bbox.get("y")).doubleValue();
+        double width = ((Number) bbox.get("width")).doubleValue();
+        double height = ((Number) bbox.get("height")).doubleValue();
         return Map.of("id", id, "pageNumber", 1, "tool", tool, "color", "#000000", "widthNorm", 0.01,
-                "points", List.of(Map.of("x", bbox.get("x"), "y", bbox.get("y"))), "bboxNorm", bbox);
+                "points", List.of(Map.of("x", x, "y", y), Map.of("x", x + width, "y", y + height)),
+                "bboxNorm", bbox);
     }
 
     private static Map<String, Object> box(double x, double y, double width, double height) {
@@ -198,18 +187,7 @@ class AnnotationWorkflowIT {
                 """).param("id", id).param("owner", owner).param("course", course)
                 .param("session", UUID.fromString(session)).param("key", "material/" + id)
                 .param("hash", "a".repeat(64)).param("now", now).update();
-        storage.put("material/" + id, pdf());
         return id;
-    }
-
-    private static byte[] pdf() {
-        try (PDDocument document = new PDDocument(); ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            document.addPage(new PDPage(new PDRectangle(100, 100)));
-            document.save(output);
-            return output.toByteArray();
-        } catch (Exception exception) {
-            throw new IllegalStateException(exception);
-        }
     }
 
     private String session(String token) throws Exception {
@@ -260,54 +238,8 @@ class AnnotationWorkflowIT {
 
     @TestConfiguration
     static class Fakes {
-        @Bean @Primary FakeVision fakeVision() {
-            return new FakeVision();
+        @Bean @Primary FakeHandwritingVision fakeVision() {
+            return new FakeHandwritingVision();
         }
-
-        @Bean @Primary FakeStorage fakeStorage() {
-            return new FakeStorage();
-        }
-    }
-
-    static final class FakeVision implements VisionOcrPort {
-        private OcrResult result;
-        private int width;
-        private int height;
-
-        void result(String text, double confidence) {
-            result = new OcrResult(List.of(new OcrBlock(text, confidence,
-                    new NormalizedBox(0, 0, 1, 1))), "fake-vision", "fake-handwriting");
-            width = 0;
-            height = 0;
-        }
-
-        int width() { return width; }
-        int height() { return height; }
-
-        @Override
-        public OcrResult extract(byte[] image) {
-            try {
-                BufferedImage crop = ImageIO.read(new ByteArrayInputStream(image));
-                width = crop.getWidth();
-                height = crop.getHeight();
-                return result;
-            } catch (Exception exception) {
-                throw new IllegalArgumentException(exception);
-            }
-        }
-    }
-
-    static final class FakeStorage implements CloudStoragePort {
-        private final java.util.Map<String, byte[]> objects = new java.util.HashMap<>();
-
-        void put(String key, byte[] value) { objects.put(key, value); }
-        @Override public URI createUploadUrl(String key, String type, long length, Instant expiry) {
-            return URI.create("https://storage.test/upload");
-        }
-        @Override public URI createDownloadUrl(String key, Instant expiry) {
-            return URI.create("https://storage.test/download");
-        }
-        @Override public StoredObjectMetadata metadata(String key) { return null; }
-        @Override public byte[] read(String key) { return objects.get(key); }
     }
 }

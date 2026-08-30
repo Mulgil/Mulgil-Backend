@@ -40,23 +40,22 @@ class HandwritingService {
     JobQueue.JobAccepted confirm(UUID ownerId, UUID blockId, String text) {
         Block block = block(ownerId, blockId, true);
         if (block == null) throw notFound();
+        if (!block.status().equals("needs_user_review") || block.inputVersion() != block.documentVersion()) {
+            throw conflict();
+        }
         jdbc.sql("""
                 UPDATE handwriting_blocks
                 SET confirmed_text=:text,status='confirmed',updated_at=:now WHERE id=:id
                 """).param("text", text.strip()).param("now", Timestamp.from(clock.instant()))
                 .param("id", blockId).update();
-        return index(block, text.strip(), "user", "confirmed");
+        return index(block, text.strip(), new SourceAttribution("user", "confirmed"));
     }
 
     @Transactional
     void publish(OcrResult result) {
         Block block = block(result.ownerId(), result.blockId(), true);
         if (block == null) return;
-        boolean current = jdbc.sql("""
-                SELECT EXISTS(SELECT 1 FROM annotation_documents
-                    WHERE id=:document AND version=:version)
-                """).param("document", block.documentId()).param("version", block.inputVersion())
-                .query(Boolean.class).single();
+        boolean current = block.inputVersion() == block.documentVersion();
         if (!current || !block.status().equals("queued")) {
             if (block.status().equals("queued")) {
                 jdbc.sql("UPDATE handwriting_blocks SET status='outdated',updated_at=:now WHERE id=:id")
@@ -78,10 +77,10 @@ class HandwritingService {
                     status='confirmed',updated_at=:now WHERE id=:id
                 """).param("text", text).param("confidence", result.confidence())
                 .param("now", Timestamp.from(clock.instant())).param("id", block.id()).update();
-        index(block, text, result.provider(), result.model());
+        index(block, text, new SourceAttribution(result.provider(), result.model()));
     }
 
-    private JobQueue.JobAccepted index(Block block, String text, String provider, String model) {
+    private JobQueue.JobAccepted index(Block block, String text, SourceAttribution source) {
         jdbc.sql("DELETE FROM content_blocks WHERE handwriting_block_id=:id")
                 .param("id", block.id()).update();
         UUID contentBlockId = UUID.nameUUIDFromBytes((block.id() + ":" + block.inputVersion())
@@ -95,7 +94,7 @@ class HandwritingService {
                         :provider,:model,:hash,:now)
                 """).param("id", contentBlockId).param("owner", block.ownerId()).param("course", block.courseId())
                 .param("session", block.sessionId()).param("block", block.id()).param("text", text)
-                .param("bbox", block.bbox()).param("provider", provider).param("model", model)
+                .param("bbox", block.bbox()).param("provider", source.provider()).param("model", source.model())
                 .param("hash", blockHash).param("now", Timestamp.from(clock.instant())).update();
         Map<String, Object> reference = Map.of("sourceType", "handwriting", "handwritingBlockId", block.id(),
                 "contentBlockId", contentBlockId, "materialId", block.materialId(),
@@ -119,19 +118,20 @@ class HandwritingService {
 
     Block block(UUID ownerId, UUID blockId, boolean lock) {
         return jdbc.sql("""
-                SELECT block.id,block.owner_id,block.course_id,block.session_id,block.annotation_document_id,
+                SELECT block.id,block.owner_id,block.course_id,block.session_id,
                        document.material_id,block.page_number,block.bbox_norm::text,block.input_version,
-                       block.status
+                       block.status,document.version document_version
                 FROM handwriting_blocks block
                 JOIN annotation_documents document ON document.id=block.annotation_document_id
                 WHERE block.owner_id=:owner AND block.id=:id
-                """ + (lock ? " FOR UPDATE OF block" : ""))
+                """ + (lock ? " FOR UPDATE OF block,document" : ""))
                 .param("owner", ownerId).param("id", blockId)
                 .query((row, ignored) -> new Block(row.getObject("id", UUID.class),
                         row.getObject("owner_id", UUID.class), row.getObject("course_id", UUID.class),
-                        row.getObject("session_id", UUID.class), row.getObject("annotation_document_id", UUID.class),
-                        row.getObject("material_id", UUID.class), row.getInt("page_number"),
-                        row.getString("bbox_norm"), row.getInt("input_version"), row.getString("status")))
+                        row.getObject("session_id", UUID.class), row.getObject("material_id", UUID.class),
+                        row.getInt("page_number"),
+                        row.getString("bbox_norm"), row.getInt("input_version"), row.getString("status"),
+                        row.getInt("document_version")))
                 .optional().orElse(null);
     }
 
@@ -139,7 +139,12 @@ class HandwritingService {
         return new ApiException(HttpStatus.NOT_FOUND, "HANDWRITING_NOT_FOUND", "Handwriting block not found.");
     }
 
+    private static ApiException conflict() {
+        return new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT", "Version conflict.");
+    }
+
     record OcrResult(UUID ownerId, UUID blockId, String text, double confidence, String provider, String model) {}
-    record Block(UUID id, UUID ownerId, UUID courseId, UUID sessionId, UUID documentId, UUID materialId,
-                 int page, String bbox, int inputVersion, String status) {}
+    record Block(UUID id, UUID ownerId, UUID courseId, UUID sessionId, UUID materialId,
+                 int page, String bbox, int inputVersion, String status, int documentVersion) {}
+    private record SourceAttribution(String provider, String model) {}
 }
