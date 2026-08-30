@@ -25,11 +25,13 @@ final class GcsSpeechTemporaryObjectAdapter implements SpeechTemporaryObjectPort
     }
 
     @Override
-    public URI put(Path segment) {
-        String key = "temporary/stt/" + UUID.randomUUID() + ".m4a";
+    public URI put(UUID jobId, int segmentIndex, Path segment) {
+        String key = "temporary/stt/" + jobId + "/" + segmentIndex + ".m4a";
         try {
-            storage.create(BlobInfo.newBuilder(bucket, key).setContentType("audio/mp4").build(),
-                    Files.readAllBytes(segment));
+            if (storage.get(bucket, key) == null) {
+                storage.create(BlobInfo.newBuilder(bucket, key).setContentType("audio/mp4").build(),
+                        Files.readAllBytes(segment));
+            }
             return URI.create("gs://" + bucket + "/" + key);
         } catch (IOException exception) {
             throw new IllegalStateException("Could not upload temporary speech object.", exception);

@@ -28,6 +28,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -61,6 +62,7 @@ class RecordingWorkflowIT {
     @Autowired List<JobHandler> handlers;
     @Autowired FakeSegmenter segmenter;
     @Autowired FakeTemporaryObjects temporaryObjects;
+    @Autowired FakeSpeech speech;
 
     UUID owner;
     UUID course;
@@ -71,6 +73,7 @@ class RecordingWorkflowIT {
         jdbc.sql("DELETE FROM users").update();
         segmenter.reset();
         temporaryObjects.reset();
+        speech.reset();
         owner = UUID.randomUUID();
         course = UUID.randomUUID();
         session = UUID.randomUUID();
@@ -141,6 +144,39 @@ class RecordingWorkflowIT {
         System.out.println("RECORDING_WORKFLOW scenario=audio_boundaries_isolation observable=unconfirmed_zero_jobs_foreign_zero_chunks result=PASS");
     }
 
+    @Test
+    void keepsBatchInputsAndStartsOneOperation_whenFirstProviderWaitTimesOut() throws Exception {
+        UUID recording = recording(1_200, "uploaded");
+        mappings.confirm(owner, recording, session);
+
+        runAll("stt");
+
+        assertThat(speech.starts()).isOne();
+        assertThat(speech.polls()).isEqualTo(2);
+        assertThat(speech.inputsPresentDuringTimeout()).isTrue();
+        assertThat(temporaryObjects.deletes()).isEqualTo(2);
+        assertThat(jdbc.sql("SELECT provider_request_id FROM ai_jobs WHERE recording_id=:recording")
+                .param("recording", recording).query(String.class).single()).isEqualTo("operations/fake-1");
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE recording_id=:recording")
+                .param("recording", recording).query(String.class).single()).isEqualTo("succeeded");
+        System.out.println("RECORDING_WORKFLOW scenario=provider_wait_timeout observable=one_operation_inputs_deleted_after_terminal result=PASS");
+    }
+
+    @Test
+    void resumesPersistedProviderOperation_withoutStartingAnotherPaidOperation() throws Exception {
+        UUID recording = recording(1_200, "uploaded");
+        JobQueue.JobAccepted accepted = mappings.confirm(owner, recording, session);
+        jdbc.sql("UPDATE ai_jobs SET provider_request_id='operations/existing' WHERE id=:id")
+                .param("id", accepted.jobId()).update();
+
+        runAll("stt");
+
+        assertThat(speech.starts()).isZero();
+        assertThat(speech.awaitedOperation()).isEqualTo("operations/existing");
+        assertThat(temporaryObjects.deletes()).isEqualTo(2);
+        System.out.println("RECORDING_WORKFLOW scenario=provider_operation_resume observable=zero_duplicate_starts_terminal_cleanup result=PASS");
+    }
+
     private String confirmAfter(CountDownLatch start, UUID recording) throws InterruptedException {
         start.await();
         try {
@@ -190,11 +226,7 @@ class RecordingWorkflowIT {
     static class Fakes {
         @Bean @Primary FakeSegmenter segmenter() { return new FakeSegmenter(); }
         @Bean @Primary FakeTemporaryObjects temporaryObjects() { return new FakeTemporaryObjects(); }
-        @Bean @Primary SpeechToTextPort speech() {
-            return (uri, offset) -> new SpeechToTextPort.Transcript(
-                    List.of(new SpeechToTextPort.Segment(100, 500, "segment " + offset.toSeconds(), null)),
-                    "fake-chirp", "chirp_3");
-        }
+        @Bean @Primary FakeSpeech speech(FakeTemporaryObjects objects) { return new FakeSpeech(objects); }
         @Bean @Primary ChunkEmbeddingPort embeddings() {
             return text -> new ChunkEmbeddingPort.Embedding(Collections.nCopies(768, 0.25f), "fake-768");
         }
@@ -215,12 +247,51 @@ class RecordingWorkflowIT {
     static final class FakeTemporaryObjects implements SpeechTemporaryObjectPort {
         private final AtomicInteger puts = new AtomicInteger();
         private final AtomicInteger deletes = new AtomicInteger();
-        @Override public URI put(Path segment) {
-            return URI.create("gs://fake-bucket/stt/" + puts.incrementAndGet() + ".m4a");
+        @Override public URI put(UUID jobId, int segmentIndex, Path segment) {
+            puts.incrementAndGet();
+            return URI.create("gs://fake-bucket/stt/" + jobId + "/" + segmentIndex + ".m4a");
         }
         @Override public void delete(URI uri) { deletes.incrementAndGet(); }
         int puts() { return puts.get(); }
         int deletes() { return deletes.get(); }
+        int active() { return puts.get() - deletes.get(); }
         void reset() { puts.set(0); deletes.set(0); }
+    }
+
+    static final class FakeSpeech implements SpeechToTextPort {
+        private final FakeTemporaryObjects objects;
+        private final AtomicInteger starts = new AtomicInteger();
+        private final AtomicInteger polls = new AtomicInteger();
+        private boolean inputsPresentDuringTimeout;
+        private String awaitedOperation;
+
+        FakeSpeech(FakeTemporaryObjects objects) { this.objects = objects; }
+
+        @Override public String start(List<Input> inputs) {
+            starts.incrementAndGet();
+            return "operations/fake-1";
+        }
+
+        @Override public Optional<Transcript> await(String operationId, List<Input> inputs, Duration pollTimeout) {
+            awaitedOperation = operationId;
+            if (polls.incrementAndGet() == 1) {
+                inputsPresentDuringTimeout = objects.active() == 2;
+                return Optional.empty();
+            }
+            return Optional.of(new Transcript(List.of(
+                    new Segment(100, 500, "segment 0", null),
+                    new Segment(1_140_100, 1_140_500, "segment 1140", null)), "fake-chirp", "chirp_3"));
+        }
+
+        int starts() { return starts.get(); }
+        int polls() { return polls.get(); }
+        boolean inputsPresentDuringTimeout() { return inputsPresentDuringTimeout; }
+        String awaitedOperation() { return awaitedOperation; }
+        void reset() {
+            starts.set(0);
+            polls.set(0);
+            inputsPresentDuringTimeout = false;
+            awaitedOperation = null;
+        }
     }
 }

@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 @Component
@@ -71,26 +72,60 @@ final class RecordingSttJobHandler implements JobHandler {
             throw new JobExecutionException("AUDIO_SEGMENT_FAILED", "Audio segmentation failed.", false);
         }
         List<PreparedSegment> prepared = new ArrayList<>();
+        List<URI> inputUris = new ArrayList<>();
+        boolean terminal = false;
         try {
-            for (RecordingSegmenter.AudioSegment segment : segments) {
-                URI uri = objects.put(segment.path());
+            for (int index = 0; index < segments.size(); index++) {
+                inputUris.add(objects.put(job.id(), index, segments.get(index).path()));
+            }
+            List<SpeechToTextPort.Input> inputs = java.util.stream.IntStream.range(0, segments.size())
+                    .mapToObj(index -> new SpeechToTextPort.Input(inputUris.get(index), segments.get(index).offset()))
+                    .toList();
+            String operationId = providerRequestId(job.id());
+            if (operationId == null) {
                 try {
-                    SpeechToTextPort.Transcript transcript = transcriber.transcribe(uri, segment.offset());
-                    for (SpeechToTextPort.Segment value : transcript.segments()) {
-                        long offsetMs = segment.offset().toMillis();
-                        prepared.add(new PreparedSegment(offsetMs + value.startMs(), offsetMs + value.endMs(),
-                                value.text(), value.confidence(), transcript.provider(), transcript.model()));
-                    }
-                } finally {
-                    objects.delete(uri);
+                    operationId = transcriber.start(inputs);
+                    persistProviderRequestId(job, operationId);
+                } catch (RuntimeException exception) {
+                    throw new JobExecutionException("PROVIDER_START_UNKNOWN",
+                            "Speech operation start could not be confirmed.", false);
                 }
             }
+            Optional<SpeechToTextPort.Transcript> result;
+            do {
+                result = transcriber.await(operationId, inputs,
+                        Duration.ofSeconds(properties.jobs().providerTimeoutSeconds()));
+            } while (result.isEmpty());
+            terminal = true;
+            SpeechToTextPort.Transcript transcript = result.orElseThrow();
+            for (SpeechToTextPort.Segment value : transcript.segments()) {
+                prepared.add(new PreparedSegment(value.startMs(), value.endMs(), value.text(), value.confidence(),
+                        transcript.provider(), transcript.model()));
+            }
+        } catch (SpeechToTextPort.TerminalOperationException exception) {
+            terminal = true;
+            throw new JobExecutionException("PROVIDER_FAILED", "Speech provider rejected the operation.", false);
         } catch (RuntimeException exception) {
             throw new JobExecutionException("PROVIDER_UNAVAILABLE", "Speech provider failed.", true);
         } finally {
+            if (terminal) inputUris.forEach(objects::delete);
             segmenter.cleanup(segments);
         }
         return () -> publish(job, prepared);
+    }
+
+    private String providerRequestId(UUID jobId) {
+        return jdbc.sql("SELECT provider_request_id FROM ai_jobs WHERE id=:id")
+                .param("id", jobId).query(String.class).optional().orElse(null);
+    }
+
+    private void persistProviderRequestId(JobQueue.ClaimedJob job, String operationId) {
+        int updated = jdbc.sql("""
+                        UPDATE ai_jobs SET provider_request_id=:operation
+                        WHERE id=:id AND status='running' AND claimed_by=:worker AND provider_request_id IS NULL
+                        """).param("operation", operationId).param("id", job.id())
+                .param("worker", job.claimedBy()).update();
+        if (updated != 1) throw new IllegalStateException("Could not persist speech operation ID.");
     }
 
     private void publish(JobQueue.ClaimedJob job, List<PreparedSegment> segments) {
