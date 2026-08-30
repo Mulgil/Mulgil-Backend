@@ -312,8 +312,9 @@ public class JobQueue {
                 : request.examResourceId() != null ? request.examResourceId().toString()
                 : request.noteId() != null ? request.noteId().toString()
                 : request.recordingId() != null ? request.recordingId().toString()
-                : request.examId().toString();
-        String canonical = String.join("\u001f", request.type(), resource,
+                : request.examId() != null ? request.examId().toString()
+                : request.sessionId() + ":" + request.sourceHash();
+        String canonical = String.join("\u001f", request.type(), resource, request.sessionId().toString(),
                 Integer.toString(request.inputVersion()), request.sourceHash(), request.provider(),
                 request.model(), request.promptVersion());
         try {

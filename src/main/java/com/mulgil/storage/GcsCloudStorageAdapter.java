@@ -50,4 +50,10 @@ final class GcsCloudStorageAdapter implements CloudStoragePort {
         String checksum = blob.getMetadata() == null ? null : blob.getMetadata().get("sha256");
         return new StoredObjectMetadata(blob.getContentType(), blob.getSize(), checksum);
     }
+
+    @Override
+    public byte[] read(String objectKey) {
+        Blob blob = storage.get(bucket, objectKey);
+        return blob == null ? null : blob.getContent();
+    }
 }

@@ -3,6 +3,7 @@ package com.mulgil.job;
 import com.mulgil.common.config.MulgilProperties;
 import jakarta.annotation.PreDestroy;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 
@@ -18,6 +19,7 @@ import java.util.stream.Collectors;
 
 @Configuration
 @EnableScheduling
+@Profile("!test")
 class JobWorker {
     private final JobQueue queue;
     private final Map<String, JobHandler> handlers;
