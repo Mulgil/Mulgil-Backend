@@ -47,6 +47,7 @@ class GenerationWorkflowIT {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("mulgil.demo.cache-enabled", () -> false);
     }
 
     @LocalServerPort int port;
@@ -193,7 +194,7 @@ class GenerationWorkflowIT {
     }
 
     @Test
-    void keepsExamGenerationIdempotentWithinExam_withoutCollidingAcrossExams() throws Exception {
+    void keepsExamGenerationIdempotentWhenOutputCacheIsDisabled_withoutCollidingAcrossExams() throws Exception {
         sources.addReviewNote("shared selected source", 0);
         runOne("chunk_embed");
         UUID firstExam = createExam();

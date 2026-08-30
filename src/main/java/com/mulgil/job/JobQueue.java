@@ -32,12 +32,15 @@ public class JobQueue {
 
     private final JdbcClient jdbc;
     private final MulgilProperties properties;
+    private final AiJobAdmissionGuard admission;
     private final Clock clock;
     private final List<JobCompletionListener> listeners;
 
-    JobQueue(JdbcClient jdbc, MulgilProperties properties, Clock clock, List<JobCompletionListener> listeners) {
+    JobQueue(JdbcClient jdbc, MulgilProperties properties, AiJobAdmissionGuard admission,
+             Clock clock, List<JobCompletionListener> listeners) {
         this.jdbc = jdbc;
         this.properties = properties;
+        this.admission = admission;
         this.clock = clock;
         this.listeners = List.copyOf(listeners);
     }
@@ -79,8 +82,10 @@ public class JobQueue {
         return requests.stream().map(this::enqueue).toList();
     }
 
+    @Transactional
     public AiJob enqueue(EnqueueRequest request) {
         String key = idempotencyKey(request);
+        admission.admit(request.ownerId(), request.type(), key);
         Instant now = clock.instant();
         return jdbc.sql("""
                         INSERT INTO ai_jobs

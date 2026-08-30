@@ -3,6 +3,7 @@ package com.mulgil.generation;
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.job.JobCompletionListener;
 import com.mulgil.job.JobQueue;
+import com.mulgil.job.AiJobAdmissionGuard;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -17,16 +18,16 @@ final class GenerationScheduler implements JobCompletionListener {
     private final JdbcClient jdbc;
     private final GenerationSnapshotService snapshots;
     private final MulgilProperties properties;
-    private final DemoGenerationGuard guard;
+    private final AiJobAdmissionGuard admission;
     private final TransactionTemplate transactions;
     private final Clock clock;
 
     GenerationScheduler(JdbcClient jdbc, GenerationSnapshotService snapshots, MulgilProperties properties,
-                        DemoGenerationGuard guard, TransactionTemplate transactions, Clock clock) {
+                        AiJobAdmissionGuard admission, TransactionTemplate transactions, Clock clock) {
         this.jdbc = jdbc;
         this.snapshots = snapshots;
         this.properties = properties;
-        this.guard = guard;
+        this.admission = admission;
         this.transactions = transactions;
         this.clock = clock;
     }
@@ -67,8 +68,8 @@ final class GenerationScheduler implements JobCompletionListener {
     private JobQueue.JobAccepted enqueue(GenerationSnapshotService.Snapshot snapshot, String type) {
         String model = properties.vertex().generationModel();
         String scope = type + ":" + (snapshot.examId() == null ? snapshot.sessionId() : snapshot.examId());
-        String key = guard.idempotencyKey(snapshot.ownerId(), snapshot.snapshotHash(),
-                "vertex", model, PROMPT_VERSION, scope);
+        String key = admission.generationKey(snapshot.snapshotHash(), "vertex", model, PROMPT_VERSION, scope);
+        admission.admit(snapshot.ownerId(), type, key);
         int version = jdbc.sql("""
                         SELECT COALESCE(max(input_version),0)+1 FROM ai_jobs
                         WHERE owner_id=:owner AND job_type IN (:types)
