@@ -131,15 +131,12 @@ class AnnotationWorkflowIT {
                         + "(SELECT id FROM content_blocks WHERE handwriting_block_id=:id)")
                 .param("id", handwriting).query(Integer.class).single()).isOne();
 
-        UUID newPen = UUID.randomUUID();
-        Map<String, Object> newBox = box(0.70, 0.70, 0.10, 0.10);
         Map<String, Object> changedBox = box(0.40, 0.40, 0.10, 0.10);
         vision.result("auto accepted", 0.80);
         ok(send("PUT", "/api/v1/materials/" + material + "/annotations", owner,
                 Map.of("expectedVersion", 1, "inkStrokes", List.of(
                                 stroke(stablePen, "pen", box(0.05, 0.05, 0.10, 0.10), 1),
-                                stroke(penA, "pen", boxA, 2), stroke(penB, "pen", changedBox, 2),
-                                stroke(newPen, "pen", newBox, 2)),
+                                stroke(penA, "pen", boxA, 2), stroke(penB, "pen", changedBox, 2)),
                         "emphasisRegions", List.of())), 200);
         ok(send("POST", "/api/v1/materials/" + material + "/annotations/leave", owner,
                 Map.of("changedVersion", 2)), 202);
@@ -157,8 +154,7 @@ class AnnotationWorkflowIT {
         String dirtyIds = jdbc.sql("SELECT stroke_ids::text FROM handwriting_blocks "
                         + "WHERE annotation_document_id=:id AND input_version=2 AND page_number=2")
                 .param("id", UUID.fromString(document.path("id").asText())).query(String.class).single();
-        assertThat(dirtyIds).contains(penB.toString(), newPen.toString())
-                .doesNotContain(penA.toString(), stablePen.toString());
+        assertThat(dirtyIds).contains(penA.toString(), penB.toString()).doesNotContain(stablePen.toString());
         runAll("handwriting_ocr");
         UUID automatic = jdbc.sql("SELECT id FROM handwriting_blocks WHERE annotation_document_id=:id "
                         + "AND input_version=2 AND page_number=2")
@@ -167,10 +163,10 @@ class AnnotationWorkflowIT {
         assertThat(jdbc.sql("SELECT status FROM handwriting_blocks WHERE id=:id").param("id", automatic)
                 .query(String.class).single()).isEqualTo("confirmed");
         assertThat(vision.width()).isEqualTo(400);
-        assertThat(vision.height()).isEqualTo(400);
+        assertThat(vision.height()).isEqualTo(300);
         error(send("PATCH", "/api/v1/handwriting-blocks/" + automatic + "/confirm", owner,
                 Map.of("confirmedText", "not reviewable")), 409, "VERSION_CONFLICT");
-        System.out.println("ANNOTATION_WORKFLOW scenario=stroke-raster-dirty-current-confirm observable=strokePng600x500,dirtyPng400x400,new-and-modified-only,ink-on-white,unchanged-page-preserved-current,prior-output-invalidated,review-only-confirm result=PASS");
+        System.out.println("ANNOTATION_WORKFLOW scenario=stroke-raster-dirty-current-confirm observable=strokePng600x500,changedPagePng400x300,changed-page-full-union,ink-on-white,unchanged-page-preserved-current,prior-output-invalidated,review-only-confirm result=PASS");
     }
 
     private Map<String, Object> stroke(UUID id, String tool, Map<String, Object> bbox, int page) {

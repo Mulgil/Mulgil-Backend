@@ -24,12 +24,14 @@ class AnnotationService {
     private final JobQueue jobs;
     private final ObjectMapper json;
     private final Clock clock;
+    private final HandwritingRevisionUpdater handwritingRevisions;
 
     AnnotationService(JdbcClient jdbc, JobQueue jobs, ObjectMapper json, Clock clock) {
         this.jdbc = jdbc;
         this.jobs = jobs;
         this.json = json;
         this.clock = clock;
+        this.handwritingRevisions = new HandwritingRevisionUpdater(jdbc);
     }
 
     @Transactional
@@ -73,18 +75,14 @@ class AnnotationService {
         Timestamp now = Timestamp.from(clock.instant());
         jdbc.sql("UPDATE annotation_documents SET last_left_version=:version,updated_at=:now WHERE id=:id")
                 .param("version", changedVersion).param("now", now).param("id", document.id()).update();
-        carryForwardBlocks(document.id(), changedVersion, now);
+        List<Integer> dirtyPages = handwritingRevisions.advance(document.id(), changedVersion, now);
+        if (dirtyPages.isEmpty()) return null;
         List<Stroke> strokes = jdbc.sql("""
                 SELECT stroke.id,stroke.page_number,stroke.bbox_norm::text FROM ink_strokes stroke
                 WHERE stroke.annotation_document_id=:id AND stroke.tool='pen'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM handwriting_blocks prior
-                      WHERE prior.annotation_document_id=:id AND prior.input_version<=:version
-                        AND prior.stroke_ids @> jsonb_build_array(stroke.id::text)
-                        AND prior.created_at>=stroke.created_at
-                  )
+                  AND stroke.page_number IN (:pages)
                 ORDER BY stroke.page_number,stroke.created_at,stroke.id
-                """).param("id", document.id()).param("version", changedVersion)
+                """).param("id", document.id()).param("pages", dirtyPages)
                 .query((row, ignored) -> new Stroke(
                         row.getObject("id", UUID.class), row.getInt("page_number"),
                         readBox(row.getString("bbox_norm")))).list();
@@ -110,36 +108,6 @@ class AnnotationService {
                 document.courseId(), document.sessionId(), null, null, null, null, null, changedVersion,
                 sourceHash, "vision", "configured", "none"));
         return new JobQueue.JobAccepted(job.id(), job.status());
-    }
-
-    private void carryForwardBlocks(UUID documentId, int version, Timestamp now) {
-        String carryable = """
-                handwriting.annotation_document_id=:document AND handwriting.input_version<:version
-                AND handwriting.status IN ('confirmed','needs_user_review')
-                AND NOT EXISTS (
-                    SELECT 1 FROM jsonb_array_elements_text(handwriting.stroke_ids) stroke_id(value)
-                    LEFT JOIN ink_strokes stroke ON stroke.id=stroke_id.value::uuid
-                      AND stroke.annotation_document_id=handwriting.annotation_document_id
-                    WHERE stroke.id IS NULL OR stroke.tool<>'pen' OR stroke.created_at>handwriting.created_at
-                )
-                """;
-        jdbc.sql("""
-                UPDATE chunks chunk SET source_ref=jsonb_set(chunk.source_ref,'{inputVersion}',
-                    to_jsonb(CAST(:version AS integer)))
-                FROM content_blocks content,handwriting_blocks handwriting
-                WHERE chunk.content_block_id=content.id AND content.handwriting_block_id=handwriting.id AND
-                """ + carryable).param("document", documentId).param("version", version).update();
-        jdbc.sql("UPDATE handwriting_blocks handwriting SET input_version=:version,updated_at=:now WHERE "
-                        + carryable).param("document", documentId).param("version", version).param("now", now).update();
-        jdbc.sql("""
-                DELETE FROM content_blocks content USING handwriting_blocks handwriting
-                WHERE content.handwriting_block_id=handwriting.id
-                  AND handwriting.annotation_document_id=:document AND handwriting.input_version<:version
-                """).param("document", documentId).param("version", version).update();
-        jdbc.sql("""
-                UPDATE handwriting_blocks SET status='outdated',confirmed_text=NULL,updated_at=:now
-                WHERE annotation_document_id=:document AND input_version<:version AND status<>'outdated'
-                """).param("document", documentId).param("version", version).param("now", now).update();
     }
 
     private void persist(UUID documentId, AnnotationController.Write request, Timestamp now) {
