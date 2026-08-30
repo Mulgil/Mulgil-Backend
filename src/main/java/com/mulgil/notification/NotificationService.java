@@ -9,9 +9,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Clock;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.ZoneId;
-import java.time.zone.ZoneRulesException;
 import java.util.List;
 import java.util.UUID;
 
@@ -28,7 +28,7 @@ final class NotificationService {
     DeviceToken register(UUID ownerId, String token, String platform, String timezone) {
         try {
             ZoneId.of(timezone);
-        } catch (ZoneRulesException exception) {
+        } catch (DateTimeException exception) {
             throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Invalid timezone.");
         }
         Instant now = clock.instant();

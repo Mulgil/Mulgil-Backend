@@ -131,6 +131,9 @@ class NotificationWorkflowIT {
         assertError(send("PUT", "/api/v1/devices/fcm-token", token,
                 Map.of("token", "valid-token", "platform", "android", "timezone", "Mars/Olympus")),
                 422, "VALIDATION_FAILED");
+        assertError(send("PUT", "/api/v1/devices/fcm-token", token,
+                Map.of("token", "plus-timezone-token", "platform", "android", "timezone", "+")),
+                422, "VALIDATION_FAILED");
         successful(send("PUT", "/api/v1/devices/fcm-token", token,
                 Map.of("token", "failure-token", "platform", "android", "timezone", "UTC")), 200);
         UUID owner = jdbc.sql("SELECT id FROM users WHERE provider_subject='notification-failure'")
@@ -180,7 +183,8 @@ class NotificationWorkflowIT {
 
         Files.createDirectories(EVIDENCE);
         Files.writeString(EVIDENCE.resolve("notification-privacy-failure.txt"),
-                "malformed-token=422\nmalformed-timezone=422\nnotification-status=failed\njob-status=failed\n"
+                "malformed-token=422\nmalformed-timezone=422\nmalformed-plus-timezone=422\n"
+                        + "notification-status=failed\njob-status=failed\n"
                         + "retryable-job-error=PROVIDER_TIMEOUT\nnonretryable-job-error=INVALID_ARGUMENT\n"
                         + "forbidden-content-scan=PASS\n");
     }
