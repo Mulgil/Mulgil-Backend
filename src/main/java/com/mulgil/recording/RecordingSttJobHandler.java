@@ -4,6 +4,7 @@ import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.job.AiProviderUsageLedger;
 import com.mulgil.stt.SpeechToTextPort;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -35,12 +36,14 @@ final class RecordingSttJobHandler implements JobHandler {
     private final Clock clock;
     private final TransactionTemplate transactions;
     private final SpeechInputCleanupScheduler inputCleanup;
+    private final AiProviderUsageLedger usage;
 
     RecordingSttJobHandler(JdbcClient jdbc, ContentIndexingService indexing,
                            ObjectProvider<RecordingSegmenter> segmenters,
                            ObjectProvider<SpeechTemporaryObjectPort> temporaryObjects,
                            ObjectProvider<SpeechToTextPort> speech, MulgilProperties properties, Clock clock,
-                           TransactionTemplate transactions, SpeechInputCleanupScheduler inputCleanup) {
+                           TransactionTemplate transactions, SpeechInputCleanupScheduler inputCleanup,
+                           AiProviderUsageLedger usage) {
         this.jdbc = jdbc;
         this.indexing = indexing;
         this.segmenters = segmenters;
@@ -50,6 +53,7 @@ final class RecordingSttJobHandler implements JobHandler {
         this.clock = clock;
         this.transactions = transactions;
         this.inputCleanup = inputCleanup;
+        this.usage = usage;
     }
 
     @Override
@@ -96,25 +100,54 @@ final class RecordingSttJobHandler implements JobHandler {
                 }
                 SpeechToTextPort.Input input = new SpeechToTextPort.Input(inputUri, segments.get(index).offset());
                 String operationId;
+                long endSeconds = index + 1 < segments.size()
+                        ? segments.get(index + 1).offset().toSeconds() : recording.durationSeconds();
+                long unitCount = Math.max(0, endSeconds - segments.get(index).offset().toSeconds());
+                AiProviderUsageLedger.UsageHandle providerUsage;
                 if (state.resumes(index)) {
                     operationId = state.operationId();
+                    if (state.usageId() == null) {
+                        providerUsage = usage.begin(job.id(), job.ownerId(), "speech.recognize", "google-chirp",
+                                properties.speech().model(), "audio_second", unitCount);
+                        ProviderState upgraded = ProviderState.active(index, operationId, providerUsage.id());
+                        persistProviderRequestId(job, state.raw(), upgraded.raw());
+                        state = upgraded;
+                    } else {
+                        providerUsage = new AiProviderUsageLedger.UsageHandle(state.usageId(), job.id(),
+                                "speech.recognize", "google-chirp", properties.speech().model(), unitCount);
+                    }
                 } else {
                     inputCleanup.schedule(job.id(), job.ownerId(), inputUris);
+                    providerUsage = usage.begin(job.id(), job.ownerId(), "speech.recognize", "google-chirp",
+                            properties.speech().model(), "audio_second", unitCount);
                     try {
                         operationId = transcriber.start(input);
-                        persistProviderRequestId(job, state.raw(), ProviderState.active(index, operationId).raw());
-                        state = ProviderState.active(index, operationId);
+                        ProviderState active = ProviderState.active(index, operationId, providerUsage.id());
+                        persistProviderRequestId(job, state.raw(), active.raw());
+                        state = active;
                     } catch (RuntimeException exception) {
+                        usage.fail(providerUsage, "PROVIDER_START_UNKNOWN");
                         throw new JobExecutionException("PROVIDER_START_UNKNOWN",
                                 "Speech operation start could not be confirmed.", false);
                     }
                 }
                 Optional<SpeechToTextPort.Transcript> result;
-                do {
-                    result = transcriber.await(operationId, input,
-                            Duration.ofSeconds(properties.jobs().providerTimeoutSeconds()));
-                } while (result.isEmpty());
+                try {
+                    do {
+                        result = transcriber.await(operationId, input,
+                                Duration.ofSeconds(properties.jobs().providerTimeoutSeconds()));
+                    } while (result.isEmpty());
+                } catch (SpeechToTextPort.TerminalOperationException exception) {
+                    usage.fail(providerUsage, "PROVIDER_FAILED");
+                    throw exception;
+                } catch (RuntimeException exception) {
+                    if (job.attemptCount() >= job.maxAttempts()) {
+                        usage.fail(providerUsage, "PROVIDER_UNAVAILABLE");
+                    }
+                    throw exception;
+                }
                 SpeechToTextPort.Transcript transcript = result.orElseThrow();
+                usage.succeed(providerUsage);
                 ProviderState completed = ProviderState.completed(index);
                 checkpoint(job, state.raw(), completed.raw(), transcript);
                 state = completed;
@@ -220,28 +253,32 @@ final class RecordingSttJobHandler implements JobHandler {
     private record PreparedSegment(long startMs, long endMs, String text, Double confidence,
                                    String provider, String model) {}
 
-    private record ProviderState(String raw, Integer completedIndex, Integer activeIndex, String operationId) {
+    private record ProviderState(String raw, Integer completedIndex, Integer activeIndex, String operationId,
+                                 UUID usageId) {
         static ProviderState parse(String raw) {
-            if (raw == null) return new ProviderState(null, null, null, null);
-            String[] parts = raw.split("\\|", 3);
+            if (raw == null) return new ProviderState(null, null, null, null, null);
+            String[] parts = raw.split("\\|", 4);
             try {
                 if (parts.length == 2 && parts[0].equals("done")) {
                     return completed(Integer.parseInt(parts[1]));
                 }
-                if (parts.length == 3 && parts[0].equals("operation") && !parts[2].isBlank()) {
-                    return new ProviderState(raw, null, Integer.parseInt(parts[1]), parts[2]);
+                if ((parts.length == 3 || parts.length == 4) && parts[0].equals("operation")
+                        && !parts[2].isBlank()) {
+                    UUID usage = parts.length == 4 ? UUID.fromString(parts[3]) : null;
+                    return new ProviderState(raw, null, Integer.parseInt(parts[1]), parts[2], usage);
                 }
             } catch (NumberFormatException ignored) {
             }
             throw new IllegalStateException("Invalid persisted speech operation state.");
         }
 
-        static ProviderState active(int index, String operationId) {
-            return new ProviderState("operation|" + index + "|" + operationId, null, index, operationId);
+        static ProviderState active(int index, String operationId, UUID usageId) {
+            return new ProviderState("operation|" + index + "|" + operationId + "|" + usageId,
+                    null, index, operationId, usageId);
         }
 
         static ProviderState completed(int index) {
-            return new ProviderState("done|" + index, index, null, null);
+            return new ProviderState("done|" + index, index, null, null, null);
         }
 
         boolean completedThrough(int index) {

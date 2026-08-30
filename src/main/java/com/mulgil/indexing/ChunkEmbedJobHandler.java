@@ -2,6 +2,8 @@ package com.mulgil.indexing;
 
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.job.AiProviderUsageLedger;
+import com.mulgil.common.config.MulgilProperties;
 import com.pgvector.PGvector;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -14,10 +16,15 @@ import java.util.UUID;
 final class ChunkEmbedJobHandler implements JobHandler {
     private final JdbcClient jdbc;
     private final ObjectProvider<ChunkEmbeddingPort> embeddings;
+    private final MulgilProperties properties;
+    private final AiProviderUsageLedger usage;
 
-    ChunkEmbedJobHandler(JdbcClient jdbc, ObjectProvider<ChunkEmbeddingPort> embeddings) {
+    ChunkEmbedJobHandler(JdbcClient jdbc, ObjectProvider<ChunkEmbeddingPort> embeddings,
+                         MulgilProperties properties, AiProviderUsageLedger usage) {
         this.jdbc = jdbc;
         this.embeddings = embeddings;
+        this.properties = properties;
+        this.usage = usage;
     }
 
     @Override
@@ -40,7 +47,10 @@ final class ChunkEmbedJobHandler implements JobHandler {
                         row.getString("text_content"), row.getString("source_hash"),
                         row.getString("source_ref"))).list();
         List<EmbeddedChunk> results = chunks.stream().map(chunk -> {
-            ChunkEmbeddingPort.Embedding embedding = port.embed(chunk.text());
+            ChunkEmbeddingPort.Embedding embedding = usage.observe(job, "vertex.embed", "vertex",
+                    properties.vertex().embeddingModel(), "unicode_code_point",
+                    chunk.text().codePoints().count(),
+                    () -> port.embed(chunk.text()));
             if (embedding.values().size() != 768) throw new IllegalArgumentException("Embedding must have 768 values.");
             float[] values = new float[embedding.values().size()];
             for (int index = 0; index < values.length; index++) values[index] = embedding.values().get(index);

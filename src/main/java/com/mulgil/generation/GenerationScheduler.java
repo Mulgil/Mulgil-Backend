@@ -3,13 +3,11 @@ package com.mulgil.generation;
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.job.JobCompletionListener;
 import com.mulgil.job.JobQueue;
-import com.mulgil.job.AiJobAdmissionGuard;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import java.sql.Timestamp;
-import java.time.Clock;
 import java.util.UUID;
 
 @Component
@@ -18,18 +16,16 @@ final class GenerationScheduler implements JobCompletionListener {
     private final JdbcClient jdbc;
     private final GenerationSnapshotService snapshots;
     private final MulgilProperties properties;
-    private final AiJobAdmissionGuard admission;
+    private final ObjectProvider<JobQueue> jobs;
     private final TransactionTemplate transactions;
-    private final Clock clock;
 
     GenerationScheduler(JdbcClient jdbc, GenerationSnapshotService snapshots, MulgilProperties properties,
-                        AiJobAdmissionGuard admission, TransactionTemplate transactions, Clock clock) {
+                        ObjectProvider<JobQueue> jobs, TransactionTemplate transactions) {
         this.jdbc = jdbc;
         this.snapshots = snapshots;
         this.properties = properties;
-        this.admission = admission;
+        this.jobs = jobs;
         this.transactions = transactions;
-        this.clock = clock;
     }
 
     @Override
@@ -68,8 +64,6 @@ final class GenerationScheduler implements JobCompletionListener {
     private JobQueue.JobAccepted enqueue(GenerationSnapshotService.Snapshot snapshot, String type) {
         String model = properties.vertex().generationModel();
         String scope = type + ":" + (snapshot.examId() == null ? snapshot.sessionId() : snapshot.examId());
-        String key = admission.generationKey(snapshot.snapshotHash(), "vertex", model, PROMPT_VERSION, scope);
-        admission.admit(snapshot.ownerId(), type, key);
         int version = jdbc.sql("""
                         SELECT COALESCE(max(input_version),0)+1 FROM ai_jobs
                         WHERE owner_id=:owner AND job_type IN (:types)
@@ -79,20 +73,9 @@ final class GenerationScheduler implements JobCompletionListener {
                         : java.util.List.of("exam_summary_generate", "exam_quiz_generate"))
                 .param("exam", snapshot.examId()).param("session", snapshot.sessionId())
                 .query(Integer.class).single();
-        return jdbc.sql("""
-                        INSERT INTO ai_jobs
-                            (id,owner_id,course_id,session_id,job_type,status,input_version,idempotency_key,
-                             attempt_count,max_attempts,exam_id,source_hash,created_at)
-                        VALUES (:id,:owner,:course,:session,:type,'queued',:version,:key,0,:maxAttempts,
-                                :exam,:hash,:now)
-                        ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key
-                        RETURNING id,status
-                        """).param("id", UUID.randomUUID()).param("owner", snapshot.ownerId())
-                .param("course", snapshot.courseId()).param("session", snapshot.sessionId()).param("type", type)
-                .param("version", version).param("key", key).param("maxAttempts", properties.jobs().maxRetry() + 1)
-                .param("exam", snapshot.examId()).param("hash", snapshot.snapshotHash())
-                .param("now", Timestamp.from(clock.instant()))
-                .query((row, ignored) -> new JobQueue.JobAccepted(row.getObject("id", UUID.class),
-                        row.getString("status"))).single();
+        JobQueue.AiJob job = jobs.getObject().enqueue(new JobQueue.EnqueueRequest(type, snapshot.ownerId(),
+                snapshot.courseId(), snapshot.sessionId(), null, null, null, null, snapshot.examId(), version,
+                snapshot.snapshotHash(), "vertex", model, PROMPT_VERSION));
+        return new JobQueue.JobAccepted(job.id(), job.status());
     }
 }

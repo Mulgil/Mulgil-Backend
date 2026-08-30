@@ -6,6 +6,7 @@ import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.job.AiProviderUsageLedger;
 import com.mulgil.ocr.OcrProviderException;
 import com.mulgil.ocr.VisionOcrPort;
 import com.mulgil.storage.CloudStoragePort;
@@ -35,19 +36,21 @@ final class PdfIndexingService {
     private final ContentIndexingService indexing;
     private final JobQueue jobs;
     private final MulgilProperties properties;
+    private final AiProviderUsageLedger usage;
     private final ObjectMapper json;
     private final Clock clock;
     private final PdfPageAnalyzer analyzer = new PdfPageAnalyzer();
 
     PdfIndexingService(JdbcClient jdbc, CloudStoragePort storage, ObjectProvider<VisionOcrPort> vision,
                        ContentIndexingService indexing, JobQueue jobs, MulgilProperties properties,
-                       ObjectMapper json, Clock clock) {
+                       AiProviderUsageLedger usage, ObjectMapper json, Clock clock) {
         this.jdbc = jdbc;
         this.storage = storage;
         this.vision = vision;
         this.indexing = indexing;
         this.jobs = jobs;
         this.properties = properties;
+        this.usage = usage;
         this.json = json;
         this.clock = clock;
     }
@@ -70,7 +73,12 @@ final class PdfIndexingService {
         for (PdfPageAnalyzer.Page page : prepared.pages()) {
             if (!needsOcr(page)) continue;
             try {
-                pages.add(new OcrPage(page.number(), port.extract(analyzer.render(prepared.bytes(), page.number()))));
+                byte[] image = analyzer.render(prepared.bytes(), page.number());
+                VisionOcrPort.OcrResult result = usage.observe(job, "vision.ocr", "google-vision",
+                        properties.vision().feature(), "image", 1L, ignored -> 1L,
+                        exception -> exception instanceof OcrProviderException ocr
+                                ? ocr.code() : "PROVIDER_FAILED", () -> port.extract(image));
+                pages.add(new OcrPage(page.number(), result));
             } catch (OcrProviderException exception) {
                 throw new JobHandler.JobExecutionException(exception.code(), exception.getMessage(),
                         exception.retryable());

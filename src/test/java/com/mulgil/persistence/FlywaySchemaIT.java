@@ -53,7 +53,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV011_whenDatabaseIsFresh() {
+    void appliesV001ThroughV012_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -62,21 +62,23 @@ class FlywaySchemaIT {
                             'annotation_documents', 'ink_strokes', 'emphasis_regions', 'handwriting_blocks',
                             'document_pages', 'content_blocks', 'transcript_segments', 'chunks', 'summaries',
                             'mindmaps', 'quiz_questions', 'quiz_attempts', 'progress_status', 'ai_jobs',
-                            'device_tokens', 'notifications', 'speech_input_cleanups')
+                            'device_tokens', 'notifications', 'speech_input_cleanups', 'ai_provider_usage')
                         """).query(Integer.class).single();
         List<String> requiredIndexes = jdbc.sql("""
                         SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname IN (
                             'document_pages_material_page_uidx', 'document_pages_exam_session_page_uidx',
                             'chunks_embedding_hnsw_idx', 'ai_jobs_queued_claim_idx',
                             'ai_jobs_expired_running_idx', 'notifications_scheduled_idx',
-                            'speech_input_cleanups_due_idx', 'speech_input_cleanups_owner_idx') ORDER BY indexname
+                            'speech_input_cleanups_due_idx', 'speech_input_cleanups_owner_idx',
+                            'ai_jobs_active_cache_fingerprint_uidx', 'ai_provider_usage_job_idx') ORDER BY indexname
                         """).query(String.class).list();
         Integer jobColumns = jdbc.sql("""
                         SELECT count(*) FROM information_schema.columns
                         WHERE table_schema = 'public' AND table_name = 'ai_jobs' AND (
                             (column_name IN ('exam_resource_id', 'source_hash') AND is_nullable = 'YES')
                             OR (column_name = 'input_version' AND data_type = 'integer')
-                            OR column_name IN ('claimed_by', 'last_heartbeat_at', 'lease_expires_at'))
+                            OR column_name IN ('claimed_by', 'last_heartbeat_at', 'lease_expires_at',
+                                               'cache_fingerprint'))
                         """).query(Integer.class).single();
         Integer nullableSourceParents = jdbc.sql("""
                         SELECT count(*) FROM information_schema.columns
@@ -100,16 +102,17 @@ class FlywaySchemaIT {
                             'content_blocks_exam_session_check', 'ai_jobs_exam_session_check',
                             'exam_session_members_dependents_cleanup',
                             'exam_session_members_dependents_update_cleanup',
-                            'exam_resources_dependents_update_cleanup', 'quiz_attempts_immutable')
+                            'exam_resources_dependents_update_cleanup', 'quiz_attempts_immutable',
+                            'ai_jobs_cache_fingerprint_default')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011");
-        assertThat(requiredTables).isEqualTo(17);
-        assertThat(requiredIndexes).hasSize(8);
-        assertThat(jobColumns).isEqualTo(6);
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012");
+        assertThat(requiredTables).isEqualTo(18);
+        assertThat(requiredIndexes).hasSize(10);
+        assertThat(jobColumns).isEqualTo(7);
         assertThat(nullableSourceParents).isEqualTo(4);
         assertThat(requiredConstraints).isEqualTo(12);
-        assertThat(requiredTriggers).isEqualTo(8);
+        assertThat(requiredTriggers).isEqualTo(9);
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
                         + "jobColumns=%d nullablePageBlockParents=%d result=PASS%n", versions, requiredTables,
                 requiredIndexes.size(), requiredConstraints, requiredTriggers, jobColumns, nullableSourceParents);
@@ -173,6 +176,55 @@ class FlywaySchemaIT {
                 .query(Integer.class).single()).isOne();
         assertThatThrownBy(() -> upgrade.sql("UPDATE quiz_attempts SET is_correct=false WHERE id=:id")
                 .param("id", attempt).update()).isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    void upgradesV011JobWithLongLegacyIdempotencyKey_withoutTruncation() {
+        String schema = "usage_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        String url = POSTGRES.getJdbcUrl() + "&currentSchema=" + schema + ",public";
+        Flyway throughV011 = Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).target(MigrationVersion.fromVersion("011")).load();
+        throughV011.migrate();
+        JdbcClient upgrade = JdbcClient.create(new DriverManagerDataSource(
+                url, POSTGRES.getUsername(), POSTGRES.getPassword()));
+        SchemaFixture oldFixture = new SchemaFixture(upgrade);
+        UUID job = UUID.randomUUID();
+        String legacyKey = "legacy-" + "x".repeat(193);
+        oldFixture.insertJob(job, oldFixture.materialId(), null, legacyKey);
+
+        Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).load().migrate();
+
+        assertThat(upgrade.sql("SELECT idempotency_key FROM ai_jobs WHERE id=:id")
+                .param("id", job).query(String.class).single()).isEqualTo(legacyKey);
+        assertThat(upgrade.sql("SELECT length(cache_fingerprint) FROM ai_jobs WHERE id=:id")
+                .param("id", job).query(Integer.class).single()).isEqualTo(64);
+    }
+
+    @Test
+    void preservesExplicitCacheFingerprint_andDefaultsOnlyLegacyStyleInsert() {
+        UUID legacyStyle = UUID.randomUUID();
+        fixture.insertJob(legacyStyle, fixture.materialId(), null, "legacy-style-key");
+        String explicitFingerprint = "a".repeat(64);
+        UUID explicit = UUID.randomUUID();
+        UUID course = jdbc.sql("SELECT course_id FROM class_sessions WHERE id=:session")
+                .param("session", fixture.sessionId()).query(UUID.class).single();
+        jdbc.sql("""
+                        INSERT INTO ai_jobs
+                            (id,owner_id,course_id,session_id,job_type,status,input_version,idempotency_key,
+                             attempt_count,max_attempts,material_id,source_hash,cache_fingerprint,created_at)
+                        VALUES (:id,:owner,:course,:session,'pdf_extract','succeeded',1,:key,
+                                0,3,:material,:hash,:fingerprint,:now)
+                        """).param("id", explicit).param("owner", fixture.ownerId())
+                .param("course", course).param("session", fixture.sessionId())
+                .param("key", "explicit-key").param("material", fixture.materialId())
+                .param("hash", "f".repeat(64)).param("fingerprint", explicitFingerprint)
+                .param("now", Timestamp.from(Instant.now())).update();
+
+        assertThat(jdbc.sql("SELECT length(cache_fingerprint) FROM ai_jobs WHERE id=:id")
+                .param("id", legacyStyle).query(Integer.class).single()).isEqualTo(64);
+        assertThat(jdbc.sql("SELECT cache_fingerprint FROM ai_jobs WHERE id=:id")
+                .param("id", explicit).query(String.class).single()).isEqualTo(explicitFingerprint);
     }
 
     @Test

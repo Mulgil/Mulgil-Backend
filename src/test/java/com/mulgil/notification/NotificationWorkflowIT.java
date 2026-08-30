@@ -106,6 +106,8 @@ class NotificationWorkflowIT {
                         Instant.parse("2026-09-01T00:00:00Z"), Instant.parse("2026-09-13T00:00:00Z"),
                         Instant.parse("2026-09-14T00:00:00Z"));
         assertThat(fcm.sent()).hasSize(1);
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_provider_usage")
+                .query(Integer.class).single()).isZero();
         FcmPort.Message payload = fcm.sent().getFirst().message();
         assertThat(payload.resourceId()).isEqualTo(examId);
         assertThat(payload.deepLink()).isEqualTo("mulgil://exams/" + examId);

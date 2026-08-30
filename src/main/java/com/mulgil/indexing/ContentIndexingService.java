@@ -2,6 +2,7 @@ package com.mulgil.indexing;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.job.JobQueue;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
@@ -21,18 +22,21 @@ import java.util.UUID;
 public class ContentIndexingService {
     private final JdbcClient jdbc;
     private final JobQueue jobs;
+    private final MulgilProperties properties;
     private final ObjectMapper json;
     private final Clock clock;
 
-    public ContentIndexingService(JdbcClient jdbc, JobQueue jobs, ObjectMapper json, Clock clock) {
+    public ContentIndexingService(JdbcClient jdbc, JobQueue jobs, MulgilProperties properties,
+                                  ObjectMapper json, Clock clock) {
         this.jdbc = jdbc;
         this.jobs = jobs;
+        this.properties = properties;
         this.json = json;
         this.clock = clock;
     }
 
     @Transactional
-    public UUID index(IndexRequest request) {
+    public IndexResult index(IndexRequest request) {
         String text = request.text().strip();
         if (text.isEmpty()) throw new IllegalArgumentException("Indexed text must not be blank.");
         UUID contentBlockId = uuid(request.sourceReference().get("contentBlockId"));
@@ -65,10 +69,10 @@ public class ContentIndexingService {
                 .param("session", request.sessionId()).param("block", contentBlockId)
                 .param("segment", transcriptSegmentId).param("text", text).param("reference", reference)
                 .param("hash", sourceHash).param("now", Timestamp.from(clock.instant())).update();
-        jobs.enqueue(new JobQueue.EnqueueRequest("chunk_embed", request.ownerId(), request.courseId(),
+        JobQueue.AiJob job = jobs.enqueue(new JobQueue.EnqueueRequest("chunk_embed", request.ownerId(), request.courseId(),
                 request.sessionId(), null, null, null, null, null, request.inputVersion(), sourceHash,
-                "embedding", "configured", "none"));
-        return id;
+                "vertex", properties.vertex().embeddingModel(), "none"));
+        return new IndexResult(id, new JobQueue.JobAccepted(job.id(), job.status()));
     }
 
     public List<IndexedChunk> chunks(UUID ownerId, UUID courseId, UUID sessionId) {
@@ -114,4 +118,5 @@ public class ContentIndexingService {
     }
 
     public record IndexedChunk(UUID id, String text, String sourceReference, String sourceHash) {}
+    public record IndexResult(UUID chunkId, JobQueue.JobAccepted job) {}
 }

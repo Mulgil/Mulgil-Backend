@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.job.AiProviderUsageLedger;
+import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.ocr.OcrProviderException;
 import com.mulgil.ocr.VisionOcrPort;
 import org.springframework.beans.factory.ObjectProvider;
@@ -23,13 +25,18 @@ final class HandwritingOcrJobHandler implements JobHandler {
     private final ObjectProvider<VisionOcrPort> providers;
     private final HandwritingService service;
     private final ObjectMapper json;
+    private final MulgilProperties properties;
+    private final AiProviderUsageLedger usage;
     private final HandwritingRasterizer rasterizer = new HandwritingRasterizer();
 
     HandwritingOcrJobHandler(JdbcClient jdbc, ObjectProvider<VisionOcrPort> providers,
-                             HandwritingService service, ObjectMapper json) {
+                             HandwritingService service, MulgilProperties properties,
+                             AiProviderUsageLedger usage, ObjectMapper json) {
         this.jdbc = jdbc;
         this.providers = providers;
         this.service = service;
+        this.properties = properties;
+        this.usage = usage;
         this.json = json;
     }
 
@@ -85,7 +92,10 @@ final class HandwritingOcrJobHandler implements JobHandler {
             }
             VisionOcrPort.OcrResult extracted;
             try {
-                extracted = provider.extract(image);
+                extracted = usage.observe(job, "vision.ocr", "google-vision", properties.vision().feature(),
+                        "image", 1L, ignored -> 1L,
+                        exception -> exception instanceof OcrProviderException ocr
+                                ? ocr.code() : "PROVIDER_FAILED", () -> provider.extract(image));
             } catch (OcrProviderException exception) {
                 throw new JobExecutionException(exception.code(), exception.getMessage(), exception.retryable());
             }

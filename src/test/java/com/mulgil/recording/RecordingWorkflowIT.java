@@ -53,6 +53,7 @@ class RecordingWorkflowIT {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("mulgil.ai-rates.speech-second-microusd", () -> 3);
     }
 
     @Autowired JdbcClient jdbc;
@@ -140,7 +141,14 @@ class RecordingWorkflowIT {
         runAll("chunk_embed");
 
         assertThat(retrieval.search(owner, course, session, "lecture", 5)).hasSize(2);
-        assertThat(retrieval.search(UUID.randomUUID(), course, session, "lecture", 5)).isEmpty();
+        UUID foreignOwner = UUID.randomUUID();
+        assertThat(retrieval.search(foreignOwner, course, session, "lecture", 5)).isEmpty();
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_provider_usage WHERE owner_id=:owner AND job_id IS NULL "
+                        + "AND operation='vertex.embed'").param("owner", owner)
+                .query(Integer.class).single()).isOne();
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_provider_usage WHERE owner_id=:owner AND job_id IS NULL "
+                        + "AND operation='vertex.embed'").param("owner", foreignOwner)
+                .query(Integer.class).single()).isOne();
         assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type IN ('review_generate','preview_generate')")
                 .query(Integer.class).single()).isOne();
         System.out.println("RECORDING_WORKFLOW scenario=audio_boundaries_isolation observable=unconfirmed_zero_jobs_foreign_zero_chunks_review_queued result=PASS");
@@ -161,6 +169,12 @@ class RecordingWorkflowIT {
                 .param("recording", recording).query(String.class).single()).isEqualTo("done|1");
         assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE recording_id=:recording")
                 .param("recording", recording).query(String.class).single()).isEqualTo("succeeded");
+        assertThat(jdbc.sql("""
+                        SELECT operation||':'||status||':'||count(*) FROM ai_provider_usage
+                        WHERE job_id=(SELECT id FROM ai_jobs WHERE recording_id=:recording)
+                        GROUP BY operation,status ORDER BY operation,status
+                        """).param("recording", recording).query(String.class).list())
+                .containsExactly("speech.recognize:succeeded:2");
         System.out.println("RECORDING_WORKFLOW scenario=multi_segment_timeout observable=one_operation_per_segment_no_duplicate_terminal_cleanup result=PASS");
     }
 
@@ -176,7 +190,120 @@ class RecordingWorkflowIT {
         assertThat(speech.starts()).isZero();
         assertThat(speech.awaitedOperations()).contains("operations/existing");
         assertThat(temporaryObjects.deletes()).isEqualTo(2);
+        assertThat(jdbc.sql("SELECT status FROM ai_provider_usage WHERE job_id=:job")
+                .param("job", accepted.jobId()).query(String.class).single()).isEqualTo("succeeded");
         System.out.println("RECORDING_WORKFLOW scenario=provider_operation_resume observable=zero_duplicate_starts_terminal_cleanup result=PASS");
+    }
+
+    @Test
+    void keepsOneStartedUsageAcrossTransientAwaitRetry_thenTerminalizesSucceeded() throws Exception {
+        UUID recording = recording(1_200, "uploaded");
+        JobQueue.JobAccepted accepted = mappings.confirm(owner, recording, session);
+        speech.failNextAwait();
+        JobHandler handler = handlers.stream().filter(value -> value.jobType().equals("stt"))
+                .findFirst().orElseThrow();
+        JobQueue.ClaimedJob firstClaim = jobs.claim("transient-await-1", Set.of("stt"));
+
+        try {
+            handler.handle(firstClaim);
+            throw new AssertionError("Expected transient speech await failure.");
+        } catch (JobHandler.JobExecutionException exception) {
+            assertThat(exception.code()).isEqualTo("PROVIDER_UNAVAILABLE");
+            assertThat(exception.retryable()).isTrue();
+            jobs.fail(firstClaim, exception.code(), exception.getMessage(), true);
+        }
+
+        String providerState = jdbc.sql("SELECT provider_request_id FROM ai_jobs WHERE id=:job")
+                .param("job", accepted.jobId()).query(String.class).single();
+        UUID usageId = UUID.fromString(providerState.split("\\|", 4)[3]);
+        assertThat(jdbc.sql("SELECT status FROM ai_provider_usage WHERE id=:id")
+                .param("id", usageId).query(String.class).single()).isEqualTo("started");
+
+        jobs.retry(owner, accepted.jobId());
+        JobQueue.ClaimedJob resumed = jobs.claim("transient-await-2", Set.of("stt"));
+        assertThat(jobs.complete(resumed, handler.handle(resumed))).isTrue();
+
+        assertThat(speech.starts()).isEqualTo(2);
+        assertThat(speech.awaitedOperations().stream().filter("operations/fake-1"::equals).count()).isEqualTo(3);
+        assertThat(jdbc.sql("""
+                        SELECT status||':'||unit_type||':'||unit_count||':'||estimated_cost_microusd
+                        FROM ai_provider_usage WHERE id=:id
+                        """).param("id", usageId).query(String.class).single())
+                .isEqualTo("succeeded:audio_second:1140:3420");
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_provider_usage WHERE job_id=:job")
+                .param("job", accepted.jobId()).query(Integer.class).single()).isEqualTo(2);
+        System.out.println("RECORDING_WORKFLOW scenario=transient_await_resume "
+                + "observable=one_usage_same_operation_terminal_success result=PASS");
+    }
+
+    @Test
+    void terminalizesUsageFailed_whenSpeechOperationFailsTerminally() throws Exception {
+        UUID recording = recording(1_200, "uploaded");
+        JobQueue.JobAccepted accepted = mappings.confirm(owner, recording, session);
+        speech.failNextAwaitTerminally();
+        JobHandler handler = handlers.stream().filter(value -> value.jobType().equals("stt"))
+                .findFirst().orElseThrow();
+        JobQueue.ClaimedJob claimed = jobs.claim("terminal-await", Set.of("stt"));
+
+        try {
+            handler.handle(claimed);
+            throw new AssertionError("Expected terminal speech failure.");
+        } catch (JobHandler.JobExecutionException exception) {
+            assertThat(exception.code()).isEqualTo("PROVIDER_FAILED");
+            assertThat(exception.retryable()).isFalse();
+            jobs.fail(claimed, exception.code(), exception.getMessage(), false);
+        }
+
+        assertThat(jdbc.sql("SELECT status||':'||error_code FROM ai_provider_usage WHERE job_id=:job")
+                .param("job", accepted.jobId()).query(String.class).single())
+                .isEqualTo("failed:PROVIDER_FAILED");
+    }
+
+    @Test
+    void terminalizesSameUsage_whenTransientAwaitFailsOnFinalAttempt() throws Exception {
+        UUID recording = recording(600, "uploaded");
+        JobQueue.JobAccepted accepted = mappings.confirm(owner, recording, session);
+        JobHandler handler = handlers.stream().filter(value -> value.jobType().equals("stt"))
+                .findFirst().orElseThrow();
+        UUID usageId = null;
+
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            speech.failNextAwait();
+            JobQueue.ClaimedJob claimed = jobs.claim("exhaustion-" + attempt, Set.of("stt"));
+            assertThat(claimed.maxAttempts()).isEqualTo(3);
+            try {
+                handler.handle(claimed);
+                throw new AssertionError("Expected transient speech await failure.");
+            } catch (JobHandler.JobExecutionException exception) {
+                assertThat(exception.code()).isEqualTo("PROVIDER_UNAVAILABLE");
+                assertThat(exception.retryable()).isTrue();
+                jobs.fail(claimed, exception.code(), exception.getMessage(), true);
+            }
+            String providerState = jdbc.sql("SELECT provider_request_id FROM ai_jobs WHERE id=:job")
+                    .param("job", accepted.jobId()).query(String.class).single();
+            UUID currentUsageId = UUID.fromString(providerState.split("\\|", 4)[3]);
+            if (usageId == null) usageId = currentUsageId;
+            assertThat(currentUsageId).isEqualTo(usageId);
+            assertThat(jdbc.sql("SELECT status FROM ai_provider_usage WHERE id=:id")
+                    .param("id", usageId).query(String.class).single())
+                    .isEqualTo(attempt < 3 ? "started" : "failed");
+            if (attempt < 3) jobs.retry(owner, accepted.jobId());
+        }
+
+        assertThat(speech.starts()).isOne();
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_provider_usage WHERE job_id=:job")
+                .param("job", accepted.jobId()).query(Integer.class).single()).isOne();
+        assertThat(jdbc.sql("""
+                        SELECT error_code||':'||(finished_at IS NOT NULL)||':'||(latency_ms IS NOT NULL)
+                        FROM ai_provider_usage WHERE id=:id
+                        """).param("id", usageId).query(String.class).single())
+                .isEqualTo("PROVIDER_UNAVAILABLE:true:true");
+        assertThatThrownBy(() -> jobs.retry(owner, accepted.jobId()))
+                .isInstanceOf(ApiException.class)
+                .extracting(value -> ((ApiException) value).code())
+                .isEqualTo("JOB_NOT_RETRYABLE");
+        System.out.println("RECORDING_WORKFLOW scenario=transient_await_exhaustion "
+                + "observable=one_usage_one_start_terminal_safe_failure result=PASS");
     }
 
     @Test
@@ -308,6 +435,8 @@ class RecordingWorkflowIT {
         private final AtomicInteger polls = new AtomicInteger();
         private boolean inputsPresentDuringTimeout;
         private boolean failNextStart;
+        private boolean failNextAwait;
+        private boolean failNextAwaitTerminally;
         private final List<String> awaitedOperations = new java.util.ArrayList<>();
 
         FakeSpeech(FakeTemporaryObjects objects) { this.objects = objects; }
@@ -323,6 +452,14 @@ class RecordingWorkflowIT {
 
         @Override public Optional<Transcript> await(String operationId, Input input, Duration pollTimeout) {
             awaitedOperations.add(operationId);
+            if (failNextAwait) {
+                failNextAwait = false;
+                throw new IllegalStateException("Transient provider await failure.");
+            }
+            if (failNextAwaitTerminally) {
+                failNextAwaitTerminally = false;
+                throw new TerminalOperationException("Terminal provider operation failure.");
+            }
             if (polls.incrementAndGet() == 1) {
                 inputsPresentDuringTimeout = objects.active() == 2;
                 return Optional.empty();
@@ -338,11 +475,15 @@ class RecordingWorkflowIT {
         boolean inputsPresentDuringTimeout() { return inputsPresentDuringTimeout; }
         List<String> awaitedOperations() { return List.copyOf(awaitedOperations); }
         void failNextStart() { failNextStart = true; }
+        void failNextAwait() { failNextAwait = true; }
+        void failNextAwaitTerminally() { failNextAwaitTerminally = true; }
         void reset() {
             starts.set(0);
             polls.set(0);
             inputsPresentDuringTimeout = false;
             failNextStart = false;
+            failNextAwait = false;
+            failNextAwaitTerminally = false;
             awaitedOperations.clear();
         }
     }

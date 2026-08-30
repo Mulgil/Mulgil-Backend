@@ -57,6 +57,11 @@ mulgil:
   demo:
     cache-enabled: ${DEMO_AI_CACHE_ENABLED:true}
     max-ai-jobs-per-day: ${MAX_AI_JOBS_PER_DAY:30}
+  ai-rates:
+    vision-image-microusd: ${AI_RATE_VISION_IMAGE_MICROUSD:0}
+    speech-second-microusd: ${AI_RATE_SPEECH_SECOND_MICROUSD:0}
+    embedding-character-microusd: ${AI_RATE_EMBEDDING_CHARACTER_MICROUSD:0}
+    generation-character-microusd: ${AI_RATE_GENERATION_CHARACTER_MICROUSD:0}
   notifications:
     post-class-reminder-hours: ${POST_CLASS_REMINDER_HOURS:3}
     exam-reminder-days: ${EXAM_REMINDER_DAYS:14,2,1}

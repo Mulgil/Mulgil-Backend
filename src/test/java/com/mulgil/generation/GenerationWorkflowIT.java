@@ -89,6 +89,8 @@ class GenerationWorkflowIT {
         assertThat(jobCount("review_generate")).isZero();
         runOne("chunk_embed");
         assertThat(jobCount("review_generate")).isOne();
+        runCompletionReplay();
+        assertThat(jobCount("review_generate")).isOne();
         runOne("review_generate");
 
         JsonNode response = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
@@ -96,9 +98,14 @@ class GenerationWorkflowIT {
         assertThat(response.path("mindmap").path("nodes").get(0).path("sourceRefs")).isNotEmpty();
         assertThat(jdbc.sql("SELECT count(*) FROM quiz_questions WHERE session_id=:session AND status='succeeded'")
                 .param("session", session).query(Integer.class).single()).isOne();
+        assertThat(jdbc.sql("""
+                        SELECT operation||':'||status FROM ai_provider_usage
+                        WHERE owner_id=:owner ORDER BY operation,status
+                        """).param("owner", owner).query(String.class).list())
+                .contains("vertex.embed:succeeded", "vertex.generate:succeeded");
 
         runCompletionReplay();
-        assertThat(jobCount("review_generate")).isOne();
+        assertThat(jobCount("review_generate")).isEqualTo(2);
         System.out.println("GENERATION_WORKFLOW scenario=staggered_sources observable=zero_then_one_job_valid_http_and_practice_rows result=PASS");
     }
 
@@ -214,6 +221,81 @@ class GenerationWorkflowIT {
         assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type='exam_summary_generate'")
                 .query(Integer.class).single()).isEqualTo(2);
         System.out.println("GENERATION_WORKFLOW scenario=exam_idempotency observable=distinct_exam_jobs_same_exam_retry result=PASS");
+    }
+
+    @Test
+    void bypassesSucceededBillableJob_whenOutputCacheIsDisabled() {
+        JobQueue.EnqueueRequest request = cacheContractRequest("review_generate", "succeeded-billable");
+        JobQueue.AiJob first = jobs.enqueue(request);
+        jobs.complete(jobs.claim("succeeded-billable", Set.of(request.type())), () -> {});
+
+        JobQueue.AiJob replay = jobs.enqueue(request);
+
+        assertThat(replay.id()).isNotEqualTo(first.id());
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type=:type AND source_hash=:hash")
+                .param("type", request.type()).param("hash", request.sourceHash())
+                .query(Integer.class).single()).isEqualTo(2);
+    }
+
+    @Test
+    void deduplicatesQueuedAndRunningBillableJob_whenOutputCacheIsDisabled() {
+        JobQueue.EnqueueRequest request = cacheContractRequest("chunk_embed", "active-billable");
+        JobQueue.AiJob first = jobs.enqueue(request);
+
+        assertThat(jobs.enqueue(request).id()).isEqualTo(first.id());
+        JobQueue.ClaimedJob claimed = jobs.claim("active-billable", Set.of(request.type()));
+        JobQueue.AiJob runningReplay = jobs.enqueue(request);
+
+        assertThat(runningReplay.id()).isEqualTo(first.id());
+        assertThat(runningReplay.status()).isEqualTo("running");
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type=:type AND source_hash=:hash")
+                .param("type", request.type()).param("hash", request.sourceHash())
+                .query(Integer.class).single()).isOne();
+        assertThat(claimed.id()).isEqualTo(first.id());
+    }
+
+    @Test
+    void reusesSucceededNotificationAndLocalPdfJob_whenOutputCacheIsDisabled() {
+        for (String type : List.of("notification_send", "pdf_extract")) {
+            JobQueue.EnqueueRequest request = cacheContractRequest(type, "succeeded-non-billable-" + type);
+            JobQueue.AiJob first = jobs.enqueue(request);
+            jobs.complete(jobs.claim("succeeded-" + type, Set.of(type)), () -> {});
+
+            JobQueue.AiJob replay = jobs.enqueue(request);
+
+            assertThat(replay.id()).as(type).isEqualTo(first.id());
+            assertThat(replay.status()).as(type).isEqualTo("succeeded");
+            assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type=:type AND source_hash=:hash")
+                    .param("type", type).param("hash", request.sourceHash())
+                    .query(Integer.class).single()).as(type).isOne();
+        }
+    }
+
+    @Test
+    void requeuesRetryableAiAndNonAiJobs_whenOutputCacheIsDisabled() {
+        for (String type : List.of("chunk_embed", "notification_send", "pdf_extract")) {
+            JobQueue.EnqueueRequest request = cacheContractRequest(type, "retryable-" + type);
+            JobQueue.AiJob first = jobs.enqueue(request);
+            JobQueue.ClaimedJob claimed = jobs.claim("retryable-" + type, Set.of(type));
+            jobs.fail(claimed, "PROVIDER_TIMEOUT", "Provider timed out.", true);
+
+            JobQueue.AiJob replay = jobs.enqueue(request);
+
+            assertThat(replay.id()).as(type).isEqualTo(first.id());
+            assertThat(replay.status()).as(type).isEqualTo("queued");
+            assertThat(replay.attemptCount()).as(type).isOne();
+            assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type=:type AND source_hash=:hash")
+                    .param("type", type).param("hash", request.sourceHash())
+                    .query(Integer.class).single()).as(type).isOne();
+        }
+        System.out.println("GENERATION_WORKFLOW scenario=cache_disabled_retryable "
+                + "observable=ai_and_non_ai_same_row_requeued result=PASS");
+    }
+
+    private JobQueue.EnqueueRequest cacheContractRequest(String type, String identity) {
+        UUID material = type.equals("pdf_extract") ? sources.addPreviewMaterial(identity) : null;
+        return new JobQueue.EnqueueRequest(type, owner, course, session, material, null, null, null, null, 1,
+                ContentIndexingService.sha256(identity), "test-provider", "test-model", "none");
     }
 
     private UUID createExam() throws Exception {

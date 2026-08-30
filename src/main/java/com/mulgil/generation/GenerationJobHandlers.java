@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.job.AiProviderUsageLedger;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
@@ -27,15 +28,17 @@ abstract class GenerationJobHandler implements JobHandler {
     private final MulgilProperties properties;
     private final ObjectMapper json;
     private final Clock clock;
+    private final AiProviderUsageLedger usage;
 
     GenerationJobHandler(JdbcClient jdbc, GenerationSnapshotService snapshots, GenerationOutputValidator validator,
                          ObjectProvider<GenerationModelPort> models, MulgilProperties properties,
-                         ObjectMapper json, Clock clock) {
+                         AiProviderUsageLedger usage, ObjectMapper json, Clock clock) {
         this.jdbc = jdbc;
         this.snapshots = snapshots;
         this.validator = validator;
         this.models = models;
         this.properties = properties;
+        this.usage = usage;
         this.json = json;
         this.clock = clock;
     }
@@ -50,13 +53,13 @@ abstract class GenerationJobHandler implements JobHandler {
         if (model == null) throw new JobExecutionException(
                 "PROVIDER_UNAVAILABLE", "Generation provider unavailable.", true);
         String raw;
+        String prompt = prompt(snapshot);
         try {
-            raw = model.generateJson(prompt(snapshot), schema());
+            raw = usage.observe(job, "vertex.generate", "vertex", properties.vertex().generationModel(),
+                    "unicode_code_point", prompt.codePoints().count(),
+                    value -> prompt.codePoints().count() + value.codePoints().count(),
+                    ignored -> "PROVIDER_FAILED", () -> model.generateJson(prompt, schema()));
         } catch (RuntimeException exception) {
-            log.atWarn().addKeyValue("event", "generation.provider.failed")
-                    .addKeyValue("jobId", job.id()).addKeyValue("jobType", job.type())
-                    .addKeyValue("failureType", exception.getClass().getSimpleName())
-                    .log("generation provider failed");
             throw new JobExecutionException("PROVIDER_UNAVAILABLE", "Generation provider failed.", true);
         }
         boolean session = job.examId() == null;
@@ -66,13 +69,10 @@ abstract class GenerationJobHandler implements JobHandler {
             output = validator.parse(raw, snapshot, session, quiz);
         } catch (JobExecutionException exception) {
             log.atWarn().addKeyValue("event", "generation.output.rejected")
-                    .addKeyValue("jobId", job.id()).addKeyValue("jobType", job.type())
-                    .addKeyValue("errorCode", exception.code()).log("generation output rejected");
+                    .addKeyValue("jobId", job.id()).addKeyValue("operation", job.type())
+                    .addKeyValue("status", "rejected").log("generation output rejected");
             throw exception;
         }
-        log.atInfo().addKeyValue("event", "generation.provider.completed")
-                .addKeyValue("jobId", job.id()).addKeyValue("jobType", job.type())
-                .addKeyValue("sourceHash", job.sourceHash()).log("generation provider completed");
         return () -> publish(job, output);
     }
 
@@ -197,8 +197,9 @@ abstract class GenerationJobHandler implements JobHandler {
 @Component
 final class PreviewGenerationJobHandler extends GenerationJobHandler {
     PreviewGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationOutputValidator v,
-                                ObjectProvider<GenerationModelPort> m, MulgilProperties p, ObjectMapper o, Clock c) {
-        super(j, s, v, m, p, o, c);
+                                ObjectProvider<GenerationModelPort> m, MulgilProperties p,
+                                AiProviderUsageLedger u, ObjectMapper o, Clock c) {
+        super(j, s, v, m, p, u, o, c);
     }
     public String jobType() { return "preview_generate"; }
 }
@@ -206,8 +207,9 @@ final class PreviewGenerationJobHandler extends GenerationJobHandler {
 @Component
 final class ReviewGenerationJobHandler extends GenerationJobHandler {
     ReviewGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationOutputValidator v,
-                               ObjectProvider<GenerationModelPort> m, MulgilProperties p, ObjectMapper o, Clock c) {
-        super(j, s, v, m, p, o, c);
+                               ObjectProvider<GenerationModelPort> m, MulgilProperties p,
+                               AiProviderUsageLedger u, ObjectMapper o, Clock c) {
+        super(j, s, v, m, p, u, o, c);
     }
     public String jobType() { return "review_generate"; }
 }
@@ -215,8 +217,9 @@ final class ReviewGenerationJobHandler extends GenerationJobHandler {
 @Component
 final class ExamSummaryGenerationJobHandler extends GenerationJobHandler {
     ExamSummaryGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationOutputValidator v,
-                                    ObjectProvider<GenerationModelPort> m, MulgilProperties p, ObjectMapper o, Clock c) {
-        super(j, s, v, m, p, o, c);
+                                    ObjectProvider<GenerationModelPort> m, MulgilProperties p,
+                                    AiProviderUsageLedger u, ObjectMapper o, Clock c) {
+        super(j, s, v, m, p, u, o, c);
     }
     public String jobType() { return "exam_summary_generate"; }
 }
@@ -224,8 +227,9 @@ final class ExamSummaryGenerationJobHandler extends GenerationJobHandler {
 @Component
 final class ExamQuizGenerationJobHandler extends GenerationJobHandler {
     ExamQuizGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationOutputValidator v,
-                                 ObjectProvider<GenerationModelPort> m, MulgilProperties p, ObjectMapper o, Clock c) {
-        super(j, s, v, m, p, o, c);
+                                 ObjectProvider<GenerationModelPort> m, MulgilProperties p,
+                                 AiProviderUsageLedger u, ObjectMapper o, Clock c) {
+        super(j, s, v, m, p, u, o, c);
     }
     public String jobType() { return "exam_quiz_generate"; }
 }
