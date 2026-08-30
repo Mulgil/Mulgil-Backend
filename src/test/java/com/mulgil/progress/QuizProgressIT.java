@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -215,7 +216,7 @@ class QuizProgressIT {
 
     @Test
     void keepsProgressTimestampsMonotonic_whenOlderAttemptFinishesAfterNewerProjection() throws Exception {
-        Instant newer = Instant.now().plusSeconds(3600);
+        Instant newer = Instant.now().plusSeconds(3600).truncatedTo(ChronoUnit.MICROS);
         jdbc.sql("""
                         INSERT INTO progress_status
                             (id,owner_id,course_id,session_id,quiz_question_id,state,correct_count,
