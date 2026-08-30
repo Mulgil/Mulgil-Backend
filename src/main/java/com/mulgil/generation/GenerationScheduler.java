@@ -66,7 +66,8 @@ final class GenerationScheduler implements JobCompletionListener {
         String model = properties.vertex().generationModel();
         String key = com.mulgil.indexing.ContentIndexingService.sha256(String.join("\u001f",
                 snapshot.phase(), snapshot.ownerId().toString(), snapshot.courseId().toString(),
-                snapshot.sessionId().toString(), snapshot.canonical(), model, PROMPT_VERSION));
+                snapshot.sessionId().toString(), snapshot.examId() == null ? "" : snapshot.examId().toString(),
+                snapshot.canonical(), model, PROMPT_VERSION));
         int version = jdbc.sql("""
                         SELECT COALESCE(max(input_version),0)+1 FROM ai_jobs
                         WHERE owner_id=:owner AND job_type IN (:types)

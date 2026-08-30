@@ -192,6 +192,24 @@ class GenerationWorkflowIT {
         System.out.println("GENERATION_WORKFLOW scenario=exam_generation observable=documented_posts_202_summary_and_predicted_rows result=PASS");
     }
 
+    @Test
+    void keepsExamGenerationIdempotentWithinExam_withoutCollidingAcrossExams() throws Exception {
+        sources.addReviewNote("shared selected source", 0);
+        runOne("chunk_embed");
+        UUID firstExam = createExam();
+        UUID secondExam = createExam();
+
+        JsonNode first = ok(send("POST", "/api/v1/exams/" + firstExam + "/summary/generate", Map.of()), 202);
+        JsonNode second = ok(send("POST", "/api/v1/exams/" + secondExam + "/summary/generate", Map.of()), 202);
+        JsonNode retry = ok(send("POST", "/api/v1/exams/" + firstExam + "/summary/generate", Map.of()), 202);
+
+        assertThat(second.path("jobId").asText()).isNotEqualTo(first.path("jobId").asText());
+        assertThat(retry.path("jobId").asText()).isEqualTo(first.path("jobId").asText());
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type='exam_summary_generate'")
+                .query(Integer.class).single()).isEqualTo(2);
+        System.out.println("GENERATION_WORKFLOW scenario=exam_idempotency observable=distinct_exam_jobs_same_exam_retry result=PASS");
+    }
+
     private UUID createExam() throws Exception {
         return UUID.fromString(ok(send("POST", "/api/v1/courses/" + course + "/exams", Map.of(
                 "title", "Midterm", "examAt", "2026-10-01T00:00:00Z", "sessionIds", List.of(session))), 201)
