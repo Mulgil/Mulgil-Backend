@@ -1,9 +1,14 @@
 package com.mulgil.document;
 
+import com.mulgil.common.config.MulgilProperties;
+import com.mulgil.common.error.ApiException;
 import com.mulgil.indexing.ChunkEmbeddingPort;
 import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.job.JobWorkerTestDriver;
+import com.mulgil.ocr.OcrProviderException;
+import com.mulgil.ocr.GoogleVisionOcrTestDriver;
 import com.mulgil.ocr.VisionOcrPort;
 import com.mulgil.storage.CloudStoragePort;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -45,6 +50,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @Testcontainers
 @ActiveProfiles("test")
@@ -68,6 +74,7 @@ class PdfIndexingIT {
     @Autowired FakeStorage storage;
     @Autowired FakeVision vision;
     @Autowired ContentIndexingService indexing;
+    @Autowired MulgilProperties properties;
 
     UUID owner;
     UUID course;
@@ -124,6 +131,10 @@ class PdfIndexingIT {
                 .param("id", material).query(String.class).single()).isEqualTo("ocr");
         assertThat(jdbc.sql("SELECT confidence FROM content_blocks WHERE material_id=:id")
                 .param("id", material).query(Double.class).single()).isEqualTo(0.91);
+        assertThat(jdbc.sql("SELECT provider||':'||model_id FROM content_blocks WHERE material_id=:id")
+                .param("id", material).query(String.class).single()).isEqualTo("fake-vision:fake-ocr");
+        assertThat(jdbc.sql("SELECT source_hash FROM content_blocks WHERE material_id=:id")
+                .param("id", material).query(String.class).single()).hasSize(64);
     }
 
     @Test
@@ -135,6 +146,43 @@ class PdfIndexingIT {
         runAll("pdf_ocr");
 
         assertThat(vision.calls()).isOne();
+    }
+
+    @Test
+    void preservesProviderFailureCode_whenPdfOcrFails() throws Exception {
+        UUID material = insertMaterial(pdf("x".repeat(79), false));
+        jobs.enqueuePdfMaterial(owner, material);
+        runAll("pdf_extract");
+        vision.fail(new OcrProviderException("PROVIDER_UNAVAILABLE", "Vision is unavailable.", true));
+        UUID jobId = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='pdf_ocr'")
+                .query(UUID.class).single();
+
+        JobWorkerTestDriver.poll(jobs, handler("pdf_ocr"), properties);
+
+        assertThat(jobs.get(owner, jobId).status()).isEqualTo("failed");
+        assertThat(jobs.get(owner, jobId).errorCode()).isEqualTo("PROVIDER_UNAVAILABLE");
+        assertThat(jobs.retry(owner, jobId).status()).isEqualTo("queued");
+        assertThat(jdbc.sql("SELECT count(*) FROM content_blocks WHERE material_id=:id")
+                .param("id", material).query(Integer.class).single()).isZero();
+    }
+
+    @Test
+    void rejectsRetry_whenVisionTerminalFailurePersistsThroughWorker() throws Exception {
+        UUID material = insertMaterial(pdf("x".repeat(79), false));
+        jobs.enqueuePdfMaterial(owner, material);
+        runAll("pdf_extract");
+        vision.delegate(GoogleVisionOcrTestDriver.permissionDenied());
+        UUID jobId = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='pdf_ocr'")
+                .query(UUID.class).single();
+
+        JobWorkerTestDriver.poll(jobs, handler("pdf_ocr"), properties);
+
+        assertThatThrownBy(() -> jobs.retry(owner, jobId))
+                .isInstanceOf(ApiException.class)
+                .extracting(value -> ((ApiException) value).code())
+                .isEqualTo("JOB_NOT_RETRYABLE");
+        assertThat(jobs.get(owner, jobId).status()).isEqualTo("failed");
+        assertThat(jobs.get(owner, jobId).errorCode()).isEqualTo("PROVIDER_FAILED");
     }
 
     @Test
@@ -316,8 +364,12 @@ class PdfIndexingIT {
     static final class FakeVision implements VisionOcrPort {
         private final AtomicInteger calls = new AtomicInteger();
         private List<OcrBlock> blocks = List.of(block("recognized text", 0));
+        private OcrProviderException failure;
+        private VisionOcrPort delegate;
         @Override public OcrResult extract(byte[] image) {
             calls.incrementAndGet();
+            if (failure != null) throw failure;
+            if (delegate != null) return delegate.extract(image);
             return new OcrResult(blocks, "fake-vision", "fake-ocr");
         }
         int calls() { return calls.get(); }
@@ -328,7 +380,11 @@ class PdfIndexingIT {
         void reset() {
             calls.set(0);
             blocks = List.of(block("recognized text", 0));
+            failure = null;
+            delegate = null;
         }
+        void fail(OcrProviderException value) { failure = value; }
+        void delegate(VisionOcrPort value) { delegate = value; }
         private static OcrBlock block(String text, int index) {
             return new OcrBlock(text, 0.91, new NormalizedBox(0.1, 0.1 + index * 0.2, 0.7, 0.15));
         }

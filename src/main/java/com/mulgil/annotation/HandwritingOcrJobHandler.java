@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.ocr.OcrProviderException;
 import com.mulgil.ocr.VisionOcrPort;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -82,7 +83,12 @@ final class HandwritingOcrJobHandler implements JobHandler {
             } catch (IOException exception) {
                 throw new JobExecutionException("INVALID_ANNOTATION", "Handwriting raster failed.", false);
             }
-            VisionOcrPort.OcrResult extracted = provider.extract(image);
+            VisionOcrPort.OcrResult extracted;
+            try {
+                extracted = provider.extract(image);
+            } catch (OcrProviderException exception) {
+                throw new JobExecutionException(exception.code(), exception.getMessage(), exception.retryable());
+            }
             String text = extracted.blocks().stream().map(VisionOcrPort.OcrBlock::text)
                     .filter(value -> value != null && !value.isBlank()).reduce((left, right) -> left + "\n" + right)
                     .orElse("");

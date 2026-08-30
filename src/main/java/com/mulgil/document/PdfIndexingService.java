@@ -6,6 +6,7 @@ import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
+import com.mulgil.ocr.OcrProviderException;
 import com.mulgil.ocr.VisionOcrPort;
 import com.mulgil.storage.CloudStoragePort;
 import org.springframework.beans.factory.ObjectProvider;
@@ -70,6 +71,9 @@ final class PdfIndexingService {
             if (!needsOcr(page)) continue;
             try {
                 pages.add(new OcrPage(page.number(), port.extract(analyzer.render(prepared.bytes(), page.number()))));
+            } catch (OcrProviderException exception) {
+                throw new JobHandler.JobExecutionException(exception.code(), exception.getMessage(),
+                        exception.retryable());
             } catch (IOException exception) {
                 throw new JobHandler.JobExecutionException("INVALID_PDF", "PDF rendering failed.", false);
             }
