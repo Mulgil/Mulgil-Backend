@@ -48,7 +48,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV008_whenDatabaseIsFresh() {
+    void appliesV001ThroughV009_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -94,7 +94,7 @@ class FlywaySchemaIT {
                             'exam_resources_dependents_update_cleanup', 'quiz_attempts_immutable')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008");
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009");
         assertThat(requiredTables).isEqualTo(16);
         assertThat(requiredIndexes).hasSize(6);
         assertThat(jobColumns).isEqualTo(6);

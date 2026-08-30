@@ -10,5 +10,9 @@ public interface CloudStoragePort {
 
     StoredObjectMetadata metadata(String objectKey);
 
+    default byte[] read(String objectKey) {
+        return null;
+    }
+
     record StoredObjectMetadata(String contentType, long contentLength, String checksum) {}
 }

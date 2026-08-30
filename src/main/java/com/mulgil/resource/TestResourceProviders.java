@@ -25,6 +25,11 @@ final class TestCloudStorageAdapter implements CloudStoragePort {
         return null;
     }
 
+    @Override
+    public byte[] read(String objectKey) {
+        return null;
+    }
+
     private static String resourceId(String objectKey) {
         String[] parts = objectKey.split("/");
         return parts[parts.length - 2];
