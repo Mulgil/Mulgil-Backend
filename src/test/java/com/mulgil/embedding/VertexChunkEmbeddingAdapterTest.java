@@ -21,6 +21,7 @@ import org.springframework.mock.env.MockEnvironment;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -35,24 +36,77 @@ import static org.mockito.Mockito.when;
 @ExtendWith(OutputCaptureExtension.class)
 class VertexChunkEmbeddingAdapterTest {
     @Test
-    void splitsTwelveInputsIntoFiveFiveTwo_preservesOrder_andUsesOneClientLifecycle() {
+    void capsRequestsAtFive_mapsVertexRequest_andPreservesOrderWithConfigTwenty() {
         PredictionServiceClient client = mock(PredictionServiceClient.class);
+        List<String> endpoints = new ArrayList<>();
         List<Integer> batchSizes = new ArrayList<>();
+        List<Value> parameters = new ArrayList<>();
+        List<Value> allInstances = new ArrayList<>();
         when(client.predict(anyString(), anyList(), any())).thenAnswer(invocation -> {
+            endpoints.add(invocation.getArgument(0));
             List<Value> instances = invocation.getArgument(1);
             batchSizes.add(instances.size());
+            allInstances.addAll(instances);
+            parameters.add(invocation.getArgument(2));
             return response(instances.stream().map(VertexChunkEmbeddingAdapterTest::marker).toList(), 768);
         });
-        VertexChunkEmbeddingAdapter adapter = adapter(5, client, new SimpleMeterRegistry());
+        VertexChunkEmbeddingAdapter adapter = adapter(20, client, new SimpleMeterRegistry());
 
         List<ChunkEmbeddingPort.Embedding> embeddings = adapter.embedAll(
                 java.util.stream.IntStream.range(0, 12).mapToObj(String::valueOf).toList());
 
         assertThat(batchSizes).containsExactly(5, 5, 2);
+        assertThat(endpoints).allMatch(endpoint -> endpoint.equals(
+                "projects/project/locations/location/publishers/google/models/text-multilingual-embedding-002"));
+        assertThat(allInstances).allMatch(instance -> instance.getStructValue().getFieldsOrThrow("task_type")
+                .getStringValue().equals("RETRIEVAL_DOCUMENT"));
+        assertThat(parameters).allMatch(parameter -> parameter.getStructValue()
+                .getFieldsOrThrow("outputDimensionality").getNumberValue() == 768d);
         assertThat(embeddings).extracting(embedding -> embedding.values().getFirst())
                 .containsExactlyElementsOf(java.util.stream.IntStream.range(0, 12)
                         .mapToObj(value -> (float) value).toList());
         verify(client).close();
+    }
+
+    @Test
+    void checkpointsSuccessfulSingletonBeforeLaterFallbackFailure_andDoesNotAttemptRemainingInput() {
+        PredictionServiceClient client = mock(PredictionServiceClient.class);
+        InvalidArgumentException batchFailure = mock(InvalidArgumentException.class);
+        IllegalStateException singletonFailure = new IllegalStateException("second singleton failed");
+        when(client.predict(anyString(), anyList(), any()))
+                .thenThrow(batchFailure)
+                .thenReturn(response(List.of(0f), 768))
+                .thenThrow(singletonFailure);
+        List<String> usage = new ArrayList<>();
+        List<Float> checkpointed = new ArrayList<>();
+        ChunkEmbeddingPort.ProviderCallObserver observer = new ChunkEmbeddingPort.ProviderCallObserver() {
+            @Override
+            public List<ChunkEmbeddingPort.Embedding> observe(int startIndex, List<String> texts,
+                                                               Supplier<List<ChunkEmbeddingPort.Embedding>> call) {
+                usage.add("started:" + startIndex + ":" + texts.size());
+                try {
+                    List<ChunkEmbeddingPort.Embedding> result = call.get();
+                    usage.add("succeeded:" + startIndex + ":" + texts.size());
+                    return result;
+                } catch (RuntimeException exception) {
+                    usage.add("failed:" + startIndex + ":" + texts.size());
+                    throw exception;
+                }
+            }
+
+            @Override
+            public void checkpoint(int startIndex, List<ChunkEmbeddingPort.Embedding> embeddings) {
+                checkpointed.add(embeddings.getFirst().values().getFirst());
+            }
+        };
+
+        assertThatThrownBy(() -> adapter(5, client, new SimpleMeterRegistry())
+                .embedAll(List.of("0", "1", "2"), observer)).isSameAs(singletonFailure);
+
+        assertThat(usage).containsExactly("started:0:3", "failed:0:3",
+                "started:0:1", "succeeded:0:1", "started:1:1", "failed:1:1");
+        assertThat(checkpointed).containsExactly(0f);
+        verify(client, times(3)).predict(anyString(), anyList(), any());
     }
 
     @Test
@@ -145,7 +199,8 @@ class VertexChunkEmbeddingAdapterTest {
                                                        SimpleMeterRegistry metrics) {
         MulgilProperties properties = mock(MulgilProperties.class);
         when(properties.google()).thenReturn(new MulgilProperties.Google("oauth", "project", "location"));
-        when(properties.vertex()).thenReturn(new MulgilProperties.Vertex("generation", "embedding", batchSize));
+        when(properties.vertex()).thenReturn(new MulgilProperties.Vertex(
+                "generation", "text-multilingual-embedding-002", batchSize));
         return new VertexChunkEmbeddingAdapter(properties, metrics, () -> client);
     }
 

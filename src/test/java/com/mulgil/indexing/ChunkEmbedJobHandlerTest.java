@@ -35,6 +35,11 @@ class ChunkEmbedJobHandlerTest {
             public List<Embedding> embedAll(List<String> texts) {
                 return List.of(new Embedding(Collections.nCopies(768, 1f), "fake"));
             }
+
+            @Override
+            public List<Embedding> embedAll(List<String> texts, ProviderCallObserver observer) {
+                return embedAll(texts);
+            }
         };
         when(ports.getIfAvailable()).thenReturn(mismatched);
         MulgilProperties properties = mock(MulgilProperties.class);

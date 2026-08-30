@@ -23,6 +23,7 @@ import java.util.List;
 @Component
 @Profile("!test & !smoke")
 final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
+    private static final int PROVIDER_MAX_BATCH_SIZE = 5;
     private static final Logger log = LoggerFactory.getLogger(VertexChunkEmbeddingAdapter.class);
     private static final String FALLBACK_REASON = "multi_instance_failed";
 
@@ -48,7 +49,7 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
     }
 
     @Override
-    public List<Embedding> embedAll(List<String> texts) {
+    public List<Embedding> embedAll(List<String> texts, ProviderCallObserver observer) {
         if (texts.isEmpty()) return List.of();
         String location = properties.google().cloudLocation();
         String model = properties.vertex().embeddingModel();
@@ -58,10 +59,11 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
                 .putFields("outputDimensionality", Value.newBuilder().setNumberValue(768).build()).build()).build();
         List<Embedding> results = new ArrayList<>(texts.size());
         try (PredictionServiceClient client = clients.create()) {
-            int batchSize = properties.vertex().embeddingBatchSize();
+            int batchSize = Math.min(properties.vertex().embeddingBatchSize(), PROVIDER_MAX_BATCH_SIZE);
+            CallSequence calls = new CallSequence(observer);
             for (int start = 0; start < texts.size(); start += batchSize) {
                 List<String> batch = texts.subList(start, Math.min(start + batchSize, texts.size()));
-                results.addAll(predict(client, endpoint, parameters, model, batch));
+                results.addAll(predict(client, endpoint, parameters, model, start, batch, calls));
             }
         } catch (IOException exception) {
             throw new IllegalStateException("Could not create Vertex embedding client.", exception);
@@ -70,18 +72,24 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
     }
 
     private List<Embedding> predict(PredictionServiceClient client, String endpoint, Value parameters,
-                                    String model, List<String> texts) {
+                                    String model, int startIndex, List<String> texts, CallSequence calls) {
         List<Value> instances = texts.stream().map(VertexChunkEmbeddingAdapter::instance).toList();
         try {
-            return embeddings(client.predict(endpoint, instances, parameters), texts.size(), model);
+            return calls.call(startIndex, texts,
+                    () -> embeddings(client.predict(endpoint, instances, parameters), texts.size(), model));
         } catch (InvalidArgumentException exception) {
             if (texts.size() == 1) throw exception;
             metrics.counter("mulgil.embedding.batch.fallback", "reason", FALLBACK_REASON).increment();
             log.atWarn().addKeyValue("event", "embedding.batch.fallback")
                     .addKeyValue("reason", FALLBACK_REASON).addKeyValue("batchSize", texts.size())
                     .log("Vertex embedding batch fell back to sequential calls");
-            return instances.stream().flatMap(instance -> embeddings(
-                    client.predict(endpoint, List.of(instance), parameters), 1, model).stream()).toList();
+            List<Embedding> fallback = new ArrayList<>(texts.size());
+            for (int index = 0; index < instances.size(); index++) {
+                Value instance = instances.get(index);
+                fallback.addAll(calls.call(startIndex + index, List.of(texts.get(index)),
+                        () -> embeddings(client.predict(endpoint, List.of(instance), parameters), 1, model)));
+            }
+            return List.copyOf(fallback);
         }
     }
 
@@ -113,5 +121,27 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
     @FunctionalInterface
     interface ClientFactory {
         PredictionServiceClient create() throws IOException;
+    }
+
+    private static final class CallSequence {
+        private final ProviderCallObserver observer;
+        private int pendingIndex;
+        private List<Embedding> pending = List.of();
+
+        private CallSequence(ProviderCallObserver observer) {
+            this.observer = observer;
+        }
+
+        private List<Embedding> call(int startIndex, List<String> texts,
+                                     java.util.function.Supplier<List<Embedding>> providerCall) {
+            if (!pending.isEmpty()) {
+                observer.checkpoint(pendingIndex, pending);
+                pending = List.of();
+            }
+            List<Embedding> embeddings = observer.observe(startIndex, texts, providerCall);
+            pendingIndex = startIndex;
+            pending = embeddings;
+            return embeddings;
+        }
     }
 }
