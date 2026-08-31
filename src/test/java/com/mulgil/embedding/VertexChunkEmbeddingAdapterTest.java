@@ -16,9 +16,6 @@ import com.mulgil.indexing.ChunkEmbeddingPort;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.validation.Validation;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.springframework.boot.test.system.CapturedOutput;
-import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.mock.env.MockEnvironment;
@@ -40,7 +37,6 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-@ExtendWith(OutputCaptureExtension.class)
 class VertexChunkEmbeddingAdapterTest {
     @Test
     void capsRequestsAtFive_mapsVertexRequest_andPreservesOrderWithConfigTwenty() {
@@ -170,7 +166,7 @@ class VertexChunkEmbeddingAdapterTest {
     }
 
     @Test
-    void fallsBackSequentiallyOnlyAfterMultiInstanceProviderFailure_andRedactsReason(CapturedOutput output) {
+    void fallsBackSequentiallyOnlyAfterMultiInstanceProviderFailure_andRedactsReason() {
         PredictionServiceClient client = mock(PredictionServiceClient.class);
         InvalidArgumentException providerFailure = mock(InvalidArgumentException.class);
         when(providerFailure.getMessage()).thenReturn("credential=secret");
@@ -193,14 +189,18 @@ class VertexChunkEmbeddingAdapterTest {
             assertThat(metrics.counter("mulgil.embedding.batch.fallback", "reason", "multi_instance_failed").count())
                     .isEqualTo(1d);
             assertThat(appender.list).singleElement().satisfies(event -> {
+                assertThat(event.getFormattedMessage())
+                        .isEqualTo("Vertex embedding batch fell back to sequential calls")
+                        .doesNotContain("credential=secret");
                 assertThat(event.getKeyValuePairs()).extracting(pair -> pair.key, pair -> pair.value)
                         .containsExactly(
                                 org.assertj.core.groups.Tuple.tuple("event", "embedding.batch.fallback"),
                                 org.assertj.core.groups.Tuple.tuple("reason", "multi_instance_failed"),
                                 org.assertj.core.groups.Tuple.tuple("batchSize", 2));
+                assertThat(event.getKeyValuePairs()).extracting(pair -> String.valueOf(pair.value))
+                        .noneMatch(value -> value.contains("credential=secret"));
+                assertThat(event.getThrowableProxy()).isNull();
             });
-            assertThat(output).contains("Vertex embedding batch fell back to sequential calls")
-                    .doesNotContain("credential=secret");
         } finally {
             logger.detachAppender(appender);
             appender.stop();
