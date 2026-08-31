@@ -1,9 +1,11 @@
 package com.mulgil.indexing;
 
+import com.google.api.gax.rpc.ApiException;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
 import com.mulgil.job.AiProviderUsageLedger;
 import com.mulgil.common.config.MulgilProperties;
+import com.mulgil.embedding.EmbeddingProviderException;
 import com.pgvector.PGvector;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -46,18 +48,69 @@ final class ChunkEmbedJobHandler implements JobHandler {
                 .query((row, ignored) -> new PendingChunk(row.getObject("id", UUID.class),
                         row.getString("text_content"), row.getString("source_hash"),
                         row.getString("source_ref"))).list();
-        List<EmbeddedChunk> results = chunks.stream().map(chunk -> {
-            ChunkEmbeddingPort.Embedding embedding = usage.observe(job, "vertex.embed", "vertex",
-                    properties.vertex().embeddingModel(), "unicode_code_point",
-                    chunk.text().codePoints().count(),
-                    () -> port.embed(chunk.text()));
-            if (embedding.values().size() != 768) throw new IllegalArgumentException("Embedding must have 768 values.");
+        List<ChunkEmbeddingPort.Embedding> embeddings;
+        try {
+            embeddings = port.embedAll(chunks.stream().map(PendingChunk::text).toList(),
+                    new ChunkEmbeddingPort.ProviderCallObserver() {
+                        @Override
+                        public List<ChunkEmbeddingPort.Embedding> observe(
+                                int startIndex, List<String> texts,
+                                java.util.function.Supplier<List<ChunkEmbeddingPort.Embedding>> providerCall) {
+                            AiProviderUsageLedger.UsageHandle handle = usage.begin(job.id(), job.ownerId(),
+                                    "vertex.embed", "vertex", properties.vertex().embeddingModel(),
+                                    "unicode_code_point",
+                                    texts.stream().mapToLong(text -> text.codePoints().count()).sum());
+                            try {
+                                List<ChunkEmbeddingPort.Embedding> result = providerCall.get();
+                                embeddedChunks(chunks, startIndex, texts.size(), result);
+                                usage.succeed(handle);
+                                return result;
+                            } catch (RuntimeException exception) {
+                                usage.fail(handle, failureCode(exception));
+                                throw exception;
+                            }
+                        }
+
+                        @Override
+                        public void checkpoint(int startIndex, List<ChunkEmbeddingPort.Embedding> embeddings) {
+                            publish(job, embeddedChunks(chunks, startIndex, embeddings.size(), embeddings));
+                        }
+                    });
+        } catch (EmbeddingProviderException exception) {
+            throw new JobExecutionException(exception.code(), "Embedding provider failed.", exception.retryable());
+        }
+        List<EmbeddedChunk> results = embeddedChunks(chunks, 0, chunks.size(), embeddings);
+        return () -> publish(job, results);
+    }
+
+    private static String failureCode(RuntimeException exception) {
+        if (exception instanceof EmbeddingProviderException provider) return provider.code();
+        if (exception instanceof ApiException provider) return EmbeddingProviderException.from(provider).code();
+        return "PROVIDER_FAILED";
+    }
+
+    private List<EmbeddedChunk> embeddedChunks(List<PendingChunk> chunks, int startIndex, int expectedCount,
+                                               List<ChunkEmbeddingPort.Embedding> embeddings) {
+        if (embeddings.size() != expectedCount || startIndex < 0 || startIndex + expectedCount > chunks.size()) {
+            throw new IllegalArgumentException("Embedding count must match chunk count.");
+        }
+        return java.util.stream.IntStream.range(0, embeddings.size()).mapToObj(offset -> {
+            PendingChunk chunk = chunks.get(startIndex + offset);
+            ChunkEmbeddingPort.Embedding embedding = embeddings.get(offset);
+            if (embedding.values().size() != 768) {
+                throw new IllegalArgumentException("Embedding must have 768 values.");
+            }
             float[] values = new float[embedding.values().size()];
-            for (int index = 0; index < values.length; index++) values[index] = embedding.values().get(index);
+            for (int valueIndex = 0; valueIndex < values.length; valueIndex++) {
+                values[valueIndex] = embedding.values().get(valueIndex);
+            }
             return new EmbeddedChunk(chunk.id(), chunk.text(), chunk.sourceHash(), chunk.sourceReference(),
                     new PGvector(values), embedding.model());
         }).toList();
-        return () -> results.forEach(result -> jdbc.sql("""
+    }
+
+    private void publish(JobQueue.ClaimedJob job, List<EmbeddedChunk> results) {
+        results.forEach(result -> jdbc.sql("""
                         UPDATE chunks SET embedding=:embedding, embedding_model=:model
                         WHERE id=:id AND owner_id=:owner AND course_id=:course AND session_id=:session
                           AND text_content=:text AND source_hash=:hash
