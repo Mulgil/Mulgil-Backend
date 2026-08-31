@@ -1,5 +1,8 @@
 package com.mulgil.embedding;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.google.api.gax.rpc.ApiException;
 import com.google.api.gax.rpc.InvalidArgumentException;
 import com.google.api.gax.rpc.StatusCode;
@@ -19,6 +22,7 @@ import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.mock.env.MockEnvironment;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -175,15 +179,32 @@ class VertexChunkEmbeddingAdapterTest {
                 .thenReturn(response(List.of(3f), 768))
                 .thenReturn(response(List.of(4f), 768));
         SimpleMeterRegistry metrics = new SimpleMeterRegistry();
+        Logger logger = (Logger) LoggerFactory.getLogger(VertexChunkEmbeddingAdapter.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
 
-        List<ChunkEmbeddingPort.Embedding> embeddings = adapter(5, client, metrics).embedAll(List.of("3", "4"));
+        try {
+            List<ChunkEmbeddingPort.Embedding> embeddings =
+                    adapter(5, client, metrics).embedAll(List.of("3", "4"));
 
-        assertThat(embeddings).extracting(embedding -> embedding.values().getFirst()).containsExactly(3f, 4f);
-        verify(client, times(3)).predict(anyString(), anyList(), any());
-        assertThat(metrics.counter("mulgil.embedding.batch.fallback", "reason", "multi_instance_failed").count())
-                .isEqualTo(1d);
-        assertThat(output).contains("embedding.batch.fallback", "reason=\"multi_instance_failed\"", "batchSize=\"2\"")
-                .doesNotContain("credential=secret");
+            assertThat(embeddings).extracting(embedding -> embedding.values().getFirst()).containsExactly(3f, 4f);
+            verify(client, times(3)).predict(anyString(), anyList(), any());
+            assertThat(metrics.counter("mulgil.embedding.batch.fallback", "reason", "multi_instance_failed").count())
+                    .isEqualTo(1d);
+            assertThat(appender.list).singleElement().satisfies(event -> {
+                assertThat(event.getKeyValuePairs()).extracting(pair -> pair.key, pair -> pair.value)
+                        .containsExactly(
+                                org.assertj.core.groups.Tuple.tuple("event", "embedding.batch.fallback"),
+                                org.assertj.core.groups.Tuple.tuple("reason", "multi_instance_failed"),
+                                org.assertj.core.groups.Tuple.tuple("batchSize", 2));
+            });
+            assertThat(output).contains("Vertex embedding batch fell back to sequential calls")
+                    .doesNotContain("credential=secret");
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
     }
 
     @Test
