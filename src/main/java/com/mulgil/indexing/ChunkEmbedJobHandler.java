@@ -1,9 +1,11 @@
 package com.mulgil.indexing;
 
+import com.google.api.gax.rpc.ApiException;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
 import com.mulgil.job.AiProviderUsageLedger;
 import com.mulgil.common.config.MulgilProperties;
+import com.mulgil.embedding.EmbeddingProviderException;
 import com.pgvector.PGvector;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -46,33 +48,45 @@ final class ChunkEmbedJobHandler implements JobHandler {
                 .query((row, ignored) -> new PendingChunk(row.getObject("id", UUID.class),
                         row.getString("text_content"), row.getString("source_hash"),
                         row.getString("source_ref"))).list();
-        List<ChunkEmbeddingPort.Embedding> embeddings = port.embedAll(
-                chunks.stream().map(PendingChunk::text).toList(), new ChunkEmbeddingPort.ProviderCallObserver() {
-                    @Override
-                    public List<ChunkEmbeddingPort.Embedding> observe(
-                            int startIndex, List<String> texts,
-                            java.util.function.Supplier<List<ChunkEmbeddingPort.Embedding>> providerCall) {
-                        AiProviderUsageLedger.UsageHandle handle = usage.begin(job.id(), job.ownerId(),
-                                "vertex.embed", "vertex", properties.vertex().embeddingModel(),
-                                "unicode_code_point", texts.stream().mapToLong(text -> text.codePoints().count()).sum());
-                        try {
-                            List<ChunkEmbeddingPort.Embedding> result = providerCall.get();
-                            embeddedChunks(chunks, startIndex, texts.size(), result);
-                            usage.succeed(handle);
-                            return result;
-                        } catch (RuntimeException exception) {
-                            usage.fail(handle, "PROVIDER_FAILED");
-                            throw exception;
+        List<ChunkEmbeddingPort.Embedding> embeddings;
+        try {
+            embeddings = port.embedAll(chunks.stream().map(PendingChunk::text).toList(),
+                    new ChunkEmbeddingPort.ProviderCallObserver() {
+                        @Override
+                        public List<ChunkEmbeddingPort.Embedding> observe(
+                                int startIndex, List<String> texts,
+                                java.util.function.Supplier<List<ChunkEmbeddingPort.Embedding>> providerCall) {
+                            AiProviderUsageLedger.UsageHandle handle = usage.begin(job.id(), job.ownerId(),
+                                    "vertex.embed", "vertex", properties.vertex().embeddingModel(),
+                                    "unicode_code_point",
+                                    texts.stream().mapToLong(text -> text.codePoints().count()).sum());
+                            try {
+                                List<ChunkEmbeddingPort.Embedding> result = providerCall.get();
+                                embeddedChunks(chunks, startIndex, texts.size(), result);
+                                usage.succeed(handle);
+                                return result;
+                            } catch (RuntimeException exception) {
+                                usage.fail(handle, failureCode(exception));
+                                throw exception;
+                            }
                         }
-                    }
 
-                    @Override
-                    public void checkpoint(int startIndex, List<ChunkEmbeddingPort.Embedding> embeddings) {
-                        publish(job, embeddedChunks(chunks, startIndex, embeddings.size(), embeddings));
-                    }
-                });
+                        @Override
+                        public void checkpoint(int startIndex, List<ChunkEmbeddingPort.Embedding> embeddings) {
+                            publish(job, embeddedChunks(chunks, startIndex, embeddings.size(), embeddings));
+                        }
+                    });
+        } catch (EmbeddingProviderException exception) {
+            throw new JobExecutionException(exception.code(), "Embedding provider failed.", exception.retryable());
+        }
         List<EmbeddedChunk> results = embeddedChunks(chunks, 0, chunks.size(), embeddings);
         return () -> publish(job, results);
+    }
+
+    private static String failureCode(RuntimeException exception) {
+        if (exception instanceof EmbeddingProviderException provider) return provider.code();
+        if (exception instanceof ApiException provider) return EmbeddingProviderException.from(provider).code();
+        return "PROVIDER_FAILED";
     }
 
     private List<EmbeddedChunk> embeddedChunks(List<PendingChunk> chunks, int startIndex, int expectedCount,

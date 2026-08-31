@@ -1,5 +1,6 @@
 package com.mulgil.embedding;
 
+import com.google.api.gax.rpc.ApiException;
 import com.google.api.gax.rpc.InvalidArgumentException;
 import com.google.cloud.vertexai.api.PredictResponse;
 import com.google.cloud.vertexai.api.PredictionServiceClient;
@@ -66,7 +67,8 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
                 results.addAll(predict(client, endpoint, parameters, model, start, batch, calls));
             }
         } catch (IOException exception) {
-            throw new IllegalStateException("Could not create Vertex embedding client.", exception);
+            throw new EmbeddingProviderException("PROVIDER_UNAVAILABLE",
+                    "Could not create Vertex embedding client.", true);
         }
         return List.copyOf(results);
     }
@@ -78,7 +80,7 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
             return calls.call(startIndex, texts,
                     () -> embeddings(client.predict(endpoint, instances, parameters), texts.size(), model));
         } catch (InvalidArgumentException exception) {
-            if (texts.size() == 1) throw exception;
+            if (texts.size() == 1) throw EmbeddingProviderException.from(exception);
             metrics.counter("mulgil.embedding.batch.fallback", "reason", FALLBACK_REASON).increment();
             log.atWarn().addKeyValue("event", "embedding.batch.fallback")
                     .addKeyValue("reason", FALLBACK_REASON).addKeyValue("batchSize", texts.size())
@@ -86,10 +88,16 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
             List<Embedding> fallback = new ArrayList<>(texts.size());
             for (int index = 0; index < instances.size(); index++) {
                 Value instance = instances.get(index);
-                fallback.addAll(calls.call(startIndex + index, List.of(texts.get(index)),
-                        () -> embeddings(client.predict(endpoint, List.of(instance), parameters), 1, model)));
+                try {
+                    fallback.addAll(calls.call(startIndex + index, List.of(texts.get(index)),
+                            () -> embeddings(client.predict(endpoint, List.of(instance), parameters), 1, model)));
+                } catch (ApiException fallbackFailure) {
+                    throw EmbeddingProviderException.from(fallbackFailure);
+                }
             }
             return List.copyOf(fallback);
+        } catch (ApiException exception) {
+            throw EmbeddingProviderException.from(exception);
         }
     }
 

@@ -1,6 +1,8 @@
 package com.mulgil.embedding;
 
+import com.google.api.gax.rpc.ApiException;
 import com.google.api.gax.rpc.InvalidArgumentException;
+import com.google.api.gax.rpc.StatusCode;
 import com.google.cloud.vertexai.api.PredictResponse;
 import com.google.cloud.vertexai.api.PredictionServiceClient;
 import com.google.protobuf.ListValue;
@@ -18,6 +20,7 @@ import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.mock.env.MockEnvironment;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -72,7 +75,7 @@ class VertexChunkEmbeddingAdapterTest {
     void checkpointsSuccessfulSingletonBeforeLaterFallbackFailure_andDoesNotAttemptRemainingInput() {
         PredictionServiceClient client = mock(PredictionServiceClient.class);
         InvalidArgumentException batchFailure = mock(InvalidArgumentException.class);
-        IllegalStateException singletonFailure = new IllegalStateException("second singleton failed");
+        ApiException singletonFailure = gax(StatusCode.Code.UNAVAILABLE, true);
         when(client.predict(anyString(), anyList(), any()))
                 .thenThrow(batchFailure)
                 .thenReturn(response(List.of(0f), 768))
@@ -101,7 +104,11 @@ class VertexChunkEmbeddingAdapterTest {
         };
 
         assertThatThrownBy(() -> adapter(5, client, new SimpleMeterRegistry())
-                .embedAll(List.of("0", "1", "2"), observer)).isSameAs(singletonFailure);
+                .embedAll(List.of("0", "1", "2"), observer))
+                .isInstanceOfSatisfying(EmbeddingProviderException.class, exception -> {
+                    assertThat(exception.code()).isEqualTo("PROVIDER_UNAVAILABLE");
+                    assertThat(exception.retryable()).isTrue();
+                });
 
         assertThat(usage).containsExactly("started:0:3", "failed:0:3",
                 "started:0:1", "succeeded:0:1", "started:1:1", "failed:1:1");
@@ -130,6 +137,35 @@ class VertexChunkEmbeddingAdapterTest {
     }
 
     @Test
+    void mapsGaxStatusesToSafeRetryTaxonomy() {
+        assertFailure(StatusCode.Code.DEADLINE_EXCEEDED, false, "PROVIDER_TIMEOUT", true);
+        assertFailure(StatusCode.Code.RESOURCE_EXHAUSTED, false, "PROVIDER_RATE_LIMIT", true);
+        assertFailure(StatusCode.Code.UNAVAILABLE, false, "PROVIDER_UNAVAILABLE", true);
+        assertFailure(StatusCode.Code.INTERNAL, false, "PROVIDER_UNAVAILABLE", true);
+        assertFailure(StatusCode.Code.ABORTED, false, "PROVIDER_UNAVAILABLE", true);
+        assertFailure(StatusCode.Code.UNKNOWN, true, "PROVIDER_UNAVAILABLE", true);
+        assertFailure(StatusCode.Code.INVALID_ARGUMENT, false, "PROVIDER_FAILED", false);
+        assertFailure(StatusCode.Code.PERMISSION_DENIED, false, "PROVIDER_FAILED", false);
+    }
+
+    @Test
+    void mapsClientCreationIoToRetryableUnavailable() {
+        MulgilProperties properties = mock(MulgilProperties.class);
+        when(properties.google()).thenReturn(new MulgilProperties.Google("oauth", "project", "location"));
+        when(properties.vertex()).thenReturn(new MulgilProperties.Vertex(
+                "generation", "text-multilingual-embedding-002", 5));
+        VertexChunkEmbeddingAdapter adapter = new VertexChunkEmbeddingAdapter(
+                properties, new SimpleMeterRegistry(), () -> { throw new IOException("credential=secret"); });
+
+        assertThatThrownBy(() -> adapter.embed("text"))
+                .isInstanceOfSatisfying(EmbeddingProviderException.class, exception -> {
+                    assertThat(exception.code()).isEqualTo("PROVIDER_UNAVAILABLE");
+                    assertThat(exception.retryable()).isTrue();
+                    assertThat(exception.getMessage()).doesNotContain("credential=secret");
+                });
+    }
+
+    @Test
     void fallsBackSequentiallyOnlyAfterMultiInstanceProviderFailure_andRedactsReason(CapturedOutput output) {
         PredictionServiceClient client = mock(PredictionServiceClient.class);
         InvalidArgumentException providerFailure = mock(InvalidArgumentException.class);
@@ -154,10 +190,17 @@ class VertexChunkEmbeddingAdapterTest {
     void doesNotFallbackForSingleInstanceFailure() {
         PredictionServiceClient client = mock(PredictionServiceClient.class);
         InvalidArgumentException providerFailure = mock(InvalidArgumentException.class);
+        StatusCode status = mock(StatusCode.class);
+        when(status.getCode()).thenReturn(StatusCode.Code.INVALID_ARGUMENT);
+        when(providerFailure.getStatusCode()).thenReturn(status);
         when(client.predict(anyString(), anyList(), any())).thenThrow(providerFailure);
         SimpleMeterRegistry metrics = new SimpleMeterRegistry();
 
-        assertThatThrownBy(() -> adapter(5, client, metrics).embed("1")).isSameAs(providerFailure);
+        assertThatThrownBy(() -> adapter(5, client, metrics).embed("1"))
+                .isInstanceOfSatisfying(EmbeddingProviderException.class, exception -> {
+                    assertThat(exception.code()).isEqualTo("PROVIDER_FAILED");
+                    assertThat(exception.retryable()).isFalse();
+                });
 
         verify(client).predict(anyString(), anyList(), any());
         assertThat(metrics.find("mulgil.embedding.batch.fallback").counter()).isNull();
@@ -202,6 +245,28 @@ class VertexChunkEmbeddingAdapterTest {
         when(properties.vertex()).thenReturn(new MulgilProperties.Vertex(
                 "generation", "text-multilingual-embedding-002", batchSize));
         return new VertexChunkEmbeddingAdapter(properties, metrics, () -> client);
+    }
+
+    private static void assertFailure(StatusCode.Code status, boolean retryable,
+                                      String expectedCode, boolean expectedRetryable) {
+        PredictionServiceClient client = mock(PredictionServiceClient.class);
+        ApiException failure = gax(status, retryable);
+        when(client.predict(anyString(), anyList(), any())).thenThrow(failure);
+
+        assertThatThrownBy(() -> adapter(5, client, new SimpleMeterRegistry()).embed("1"))
+                .isInstanceOfSatisfying(EmbeddingProviderException.class, exception -> {
+                    assertThat(exception.code()).isEqualTo(expectedCode);
+                    assertThat(exception.retryable()).isEqualTo(expectedRetryable);
+                });
+    }
+
+    private static ApiException gax(StatusCode.Code code, boolean retryable) {
+        ApiException exception = mock(ApiException.class);
+        StatusCode status = mock(StatusCode.class);
+        when(status.getCode()).thenReturn(code);
+        when(exception.getStatusCode()).thenReturn(status);
+        when(exception.isRetryable()).thenReturn(retryable);
+        return exception;
     }
 
     private static float marker(Value instance) {
