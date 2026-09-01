@@ -1,0 +1,77 @@
+name: mulgil
+
+services:
+  database:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - database
+
+  backend:
+    build:
+      context: .
+    image: ${BACKEND_IMAGE:-mulgil-backend:local}
+    restart: unless-stopped
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-}
+      DATABASE_URL: jdbc:postgresql://database:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      DATABASE_USERNAME: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      JWT_HS256_SECRET_BASE64: ${JWT_HS256_SECRET_BASE64:?Set JWT_HS256_SECRET_BASE64 in .env}
+      JWT_ISSUER: ${JWT_ISSUER:-mulgil-api}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-mulgil-mobile}
+      JWT_KEY_ID: ${JWT_KEY_ID:-prod-v1}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:?Set GOOGLE_OAUTH_CLIENT_ID in .env}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:?Set GOOGLE_CLOUD_PROJECT in .env}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-global}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/google-application-credentials.json
+      GCS_BUCKET: ${GCS_BUCKET:?Set GCS_BUCKET in .env}
+      SPEECH_LOCATION: ${SPEECH_LOCATION:-us}
+      SPEECH_API_ENDPOINT: ${SPEECH_API_ENDPOINT:-us-speech.googleapis.com}
+      SPEECH_MODEL: ${SPEECH_MODEL:-chirp_3}
+      VERTEX_GENERATION_MODEL: ${VERTEX_GENERATION_MODEL:-gemini-2.5-flash}
+      VERTEX_EMBEDDING_MODEL: ${VERTEX_EMBEDDING_MODEL:-text-multilingual-embedding-002}
+      VERTEX_EMBEDDING_BATCH_SIZE: ${VERTEX_EMBEDDING_BATCH_SIZE:-5}
+      FCM_ENABLED: ${FCM_ENABLED:-true}
+      TZ: UTC
+    secrets:
+      - source: google_application_credentials
+        target: google-application-credentials.json
+    ports:
+      - "${BACKEND_BIND_ADDRESS:-127.0.0.1}:${BACKEND_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8080/actuator/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 45s
+    networks:
+      - application
+      - database
+
+secrets:
+  google_application_credentials:
+    file: ${GOOGLE_APPLICATION_CREDENTIALS_FILE:?Set GOOGLE_APPLICATION_CREDENTIALS_FILE in .env}
+
+volumes:
+  postgres-data:
+
+networks:
+  application:
+  database:
+    internal: true
