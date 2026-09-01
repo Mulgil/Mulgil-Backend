@@ -8,9 +8,12 @@ import com.google.firebase.ErrorCode;
 import com.google.firebase.messaging.FirebaseMessaging;
 import com.google.firebase.messaging.FirebaseMessagingException;
 import com.google.firebase.messaging.MessagingErrorCode;
+import com.mulgil.common.config.MulgilProperties;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.beans.factory.annotation.AutowiredAnnotationBeanPostProcessor;
 
+import java.lang.reflect.Constructor;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -23,6 +26,21 @@ import static org.mockito.Mockito.when;
 class FirebaseFcmAdapterTest {
     private final FirebaseMessaging firebase = mock(FirebaseMessaging.class);
     private final FirebaseFcmAdapter adapter = new FirebaseFcmAdapter(firebase);
+
+    @Test
+    void selectsPropertiesConstructorForSpringInjection_whenAdapterHasTestConstructor() throws Exception {
+        // Given
+        AutowiredAnnotationBeanPostProcessor processor = new AutowiredAnnotationBeanPostProcessor();
+        Constructor<?> propertiesConstructor = FirebaseFcmAdapter.class
+                .getDeclaredConstructor(MulgilProperties.class);
+
+        // When
+        Constructor<?>[] candidates = processor.determineCandidateConstructors(
+                FirebaseFcmAdapter.class, "firebaseFcmAdapter");
+
+        // Then
+        assertThat(candidates).containsExactly(propertiesConstructor);
+    }
 
     @Test
     void sendsNotificationAndExactData_whenMessageIsValid() throws Exception {
