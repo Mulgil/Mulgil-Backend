@@ -1,0 +1,9 @@
+.git
+.gradle
+.omo
+.env
+.env.*
+!.env.example
+build
+secrets
+.DS_Store
