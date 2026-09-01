@@ -9,6 +9,7 @@ import com.google.firebase.messaging.FirebaseMessagingException;
 import com.google.firebase.messaging.MessagingErrorCode;
 import com.mulgil.common.config.MulgilProperties;
 import jakarta.annotation.PreDestroy;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
@@ -23,6 +24,7 @@ final class FirebaseFcmAdapter implements FcmPort {
     private final FirebaseMessaging firebase;
     private final FirebaseApp app;
 
+    @Autowired
     FirebaseFcmAdapter(MulgilProperties properties) {
         app = initialize(properties.google().cloudProject());
         firebase = FirebaseMessaging.getInstance(app);
