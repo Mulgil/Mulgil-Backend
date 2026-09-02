@@ -11,6 +11,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.time.Clock;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -41,6 +42,25 @@ class NoteService {
                 """).param("id", id).param("owner", ownerId).param("course", scope.courseId())
                 .param("session", sessionId).param("body", body).param("now", now).update();
         return new Note(id, sessionId, body, 1);
+    }
+
+    List<Note> list(UUID ownerId, UUID sessionId) {
+        if (!sessionExists(ownerId, sessionId)) throw notFound();
+        return jdbc.sql("""
+                SELECT id,session_id,body_markdown,version
+                FROM notes
+                WHERE owner_id=:owner AND session_id=:session
+                ORDER BY updated_at DESC, id DESC
+                """).param("owner", ownerId).param("session", sessionId)
+                .query((row, ignored) -> new Note(row.getObject("id", UUID.class),
+                        row.getObject("session_id", UUID.class), row.getString("body_markdown"),
+                        row.getInt("version")))
+                .list();
+    }
+
+    Note get(UUID ownerId, UUID noteId) {
+        StoredNote note = read(ownerId, noteId);
+        return new Note(noteId, note.sessionId(), note.body(), note.version());
     }
 
     @Transactional
@@ -90,6 +110,25 @@ class NoteService {
             offset += text.length();
         }
         return accepted;
+    }
+
+    private boolean sessionExists(UUID ownerId, UUID sessionId) {
+        return jdbc.sql("SELECT EXISTS(SELECT 1 FROM class_sessions WHERE owner_id=:owner AND id=:session)")
+                .param("owner", ownerId).param("session", sessionId)
+                .query(Boolean.class).single();
+    }
+
+    private StoredNote read(UUID ownerId, UUID noteId) {
+        return jdbc.sql("""
+                SELECT course_id,session_id,body_markdown,version,last_left_version
+                FROM notes WHERE owner_id=:owner AND id=:id
+                """).param("owner", ownerId).param("id", noteId)
+                .query((row, ignored) -> new StoredNote(
+                        row.getObject("course_id", UUID.class),
+                        row.getObject("session_id", UUID.class), row.getString("body_markdown"),
+                        row.getInt("version"),
+                        row.getInt("last_left_version")))
+                .optional().orElseThrow(NoteService::notFound);
     }
 
     private StoredNote lock(UUID ownerId, UUID noteId) {

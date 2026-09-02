@@ -62,10 +62,21 @@ class NoteWorkflowIT {
         JsonNode patched = ok(send("PATCH", "/api/v1/notes/" + noteId, owner,
                 Map.of("bodyMarkdown", "updated", "expectedVersion", 1)), 200);
         assertThat(patched.path("version").asInt()).isEqualTo(2);
+        JsonNode fetched = ok(send("GET", "/api/v1/notes/" + noteId, owner, null), 200);
+        assertThat(fetched.path("bodyMarkdown").asText()).isEqualTo("updated");
+        assertThat(fetched.path("version").asInt()).isEqualTo(2);
+        JsonNode listed = ok(send("GET", "/api/v1/sessions/" + session + "/notes", owner, null), 200);
+        assertThat(listed).hasSize(1);
+        assertThat(listed.get(0).path("id").asText()).isEqualTo(noteId);
+        assertThat(listed.get(0).path("bodyMarkdown").asText()).isEqualTo("updated");
         error(send("PATCH", "/api/v1/notes/" + noteId, owner,
                 Map.of("bodyMarkdown", "stale", "expectedVersion", 1)), 409, "VERSION_CONFLICT");
         error(send("PATCH", "/api/v1/notes/" + noteId, login("note-foreign"),
                 Map.of("bodyMarkdown", "foreign", "expectedVersion", 2)), 404, "NOTE_NOT_FOUND");
+        error(send("GET", "/api/v1/notes/" + noteId, login("note-reader-foreign"), null),
+                404, "NOTE_NOT_FOUND");
+        error(send("GET", "/api/v1/sessions/" + session + "/notes", login("note-list-foreign"), null),
+                404, "NOTE_NOT_FOUND");
 
         JsonNode accepted = ok(send("POST", "/api/v1/notes/" + noteId + "/leave", owner,
                 Map.of("changedVersion", 2)), 202);

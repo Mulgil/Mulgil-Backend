@@ -7,6 +7,7 @@ import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -15,6 +16,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.UUID;
 
 @RestController
@@ -26,10 +28,20 @@ final class NoteController {
         this.service = service;
     }
 
+    @GetMapping("/sessions/{sessionId}/notes")
+    List<NoteService.Note> list(@PathVariable UUID sessionId) {
+        return service.list(CurrentUser.id(), sessionId);
+    }
+
     @PostMapping("/sessions/{sessionId}/notes")
     @ResponseStatus(HttpStatus.CREATED)
     NoteService.Note create(@PathVariable UUID sessionId, @Valid @RequestBody NoteCreate request) {
         return service.create(CurrentUser.id(), sessionId, request.bodyMarkdown() == null ? "" : request.bodyMarkdown());
+    }
+
+    @GetMapping("/notes/{noteId}")
+    NoteService.Note get(@PathVariable UUID noteId) {
+        return service.get(CurrentUser.id(), noteId);
     }
 
     @PatchMapping("/notes/{noteId}")
