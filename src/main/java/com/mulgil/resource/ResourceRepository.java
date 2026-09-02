@@ -19,30 +19,44 @@ class ResourceRepository {
 
     Optional<SessionScope> lockSession(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
-                        SELECT id, course_id, title, starts_at, ends_at
-                        FROM class_sessions
-                        WHERE owner_id = :ownerId AND id = :sessionId
-                        FOR UPDATE
+                        SELECT session.id, session.course_id, session.title, session.starts_at, session.ends_at
+                        FROM class_sessions session
+                        JOIN courses course ON course.id = session.course_id AND course.owner_id = session.owner_id
+                        WHERE session.owner_id = :ownerId AND session.id = :sessionId AND course.deleted_at IS NULL
+                        FOR UPDATE OF session, course
                         """)
                 .param("ownerId", ownerId).param("sessionId", sessionId)
                 .query((row, ignored) -> sessionScope(row)).optional();
     }
 
     boolean ownsSession(UUID ownerId, UUID sessionId) {
-        return jdbc.sql("SELECT EXISTS (SELECT 1 FROM class_sessions WHERE owner_id = :ownerId AND id = :id)")
+        return jdbc.sql("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM class_sessions session
+                            JOIN courses course ON course.id = session.course_id AND course.owner_id = session.owner_id
+                            WHERE session.owner_id = :ownerId AND session.id = :id AND course.deleted_at IS NULL
+                        )
+                        """)
                 .param("ownerId", ownerId).param("id", sessionId).query(Boolean.class).single();
     }
 
     boolean ownsExam(UUID ownerId, UUID examId) {
-        return jdbc.sql("SELECT EXISTS (SELECT 1 FROM exams WHERE owner_id = :ownerId AND id = :id)")
+        return jdbc.sql("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM exams exam
+                            JOIN courses course ON course.id = exam.course_id AND course.owner_id = exam.owner_id
+                            WHERE exam.owner_id = :ownerId AND exam.id = :id AND course.deleted_at IS NULL
+                        )
+                        """)
                 .param("ownerId", ownerId).param("id", examId).query(Boolean.class).single();
     }
 
     int materialCount(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
-                        SELECT count(*) FROM materials
-                        WHERE owner_id = :ownerId AND session_id = :sessionId
-                          AND status NOT IN ('cancelled', 'outdated')
+                        SELECT count(*) FROM materials material
+                        JOIN courses course ON course.id = material.course_id AND course.owner_id = material.owner_id
+                        WHERE material.owner_id = :ownerId AND material.session_id = :sessionId
+                          AND material.status NOT IN ('cancelled', 'outdated') AND course.deleted_at IS NULL
                         """)
                 .param("ownerId", ownerId).param("sessionId", sessionId).query(Integer.class).single();
     }
@@ -67,9 +81,12 @@ class ResourceRepository {
 
     Optional<Material> material(UUID ownerId, UUID materialId) {
         return jdbc.sql("""
-                        SELECT id, session_id, original_filename, mime_type, byte_size, page_count,
-                               source_phase, version, status, object_key, created_at, updated_at
-                        FROM materials WHERE owner_id = :ownerId AND id = :id
+                        SELECT material.id, material.session_id, material.original_filename, material.mime_type,
+                               material.byte_size, material.page_count, material.source_phase, material.version,
+                               material.status, material.object_key, material.created_at, material.updated_at
+                        FROM materials material
+                        JOIN courses course ON course.id = material.course_id AND course.owner_id = material.owner_id
+                        WHERE material.owner_id = :ownerId AND material.id = :id AND course.deleted_at IS NULL
                         """)
                 .param("ownerId", ownerId).param("id", materialId)
                 .query((row, ignored) -> material(row)).optional();
@@ -77,11 +94,14 @@ class ResourceRepository {
 
     List<Material> materials(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
-                        SELECT id, session_id, original_filename, mime_type, byte_size, page_count,
-                               source_phase, version, status, object_key, created_at, updated_at
-                        FROM materials
-                        WHERE owner_id = :ownerId AND session_id = :sessionId
-                        ORDER BY created_at, id
+                        SELECT material.id, material.session_id, material.original_filename, material.mime_type,
+                               material.byte_size, material.page_count, material.source_phase, material.version,
+                               material.status, material.object_key, material.created_at, material.updated_at
+                        FROM materials material
+                        JOIN courses course ON course.id = material.course_id AND course.owner_id = material.owner_id
+                        WHERE material.owner_id = :ownerId AND material.session_id = :sessionId
+                          AND course.deleted_at IS NULL
+                        ORDER BY material.created_at, material.id
                         """)
                 .param("ownerId", ownerId).param("sessionId", sessionId)
                 .query((row, ignored) -> material(row)).list();
@@ -89,11 +109,15 @@ class ResourceRepository {
 
     Material finalizeMaterial(UUID ownerId, UUID id, int pageCount, String checksum, Instant now) {
         return jdbc.sql("""
-                        UPDATE materials SET page_count = :pageCount, checksum = :checksum,
+                        UPDATE materials material SET page_count = :pageCount, checksum = :checksum,
                             status = 'uploaded', updated_at = :now
-                        WHERE owner_id = :ownerId AND id = :id
-                        RETURNING id, session_id, original_filename, mime_type, byte_size, page_count,
-                                  source_phase, version, status, object_key, created_at, updated_at
+                        FROM courses course
+                        WHERE material.owner_id = :ownerId AND material.id = :id
+                          AND course.id = material.course_id AND course.owner_id = material.owner_id
+                          AND course.deleted_at IS NULL
+                        RETURNING material.id, material.session_id, material.original_filename, material.mime_type,
+                                  material.byte_size, material.page_count, material.source_phase, material.version,
+                                  material.status, material.object_key, material.created_at, material.updated_at
                         """)
                 .param("pageCount", pageCount).param("checksum", checksum).param("now", Timestamp.from(now))
                 .param("ownerId", ownerId).param("id", id)
@@ -107,7 +131,9 @@ class ResourceRepository {
                              original_filename, mime_type, byte_size, status, created_at, updated_at)
                         SELECT :id, :ownerId, e.course_id, e.id, 'past_exam', :objectKey,
                                :filename, :mimeType, :byteSize, 'created', :now, :now
-                        FROM exams e WHERE e.owner_id = :ownerId AND e.id = :examId
+                        FROM exams e
+                        JOIN courses course ON course.id = e.course_id AND course.owner_id = e.owner_id
+                        WHERE e.owner_id = :ownerId AND e.id = :examId AND course.deleted_at IS NULL
                         RETURNING id, exam_id, resource_type, original_filename, mime_type, byte_size,
                                   page_count, status, object_key, created_at, updated_at
                         """)
@@ -120,9 +146,12 @@ class ResourceRepository {
 
     Optional<ExamResource> examResource(UUID ownerId, UUID id) {
         return jdbc.sql("""
-                        SELECT id, exam_id, resource_type, original_filename, mime_type, byte_size,
-                               page_count, status, object_key, created_at, updated_at
-                        FROM exam_resources WHERE owner_id = :ownerId AND id = :id
+                        SELECT resource.id, resource.exam_id, resource.resource_type, resource.original_filename,
+                               resource.mime_type, resource.byte_size, resource.page_count, resource.status,
+                               resource.object_key, resource.created_at, resource.updated_at
+                        FROM exam_resources resource
+                        JOIN courses course ON course.id = resource.course_id AND course.owner_id = resource.owner_id
+                        WHERE resource.owner_id = :ownerId AND resource.id = :id AND course.deleted_at IS NULL
                         """)
                 .param("ownerId", ownerId).param("id", id)
                 .query((row, ignored) -> examResource(row)).optional();
@@ -130,11 +159,14 @@ class ResourceRepository {
 
     List<ExamResource> examResources(UUID ownerId, UUID examId) {
         return jdbc.sql("""
-                        SELECT id, exam_id, resource_type, original_filename, mime_type, byte_size,
-                               page_count, status, object_key, created_at, updated_at
-                        FROM exam_resources
-                        WHERE owner_id = :ownerId AND exam_id = :examId
-                        ORDER BY created_at, id
+                        SELECT resource.id, resource.exam_id, resource.resource_type, resource.original_filename,
+                               resource.mime_type, resource.byte_size, resource.page_count, resource.status,
+                               resource.object_key, resource.created_at, resource.updated_at
+                        FROM exam_resources resource
+                        JOIN courses course ON course.id = resource.course_id AND course.owner_id = resource.owner_id
+                        WHERE resource.owner_id = :ownerId AND resource.exam_id = :examId
+                          AND course.deleted_at IS NULL
+                        ORDER BY resource.created_at, resource.id
                         """)
                 .param("ownerId", ownerId).param("examId", examId)
                 .query((row, ignored) -> examResource(row)).list();
@@ -142,11 +174,16 @@ class ResourceRepository {
 
     ExamResource finalizeExamResource(UUID ownerId, UUID id, int pageCount, String checksum, Instant now) {
         return jdbc.sql("""
-                        UPDATE exam_resources SET page_count = :pageCount, checksum = :checksum,
+                        UPDATE exam_resources resource SET page_count = :pageCount, checksum = :checksum,
                             status = 'uploaded', updated_at = :now
-                        WHERE owner_id = :ownerId AND id = :id
-                        RETURNING id, exam_id, resource_type, original_filename, mime_type, byte_size,
-                                  page_count, status, object_key, created_at, updated_at
+                        FROM courses course
+                        WHERE resource.owner_id = :ownerId AND resource.id = :id
+                          AND course.id = resource.course_id AND course.owner_id = resource.owner_id
+                          AND course.deleted_at IS NULL
+                        RETURNING resource.id, resource.exam_id, resource.resource_type,
+                                  resource.original_filename, resource.mime_type, resource.byte_size,
+                                  resource.page_count, resource.status, resource.object_key,
+                                  resource.created_at, resource.updated_at
                         """)
                 .param("pageCount", pageCount).param("checksum", checksum).param("now", Timestamp.from(now))
                 .param("ownerId", ownerId).param("id", id)
@@ -195,11 +232,13 @@ class ResourceRepository {
 
     List<SessionScope> overlappingSessions(UUID ownerId, Instant start, Instant end) {
         return jdbc.sql("""
-                        SELECT id, course_id, title, starts_at, ends_at
-                        FROM class_sessions
-                        WHERE owner_id = :ownerId AND starts_at IS NOT NULL AND ends_at IS NOT NULL
-                          AND starts_at < :recordingEnd AND ends_at > :recordingStart
-                        ORDER BY starts_at, id
+                        SELECT session.id, session.course_id, session.title, session.starts_at, session.ends_at
+                        FROM class_sessions session
+                        JOIN courses course ON course.id = session.course_id AND course.owner_id = session.owner_id
+                        WHERE session.owner_id = :ownerId AND session.starts_at IS NOT NULL AND session.ends_at IS NOT NULL
+                          AND session.starts_at < :recordingEnd AND session.ends_at > :recordingStart
+                          AND course.deleted_at IS NULL
+                        ORDER BY session.starts_at, session.id
                         """)
                 .param("ownerId", ownerId).param("recordingStart", Timestamp.from(start))
                 .param("recordingEnd", Timestamp.from(end))

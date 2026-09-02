@@ -148,6 +148,38 @@ class LearningDomainApiIT {
     }
 
     @Test
+    void hidesArchivedCourseDescendants_butRetainsNotes() throws Exception {
+        String owner = login("course-delete-descendants-owner");
+        String courseId = createCourse(owner, "Distributed Systems");
+        String sessionId = createSession(owner, courseId, 1);
+        String noteId = successful(post("/api/v1/sessions/" + sessionId + "/notes", owner,
+                Map.of("bodyMarkdown", "Archived note")), 201).path("id").asText();
+        String examId = successful(post("/api/v1/courses/" + courseId + "/exams", owner, Map.of(
+                "title", "Final", "examAt", "2026-12-01T01:00:00Z", "sessionIds", List.of(sessionId))), 201)
+                .path("id").asText();
+
+        assertThat(delete("/api/v1/courses/" + courseId, owner).status()).isEqualTo(204);
+
+        assertError(get("/api/v1/sessions/" + sessionId + "/notes", owner), 404, "NOTE_NOT_FOUND");
+        assertError(get("/api/v1/notes/" + noteId, owner), 404, "NOTE_NOT_FOUND");
+        assertError(post("/api/v1/sessions/" + sessionId + "/notes", owner,
+                Map.of("bodyMarkdown", "Must not be created")), 404, "NOTE_NOT_FOUND");
+        assertError(patch("/api/v1/notes/" + noteId, owner,
+                Map.of("bodyMarkdown", "Must not be updated", "expectedVersion", 1)), 404, "NOTE_NOT_FOUND");
+        assertError(get("/api/v1/sessions/" + sessionId + "/jobs", owner), 404, "JOB_NOT_FOUND");
+        assertError(get("/api/v1/sessions/" + sessionId + "/quiz", owner), 404, "QUIZ_NOT_FOUND");
+        assertError(get("/api/v1/sessions/" + sessionId + "/summaries?type=review", owner), 404,
+                "SESSION_NOT_FOUND");
+        assertError(get("/api/v1/exams/" + examId + "/summary", owner), 404, "EXAM_NOT_FOUND");
+        assertError(get("/api/v1/exams/" + examId + "/predicted-quiz", owner), 404, "EXAM_NOT_FOUND");
+        assertError(post("/api/v1/exams/" + examId + "/summary/generate", owner, Map.of()), 404,
+                "EXAM_NOT_FOUND");
+        assertThat(jdbc.sql("SELECT count(*) FROM notes WHERE id=:id")
+                .param("id", UUID.fromString(noteId)).query(Integer.class).single()).isOne();
+        recordHttp("archivedCourseDescendants", 404, "notes-jobs-quiz-generation-hidden noteRetained=1");
+    }
+
+    @Test
     void rejectsDuplicateAndCrossCourseExamScope_whenPayloadIsInvalid() throws Exception {
         String ownerA = login("domain-validation-a");
         String ownerB = login("domain-validation-b");

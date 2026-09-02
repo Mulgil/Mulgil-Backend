@@ -64,7 +64,9 @@ final class GenerationService {
 
     ExamGeneration examSummary(UUID ownerId, UUID examId) {
         Scope scope = jdbc.sql("""
-                        SELECT course_id FROM exams WHERE owner_id=:owner AND id=:exam
+                        SELECT exam.course_id FROM exams exam
+                        JOIN courses course ON course.id=exam.course_id AND course.owner_id=exam.owner_id
+                        WHERE exam.owner_id=:owner AND exam.id=:exam AND course.deleted_at IS NULL
                         """).param("owner", ownerId).param("exam", examId)
                 .query((row, ignored) -> new Scope(row.getObject("course_id", UUID.class)))
                 .optional().orElseThrow(() -> new ApiException(
@@ -91,7 +93,13 @@ final class GenerationService {
     }
 
     JobQueue.JobAccepted generateExam(UUID ownerId, UUID examId, boolean predicted) {
-        boolean exists = jdbc.sql("SELECT EXISTS(SELECT 1 FROM exams WHERE owner_id=:owner AND id=:exam)")
+        boolean exists = jdbc.sql("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM exams exam
+                            JOIN courses course ON course.id=exam.course_id AND course.owner_id=exam.owner_id
+                            WHERE exam.owner_id=:owner AND exam.id=:exam AND course.deleted_at IS NULL
+                        )
+                        """)
                 .param("owner", ownerId).param("exam", examId).query(Boolean.class).single();
         if (!exists) throw new ApiException(HttpStatus.NOT_FOUND, "EXAM_NOT_FOUND", "Exam not found.");
         JobQueue.JobAccepted accepted = scheduler.scheduleExam(ownerId, examId, predicted);
@@ -100,7 +108,11 @@ final class GenerationService {
     }
 
     private Scope sessionScope(UUID ownerId, UUID sessionId) {
-        return jdbc.sql("SELECT course_id FROM class_sessions WHERE owner_id=:owner AND id=:session")
+        return jdbc.sql("""
+                        SELECT session.course_id FROM class_sessions session
+                        JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                        WHERE session.owner_id=:owner AND session.id=:session AND course.deleted_at IS NULL
+                        """)
                 .param("owner", ownerId).param("session", sessionId)
                 .query((row, ignored) -> new Scope(row.getObject("course_id", UUID.class)))
                 .optional().orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,

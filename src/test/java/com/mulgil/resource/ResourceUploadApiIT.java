@@ -292,6 +292,69 @@ class ResourceUploadApiIT {
     }
 
     @Test
+    void hidesArchivedCourseResources_butRetainsTheirRows() throws Exception {
+        String owner = login("archived-resource-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        String materialId = successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url",
+                owner, Map.of("filename", "archived.pdf", "mimeType", "application/pdf", "byteSize", 100,
+                        "sourcePhase", "preview_pdf")), 201).path("id").asText();
+        storage.directPut(materialId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(materialId, 1, PDF_CHECKSUM);
+        successful(post("/api/v1/materials/" + materialId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 202);
+
+        String examResourceId = successful(post("/api/v1/exams/" + ids.examId() + "/resources", owner,
+                Map.of("filename", "archived-exam.pdf", "mimeType", "application/pdf", "byteSize", 100)), 201)
+                .path("id").asText();
+        storage.directPut(examResourceId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(examResourceId, 1, PDF_CHECKSUM);
+        successful(post("/api/v1/exam-resources/" + examResourceId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 200);
+
+        successful(put("/api/v1/materials/" + materialId + "/annotations", owner,
+                Map.of("expectedVersion", 0, "inkStrokes", List.of(), "emphasisRegions", List.of())), 200);
+
+        String recordingId = successful(post("/api/v1/recordings/upload-url", owner,
+                Map.of("filename", "archived.m4a", "mimeType", "audio/m4a", "byteSize", 100,
+                        "startedAt", "2026-09-01T00:00:00Z")), 201).path("id").asText();
+        storage.directPut(recordingId, "audio/m4a", 100, AUDIO_CHECKSUM);
+        probe.audio(recordingId, 60, AUDIO_CHECKSUM);
+        successful(post("/api/v1/recordings/" + recordingId + "/upload-complete", owner,
+                Map.of("checksumSha256", AUDIO_CHECKSUM)), 200);
+
+        assertThat(delete("/api/v1/courses/" + ids.courseId(), owner).status()).isEqualTo(204);
+
+        assertError(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url", owner,
+                Map.of("filename", "blocked.pdf", "mimeType", "application/pdf", "byteSize", 100,
+                        "sourcePhase", "preview_pdf")), 404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/sessions/" + ids.sessionId() + "/materials", owner), 404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/materials/" + materialId + "/download-url", owner), 404, "RESOURCE_NOT_FOUND");
+        assertError(post("/api/v1/materials/" + materialId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/materials/" + materialId + "/annotations", owner), 404, "ANNOTATION_NOT_FOUND");
+        assertError(put("/api/v1/materials/" + materialId + "/annotations", owner,
+                Map.of("expectedVersion", 1, "inkStrokes", List.of(), "emphasisRegions", List.of())),
+                404, "ANNOTATION_NOT_FOUND");
+        assertError(post("/api/v1/exams/" + ids.examId() + "/resources", owner,
+                Map.of("filename", "blocked-exam.pdf", "mimeType", "application/pdf", "byteSize", 100)),
+                404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/exams/" + ids.examId() + "/resources", owner), 404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/exam-resources/" + examResourceId + "/download-url", owner), 404,
+                "RESOURCE_NOT_FOUND");
+        assertError(post("/api/v1/exam-resources/" + examResourceId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 404, "RESOURCE_NOT_FOUND");
+        assertError(post("/api/v1/recordings/" + recordingId + "/confirm-mapping", owner,
+                Map.of("sessionId", ids.sessionId())), 404, "RESOURCE_NOT_FOUND");
+        assertThat(jdbc.sql("SELECT count(*) FROM materials WHERE id=:id")
+                .param("id", java.util.UUID.fromString(materialId)).query(Integer.class).single()).isOne();
+        assertThat(jdbc.sql("SELECT count(*) FROM exam_resources WHERE id=:id")
+                .param("id", java.util.UUID.fromString(examResourceId)).query(Integer.class).single()).isOne();
+        assertThat(jdbc.sql("SELECT count(*) FROM annotation_documents WHERE material_id=:id")
+                .param("id", java.util.UUID.fromString(materialId)).query(Integer.class).single()).isOne();
+        recordHttp("archivedCourseResources", "204,404", "material-exam-annotation-recording-hidden;rows-retained");
+    }
+
+    @Test
     void appliesV003_whenDatabaseIsFresh() {
         assertThat(jdbc.sql("SELECT success FROM flyway_schema_history WHERE version = '003'")
                 .query(Boolean.class).single()).isTrue();
@@ -335,6 +398,14 @@ class ResourceUploadApiIT {
 
     private HttpResult post(String path, String token, Object body) throws Exception {
         return send("POST", path, token, body);
+    }
+
+    private HttpResult put(String path, String token, Object body) throws Exception {
+        return send("PUT", path, token, body);
+    }
+
+    private HttpResult delete(String path, String token) throws Exception {
+        return send("DELETE", path, token, null);
     }
 
     private HttpResult send(String method, String path, String token, Object body) throws Exception {

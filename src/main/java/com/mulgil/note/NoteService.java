@@ -29,7 +29,11 @@ class NoteService {
 
     @Transactional
     Note create(UUID ownerId, UUID sessionId, String body) {
-        Scope scope = jdbc.sql("SELECT course_id FROM class_sessions WHERE owner_id=:owner AND id=:session")
+        Scope scope = jdbc.sql("""
+                        SELECT session.course_id FROM class_sessions session
+                        JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                        WHERE session.owner_id=:owner AND session.id=:session AND course.deleted_at IS NULL
+                        """)
                 .param("owner", ownerId).param("session", sessionId)
                 .query((row, ignored) -> new Scope(row.getObject("course_id", UUID.class), sessionId))
                 .optional().orElseThrow(NoteService::notFound);
@@ -113,15 +117,23 @@ class NoteService {
     }
 
     private boolean sessionExists(UUID ownerId, UUID sessionId) {
-        return jdbc.sql("SELECT EXISTS(SELECT 1 FROM class_sessions WHERE owner_id=:owner AND id=:session)")
+        return jdbc.sql("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM class_sessions session
+                            JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                            WHERE session.owner_id=:owner AND session.id=:session AND course.deleted_at IS NULL
+                        )
+                        """)
                 .param("owner", ownerId).param("session", sessionId)
                 .query(Boolean.class).single();
     }
 
     private StoredNote read(UUID ownerId, UUID noteId) {
         return jdbc.sql("""
-                SELECT course_id,session_id,body_markdown,version,last_left_version
-                FROM notes WHERE owner_id=:owner AND id=:id
+                SELECT note.course_id,note.session_id,note.body_markdown,note.version,note.last_left_version
+                FROM notes note
+                JOIN courses course ON course.id=note.course_id AND course.owner_id=note.owner_id
+                WHERE note.owner_id=:owner AND note.id=:id AND course.deleted_at IS NULL
                 """).param("owner", ownerId).param("id", noteId)
                 .query((row, ignored) -> new StoredNote(
                         row.getObject("course_id", UUID.class),
@@ -133,8 +145,11 @@ class NoteService {
 
     private StoredNote lock(UUID ownerId, UUID noteId) {
         return jdbc.sql("""
-                SELECT course_id,session_id,body_markdown,version,last_left_version
-                FROM notes WHERE owner_id=:owner AND id=:id FOR UPDATE
+                SELECT note.course_id,note.session_id,note.body_markdown,note.version,note.last_left_version
+                FROM notes note
+                JOIN courses course ON course.id=note.course_id AND course.owner_id=note.owner_id
+                WHERE note.owner_id=:owner AND note.id=:id AND course.deleted_at IS NULL
+                FOR UPDATE OF note, course
                 """).param("owner", ownerId).param("id", noteId)
                 .query((row, ignored) -> new StoredNote(row.getObject("course_id", UUID.class),
                         row.getObject("session_id", UUID.class), row.getString("body_markdown"),

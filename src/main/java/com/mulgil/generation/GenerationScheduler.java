@@ -39,7 +39,7 @@ final class GenerationScheduler implements JobCompletionListener {
         return transactions.execute(status -> {
             GenerationSnapshotService.Snapshot snapshot = snapshots.exam(ownerId, examId, predicted);
             if (snapshot == null) return null;
-            lockSession(snapshot.ownerId(), snapshot.sessionId());
+            if (!lockSession(snapshot.ownerId(), snapshot.sessionId())) return null;
             snapshot = snapshots.exam(ownerId, examId, predicted);
             if (!snapshot.ready()) return null;
             String type = predicted ? "exam_quiz_generate" : "exam_summary_generate";
@@ -49,16 +49,21 @@ final class GenerationScheduler implements JobCompletionListener {
 
     private void scheduleSession(JobQueue.CompletionEvent event, String phase) {
         transactions.executeWithoutResult(status -> {
-            lockSession(event.ownerId(), event.sessionId());
+            if (!lockSession(event.ownerId(), event.sessionId())) return;
             GenerationSnapshotService.Snapshot snapshot = snapshots.session(
                     event.ownerId(), event.courseId(), event.sessionId(), phase);
             if (snapshot.ready()) enqueue(snapshot, phase + "_generate");
         });
     }
 
-    private void lockSession(UUID ownerId, UUID sessionId) {
-        jdbc.sql("SELECT id FROM class_sessions WHERE owner_id=:owner AND id=:session FOR UPDATE")
-                .param("owner", ownerId).param("session", sessionId).query(UUID.class).optional();
+    private boolean lockSession(UUID ownerId, UUID sessionId) {
+        return jdbc.sql("""
+                        SELECT session.id FROM class_sessions session
+                        JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                        WHERE session.owner_id=:owner AND session.id=:session AND course.deleted_at IS NULL
+                        FOR UPDATE OF session, course
+                        """)
+                .param("owner", ownerId).param("session", sessionId).query(UUID.class).optional().isPresent();
     }
 
     private JobQueue.JobAccepted enqueue(GenerationSnapshotService.Snapshot snapshot, String type) {

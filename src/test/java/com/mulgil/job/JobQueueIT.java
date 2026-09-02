@@ -355,6 +355,20 @@ class JobQueueIT {
     }
 
     @Test
+    void archivesQueuedJobs_whenTheirCourseIsSoftDeleted() {
+        JobQueue.AiJob job = queue.enqueue(request());
+        jdbc.sql("UPDATE courses SET deleted_at=now() WHERE id=:id").param("id", courseId).update();
+
+        assertThat(queue.claim("worker", Set.of("pdf_extract"))).isNull();
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id").param("id", job.id())
+                .query(String.class).single()).isEqualTo("outdated");
+        assertThatThrownBy(() -> queue.get(ownerId, job.id()))
+                .isInstanceOf(ApiException.class)
+                .extracting(value -> ((ApiException) value).code())
+                .isEqualTo("JOB_NOT_FOUND");
+    }
+
+    @Test
     void extendsLease_whenClaimedWorkerHeartbeats() {
         JobQueue.AiJob job = queue.enqueue(request());
         queue.claim("worker", Set.of("pdf_extract"));

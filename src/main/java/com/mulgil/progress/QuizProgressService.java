@@ -31,7 +31,11 @@ public class QuizProgressService {
 
     List<QuizQuestion> quiz(UUID ownerId, UUID sessionId) {
         boolean sessionExists = jdbc.sql("""
-                        SELECT EXISTS(SELECT 1 FROM class_sessions WHERE owner_id=:owner AND id=:session)
+                        SELECT EXISTS(
+                            SELECT 1 FROM class_sessions session
+                            JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                            WHERE session.owner_id=:owner AND session.id=:session AND course.deleted_at IS NULL
+                        )
                         """).param("owner", ownerId).param("session", sessionId).query(Boolean.class).single();
         if (!sessionExists) throw notFound();
         List<QuizQuestion> questions = jdbc.sql("""
@@ -52,8 +56,9 @@ public class QuizProgressService {
 
     public List<QuizQuestion> examQuiz(UUID ownerId, UUID examId) {
         Scope scope = jdbc.sql("""
-                        SELECT course_id FROM exams
-                        WHERE owner_id=:owner AND id=:exam
+                        SELECT exam.course_id FROM exams exam
+                        JOIN courses course ON course.id=exam.course_id AND course.owner_id=exam.owner_id
+                        WHERE exam.owner_id=:owner AND exam.id=:exam AND course.deleted_at IS NULL
                         """).param("owner", ownerId).param("exam", examId)
                 .query((row, ignored) -> new Scope(row.getObject("course_id", UUID.class)))
                 .optional().orElseThrow(() -> new ApiException(
@@ -83,10 +88,12 @@ public class QuizProgressService {
                         SELECT q.course_id,q.session_id,q.exam_id,q.question_type,q.question_json::text,
                                q.answer_json::text,q.explanation_json::text
                         FROM quiz_questions q
+                        JOIN courses course ON course.id=q.course_id AND course.owner_id=q.owner_id
                         LEFT JOIN class_sessions s ON s.owner_id=q.owner_id AND s.course_id=q.course_id
                             AND s.id=q.session_id
                         LEFT JOIN exams e ON e.owner_id=q.owner_id AND e.course_id=q.course_id AND e.id=q.exam_id
                         WHERE q.owner_id=:owner AND q.id=:question AND q.status='succeeded'
+                          AND course.deleted_at IS NULL
                           AND ((q.session_id IS NOT NULL AND s.id=q.session_id)
                             OR (q.exam_id IS NOT NULL AND e.id=q.exam_id))
                         FOR SHARE OF q

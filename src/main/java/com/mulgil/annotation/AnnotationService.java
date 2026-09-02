@@ -165,9 +165,11 @@ class AnnotationService {
 
     private StoredDocument document(UUID ownerId, UUID materialId, boolean lock) {
         return jdbc.sql("""
-                SELECT id,course_id,session_id,version,last_left_version FROM annotation_documents
-                WHERE owner_id=:owner AND material_id=:material
-                """ + (lock ? " FOR UPDATE" : ""))
+                SELECT document.id,document.course_id,document.session_id,document.version,document.last_left_version
+                FROM annotation_documents document
+                JOIN courses course ON course.id=document.course_id AND course.owner_id=document.owner_id
+                WHERE document.owner_id=:owner AND document.material_id=:material AND course.deleted_at IS NULL
+                """ + (lock ? " FOR UPDATE OF document, course" : ""))
                 .param("owner", ownerId).param("material", materialId)
                 .query((row, ignored) -> new StoredDocument(row.getObject("id", UUID.class),
                         row.getObject("course_id", UUID.class), row.getObject("session_id", UUID.class),
@@ -199,7 +201,12 @@ class AnnotationService {
     }
 
     private Scope material(UUID ownerId, UUID materialId) {
-        return jdbc.sql("SELECT course_id,session_id FROM materials WHERE owner_id=:owner AND id=:id FOR UPDATE")
+        return jdbc.sql("""
+                        SELECT material.course_id,material.session_id FROM materials material
+                        JOIN courses course ON course.id=material.course_id AND course.owner_id=material.owner_id
+                        WHERE material.owner_id=:owner AND material.id=:id AND course.deleted_at IS NULL
+                        FOR UPDATE OF material, course
+                        """)
                 .param("owner", ownerId).param("id", materialId)
                 .query((row, ignored) -> new Scope(row.getObject("course_id", UUID.class),
                         row.getObject("session_id", UUID.class))).optional().orElseThrow(AnnotationService::notFound);

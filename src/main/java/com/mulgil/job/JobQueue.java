@@ -50,9 +50,12 @@ public class JobQueue {
     @Transactional
     public JobAccepted enqueuePdfMaterial(UUID ownerId, UUID materialId) {
         EnqueueRequest request = jdbc.sql("""
-                        SELECT owner_id, course_id, session_id, id, version, checksum
-                        FROM materials
-                        WHERE owner_id = :ownerId AND id = :id AND status = 'uploaded'
+                        SELECT material.owner_id, material.course_id, material.session_id,
+                               material.id, material.version, material.checksum
+                        FROM materials material
+                        JOIN courses course ON course.id=material.course_id AND course.owner_id=material.owner_id
+                        WHERE material.owner_id = :ownerId AND material.id = :id AND material.status = 'uploaded'
+                          AND course.deleted_at IS NULL
                         """)
                 .param("ownerId", ownerId).param("id", materialId)
                 .query((row, ignored) -> EnqueueRequest.material("pdf_extract", row.getObject("owner_id", UUID.class),
@@ -69,10 +72,12 @@ public class JobQueue {
         List<EnqueueRequest> requests = jdbc.sql("""
                         SELECT r.owner_id, r.course_id, member.session_id, r.id, r.checksum
                         FROM exam_resources r
+                        JOIN courses course ON course.id=r.course_id AND course.owner_id=r.owner_id
                         JOIN exam_session_members member
                           ON member.exam_id = r.exam_id AND member.owner_id = r.owner_id
                          AND member.course_id = r.course_id
                         WHERE r.owner_id = :ownerId AND r.id = :id AND r.status = 'uploaded'
+                          AND course.deleted_at IS NULL
                         ORDER BY member.session_id
                         """)
                 .param("ownerId", ownerId).param("id", resourceId)
@@ -86,6 +91,7 @@ public class JobQueue {
 
     @Transactional
     public AiJob enqueue(EnqueueRequest request) {
+        if (!courseActive(request.ownerId(), request.courseId())) throw notFound();
         String fingerprint = idempotencyKey(request);
         admission.lockOwner(request.ownerId());
         boolean reuseSucceeded = properties.demo().cacheEnabled() || !admission.isBillable(request.type());
@@ -156,14 +162,16 @@ public class JobQueue {
     public ClaimedJob claim(String workerId, Set<String> supportedTypes) {
         if (supportedTypes.isEmpty()) return null;
         recoverExpired();
+        discardQueuedArchived();
         Instant now = clock.instant();
         return jdbc.sql("""
                         WITH selected AS (
-                            SELECT id FROM ai_jobs
-                            WHERE status = 'queued' AND attempt_count < max_attempts
-                              AND job_type IN (:types)
-                            ORDER BY created_at, id
-                            FOR UPDATE SKIP LOCKED LIMIT 1
+                            SELECT job.id FROM ai_jobs job
+                            JOIN courses course ON course.id=job.course_id AND course.owner_id=job.owner_id
+                            WHERE job.status = 'queued' AND job.attempt_count < job.max_attempts
+                              AND job.job_type IN (:types) AND course.deleted_at IS NULL
+                            ORDER BY job.created_at, job.id
+                            FOR UPDATE OF job SKIP LOCKED LIMIT 1
                         )
                         UPDATE ai_jobs job SET status = 'running', attempt_count = attempt_count + 1,
                             claimed_by = :workerId, last_heartbeat_at = :now,
@@ -223,11 +231,14 @@ public class JobQueue {
 
     public AiJob retry(UUID ownerId, UUID jobId) {
         AiJob result = jdbc.sql("""
-                        UPDATE ai_jobs SET status = 'queued', error_code = NULL, error_message = NULL,
+                        UPDATE ai_jobs job SET status = 'queued', error_code = NULL, error_message = NULL,
                             finished_at = NULL
-                        WHERE owner_id = :ownerId AND id = :id AND status = 'failed'
-                          AND attempt_count < max_attempts AND error_code IN (:errors)
-                        RETURNING *
+                        FROM courses course
+                        WHERE job.owner_id = :ownerId AND job.id = :id AND job.status = 'failed'
+                          AND job.attempt_count < job.max_attempts AND job.error_code IN (:errors)
+                          AND course.id=job.course_id AND course.owner_id=job.owner_id
+                          AND course.deleted_at IS NULL
+                        RETURNING job.*
                         """).param("ownerId", ownerId).param("id", jobId).param("errors", RETRYABLE_ERRORS)
                 .query((row, ignored) -> job(row)).optional().orElse(null);
         if (result != null) return result;
@@ -242,7 +253,13 @@ public class JobQueue {
     }
 
     public List<AiJob> list(UUID ownerId, UUID sessionId) {
-        boolean owns = jdbc.sql("SELECT EXISTS(SELECT 1 FROM class_sessions WHERE owner_id=:owner AND id=:id)")
+        boolean owns = jdbc.sql("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM class_sessions session
+                            JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                            WHERE session.owner_id=:owner AND session.id=:id AND course.deleted_at IS NULL
+                        )
+                        """)
                 .param("owner", ownerId).param("id", sessionId).query(Boolean.class).single();
         if (!owns) throw notFound();
         return jdbc.sql("SELECT * FROM ai_jobs WHERE owner_id=:owner AND session_id=:session ORDER BY created_at,id")
@@ -266,6 +283,17 @@ public class JobQueue {
                 """).param("now", Timestamp.from(now)).update();
     }
 
+    private void discardQueuedArchived() {
+        jdbc.sql("""
+                UPDATE ai_jobs job SET status='outdated', error_code='STALE_INPUT',
+                    error_message='Course is archived.', finished_at=:now
+                WHERE job.status='queued' AND NOT EXISTS(
+                    SELECT 1 FROM courses course
+                    WHERE course.id=job.course_id AND course.owner_id=job.owner_id AND course.deleted_at IS NULL
+                )
+                """).param("now", Timestamp.from(clock.instant())).update();
+    }
+
     private AiJob lockRunning(UUID id, String workerId) {
         return jdbc.sql("""
                         SELECT * FROM ai_jobs
@@ -277,6 +305,7 @@ public class JobQueue {
     }
 
     private boolean sourceIsCurrent(AiJob job) {
+        if (!courseActive(job.ownerId(), job.courseId())) return false;
         if (job.materialId() != null) {
             return jdbc.sql("""
                     SELECT id FROM materials WHERE id=:id AND owner_id=:owner
@@ -311,9 +340,23 @@ public class JobQueue {
     }
 
     private AiJob find(UUID ownerId, UUID jobId) {
-        return jdbc.sql("SELECT * FROM ai_jobs WHERE owner_id=:owner AND id=:id")
+        return jdbc.sql("""
+                        SELECT job.* FROM ai_jobs job
+                        JOIN courses course ON course.id=job.course_id AND course.owner_id=job.owner_id
+                        WHERE job.owner_id=:owner AND job.id=:id AND course.deleted_at IS NULL
+                        """)
                 .param("owner", ownerId).param("id", jobId)
                 .query((row, ignored) -> job(row)).optional().orElse(null);
+    }
+
+    private boolean courseActive(UUID ownerId, UUID courseId) {
+        return jdbc.sql("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM courses
+                            WHERE owner_id=:owner AND id=:course AND deleted_at IS NULL
+                        )
+                        """)
+                .param("owner", ownerId).param("course", courseId).query(Boolean.class).single();
     }
 
     private void notifyAfterCommit(CompletionEvent event) {

@@ -127,7 +127,10 @@ final class PdfIndexingService {
     private byte[] sourceBytes(JobQueue.ClaimedJob job) throws JobHandler.JobExecutionException {
         String table = job.materialId() != null ? "materials" : "exam_resources";
         UUID sourceId = job.materialId() != null ? job.materialId() : job.examResourceId();
-        String objectKey = jdbc.sql("SELECT object_key FROM " + table + " WHERE id=:id AND owner_id=:owner AND course_id=:course")
+        String objectKey = jdbc.sql("SELECT source.object_key FROM " + table + " source"
+                        + " JOIN courses course ON course.id=source.course_id AND course.owner_id=source.owner_id"
+                        + " WHERE source.id=:id AND source.owner_id=:owner AND source.course_id=:course"
+                        + " AND course.deleted_at IS NULL")
                 .param("id", sourceId).param("owner", job.ownerId()).param("course", job.courseId())
                 .query(String.class).optional().orElse(null);
         byte[] bytes = objectKey == null ? null : storage.read(objectKey);

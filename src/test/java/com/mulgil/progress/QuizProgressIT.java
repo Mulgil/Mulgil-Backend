@@ -170,6 +170,18 @@ class QuizProgressIT {
     }
 
     @Test
+    void hidesQuizQuestions_whenTheirCourseIsSoftDeleted() throws Exception {
+        jdbc.sql("UPDATE courses SET deleted_at=now() WHERE id=:id").param("id", course).update();
+
+        error(send("GET", "/api/v1/sessions/" + session + "/quiz", ownerToken, null), 404);
+        error(send("POST", "/api/v1/quiz/questions/" + trueFalse + "/attempts",
+                ownerToken, Map.of("answer", true)), 404);
+        assertThat(jdbc.sql("SELECT count(*) FROM quiz_attempts WHERE owner_id=:owner")
+                .param("owner", owner).query(Integer.class).single()).isZero();
+        System.out.println("QUIZ_PROGRESS scenario=archived-course observable=quiz-and-attempt-hidden result=PASS");
+    }
+
+    @Test
     void rollsBackAttempt_whenProgressProjectionFails() throws Exception {
         jdbc.sql("""
                 CREATE FUNCTION test_reject_progress() RETURNS trigger LANGUAGE plpgsql AS $$
