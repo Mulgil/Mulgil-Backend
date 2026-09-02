@@ -321,6 +321,8 @@ class ResourceUploadApiIT {
         probe.audio(recordingId, 60, AUDIO_CHECKSUM);
         successful(post("/api/v1/recordings/" + recordingId + "/upload-complete", owner,
                 Map.of("checksumSha256", AUDIO_CHECKSUM)), 200);
+        successful(post("/api/v1/recordings/" + recordingId + "/confirm-mapping", owner,
+                Map.of("sessionId", ids.sessionId())), 202);
 
         assertThat(delete("/api/v1/courses/" + ids.courseId(), owner).status()).isEqualTo(204);
 
@@ -343,6 +345,8 @@ class ResourceUploadApiIT {
                 "RESOURCE_NOT_FOUND");
         assertError(post("/api/v1/exam-resources/" + examResourceId + "/upload-complete", owner,
                 Map.of("checksumSha256", PDF_CHECKSUM)), 404, "RESOURCE_NOT_FOUND");
+        assertError(post("/api/v1/recordings/" + recordingId + "/upload-complete", owner,
+                Map.of("checksumSha256", AUDIO_CHECKSUM)), 404, "RESOURCE_NOT_FOUND");
         assertError(post("/api/v1/recordings/" + recordingId + "/confirm-mapping", owner,
                 Map.of("sessionId", ids.sessionId())), 404, "RESOURCE_NOT_FOUND");
         assertThat(jdbc.sql("SELECT count(*) FROM materials WHERE id=:id")
@@ -351,6 +355,8 @@ class ResourceUploadApiIT {
                 .param("id", java.util.UUID.fromString(examResourceId)).query(Integer.class).single()).isOne();
         assertThat(jdbc.sql("SELECT count(*) FROM annotation_documents WHERE material_id=:id")
                 .param("id", java.util.UUID.fromString(materialId)).query(Integer.class).single()).isOne();
+        assertThat(jdbc.sql("SELECT status FROM audio_recordings WHERE id=:id")
+                .param("id", java.util.UUID.fromString(recordingId)).query(String.class).single()).isEqualTo("queued");
         recordHttp("archivedCourseResources", "204,404", "material-exam-annotation-recording-hidden;rows-retained");
     }
 

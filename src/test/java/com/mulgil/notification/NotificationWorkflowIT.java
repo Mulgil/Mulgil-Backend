@@ -112,6 +112,10 @@ class NotificationWorkflowIT {
         assertThat(payload.resourceId()).isEqualTo(examId);
         assertThat(payload.deepLink()).isEqualTo("mulgil://exams/" + examId);
         assertThat(successful(send("GET", "/api/v1/notifications", ownerToken, null), 200)).hasSize(4);
+        assertThat(send("DELETE", "/api/v1/courses/" + courseId, ownerToken, null).statusCode()).isEqualTo(204);
+        assertThat(successful(send("GET", "/api/v1/notifications", ownerToken, null), 200)).isEmpty();
+        assertThat(jdbc.sql("SELECT count(*) FROM notifications WHERE course_id=:course")
+                .param("course", UUID.fromString(courseId)).query(Integer.class).single()).isEqualTo(4);
         assertThat(successful(send("GET", "/api/v1/notifications", foreignToken, null), 200)).isEmpty();
         assertThat(send("DELETE", "/api/v1/devices/fcm-token", foreignToken,
                 Map.of("token", "owner-fcm-token")).statusCode()).isEqualTo(204);

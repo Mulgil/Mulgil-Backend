@@ -197,6 +197,15 @@ public class JobQueue {
                 .param("id", jobId).param("workerId", workerId).update() == 1;
     }
 
+    @Transactional(noRollbackFor = JobHandler.JobExecutionException.class)
+    public boolean run(ClaimedJob claimed, JobHandler handler) throws JobHandler.JobExecutionException {
+        if (!lockActiveCourse(claimed.ownerId(), claimed.courseId())) {
+            markOutdated(claimed.id(), claimed.claimedBy());
+            return false;
+        }
+        return complete(claimed, handler.handle(claimed));
+    }
+
     @Transactional
     public boolean complete(ClaimedJob claimed, JobHandler.JobPublication publication) {
         AiJob current = lockRunning(claimed.id(), claimed.claimedBy());
@@ -357,6 +366,15 @@ public class JobQueue {
                         )
                         """)
                 .param("owner", ownerId).param("course", courseId).query(Boolean.class).single();
+    }
+
+    private boolean lockActiveCourse(UUID ownerId, UUID courseId) {
+        return jdbc.sql("""
+                        SELECT id FROM courses
+                        WHERE owner_id=:owner AND id=:course AND deleted_at IS NULL
+                        FOR SHARE
+                        """)
+                .param("owner", ownerId).param("course", courseId).query(UUID.class).optional().isPresent();
     }
 
     private void notifyAfterCommit(CompletionEvent event) {

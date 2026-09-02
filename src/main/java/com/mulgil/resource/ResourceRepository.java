@@ -51,6 +51,16 @@ class ResourceRepository {
                 .param("ownerId", ownerId).param("id", examId).query(Boolean.class).single();
     }
 
+    boolean lockExam(UUID ownerId, UUID examId) {
+        return jdbc.sql("""
+                        SELECT exam.id FROM exams exam
+                        JOIN courses course ON course.id=exam.course_id AND course.owner_id=exam.owner_id
+                        WHERE exam.owner_id=:ownerId AND exam.id=:id AND course.deleted_at IS NULL
+                        FOR SHARE OF exam, course
+                        """)
+                .param("ownerId", ownerId).param("id", examId).query(UUID.class).optional().isPresent();
+    }
+
     int materialCount(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
                         SELECT count(*) FROM materials material
@@ -87,6 +97,7 @@ class ResourceRepository {
                         FROM materials material
                         JOIN courses course ON course.id = material.course_id AND course.owner_id = material.owner_id
                         WHERE material.owner_id = :ownerId AND material.id = :id AND course.deleted_at IS NULL
+                        FOR SHARE OF material, course
                         """)
                 .param("ownerId", ownerId).param("id", materialId)
                 .query((row, ignored) -> material(row)).optional();
@@ -152,6 +163,7 @@ class ResourceRepository {
                         FROM exam_resources resource
                         JOIN courses course ON course.id = resource.course_id AND course.owner_id = resource.owner_id
                         WHERE resource.owner_id = :ownerId AND resource.id = :id AND course.deleted_at IS NULL
+                        FOR SHARE OF resource, course
                         """)
                 .param("ownerId", ownerId).param("id", id)
                 .query((row, ignored) -> examResource(row)).optional();
@@ -209,25 +221,38 @@ class ResourceRepository {
 
     Optional<Recording> recording(UUID ownerId, UUID id) {
         return jdbc.sql("""
-                        SELECT id, original_filename, mime_type, byte_size, started_at,
-                               duration_seconds, status, object_key, created_at, updated_at
-                        FROM audio_recordings WHERE owner_id = :ownerId AND id = :id
+                        SELECT recording.id, recording.original_filename, recording.mime_type, recording.byte_size,
+                               recording.started_at, recording.duration_seconds, recording.status,
+                               recording.object_key, recording.created_at, recording.updated_at
+                        FROM audio_recordings recording
+                        LEFT JOIN courses course ON course.id=recording.course_id
+                          AND course.owner_id=recording.owner_id
+                        WHERE recording.owner_id = :ownerId AND recording.id = :id AND recording.status='created'
+                          AND (recording.course_id IS NULL
+                               OR (course.id IS NOT NULL AND course.deleted_at IS NULL))
+                        FOR UPDATE OF recording
                         """)
                 .param("ownerId", ownerId).param("id", id)
                 .query((row, ignored) -> recording(row)).optional();
     }
 
-    Recording finalizeRecording(UUID ownerId, UUID id, long duration, String checksum, Instant now) {
+    Optional<Recording> finalizeRecording(UUID ownerId, UUID id, long duration, String checksum, Instant now) {
         return jdbc.sql("""
-                        UPDATE audio_recordings SET duration_seconds = :duration, checksum = :checksum,
+                        UPDATE audio_recordings recording SET duration_seconds = :duration, checksum = :checksum,
                             status = 'uploaded', updated_at = :now
-                        WHERE owner_id = :ownerId AND id = :id
-                        RETURNING id, original_filename, mime_type, byte_size, started_at,
-                                  duration_seconds, status, object_key, created_at, updated_at
+                        WHERE recording.owner_id = :ownerId AND recording.id = :id AND recording.status='created'
+                          AND (recording.course_id IS NULL OR EXISTS(
+                              SELECT 1 FROM courses course
+                              WHERE course.id=recording.course_id AND course.owner_id=recording.owner_id
+                                AND course.deleted_at IS NULL
+                          ))
+                        RETURNING recording.id, recording.original_filename, recording.mime_type,
+                                  recording.byte_size, recording.started_at, recording.duration_seconds,
+                                  recording.status, recording.object_key, recording.created_at, recording.updated_at
                         """)
                 .param("duration", duration).param("checksum", checksum).param("now", Timestamp.from(now))
                 .param("ownerId", ownerId).param("id", id)
-                .query((row, ignored) -> recording(row)).single();
+                .query((row, ignored) -> recording(row)).optional();
     }
 
     List<SessionScope> overlappingSessions(UUID ownerId, Instant start, Instant end) {
