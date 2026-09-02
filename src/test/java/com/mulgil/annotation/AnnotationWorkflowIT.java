@@ -24,6 +24,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import javax.sql.DataSource;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -35,6 +36,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -61,6 +68,7 @@ class AnnotationWorkflowIT {
     @Autowired List<JobHandler> handlers;
     @Autowired FakeHandwritingVision vision;
     @Autowired MulgilProperties properties;
+    @Autowired Fakes.AnnotationReadGate annotationReadGate;
     private final HttpClient http = HttpClient.newHttpClient();
 
     @BeforeEach
@@ -219,6 +227,70 @@ class AnnotationWorkflowIT {
                 .query(Integer.class).single()).isZero();
     }
 
+    @Test
+    void annotationGetReturnsOneRevision_duringConcurrentSave() throws Exception {
+        String owner = login("annotation-owner");
+        String session = session(owner);
+        UUID material = material(owner, session);
+        UUID firstStroke = UUID.randomUUID();
+        UUID firstEmphasis = UUID.randomUUID();
+        UUID secondStroke = UUID.randomUUID();
+        UUID secondEmphasis = UUID.randomUUID();
+        HttpResult firstPut = send("PUT", "/api/v1/materials/" + material + "/annotations", owner,
+                Map.of("expectedVersion", 0,
+                        "inkStrokes", List.of(stroke(firstStroke, "pen", box(0.1, 0.1, 0.2, 0.2), 1)),
+                        "emphasisRegions", List.of(Map.of("id", firstEmphasis, "pageNumber", 1,
+                                "bboxNorm", box(0.2, 0.2, 0.2, 0.2), "tapCount", 1))));
+        assertThat(ok(firstPut, 200).path("version").asInt()).isEqualTo(1);
+
+        ExecutorService executor = Executors.newFixedThreadPool(1);
+        Future<HttpResult> pendingGet = null;
+        HttpResult secondPut;
+        HttpResult ownerGet;
+        try {
+            annotationReadGate.arm();
+            pendingGet = executor.submit(() -> send(
+                    "GET", "/api/v1/materials/" + material + "/annotations", owner, null));
+            try {
+                annotationReadGate.awaitReached();
+                secondPut = send("PUT", "/api/v1/materials/" + material + "/annotations", owner,
+                        Map.of("expectedVersion", 1,
+                                "inkStrokes", List.of(stroke(secondStroke, "pen", box(0.4, 0.4, 0.2, 0.2), 1)),
+                                "emphasisRegions", List.of(Map.of("id", secondEmphasis, "pageNumber", 1,
+                                        "bboxNorm", box(0.5, 0.5, 0.2, 0.2), "tapCount", 2))));
+                assertThat(ok(secondPut, 200).path("version").asInt()).isEqualTo(2);
+            } finally {
+                annotationReadGate.release();
+            }
+            ownerGet = await(pendingGet);
+        } finally {
+            annotationReadGate.release();
+            executor.shutdownNow();
+            awaitTermination(executor);
+        }
+
+        JsonNode fetched = ok(ownerGet, 200);
+        System.out.printf("ANNOTATION_SNAPSHOT_OBSERVED ownerGetStatus=%d documentVersion=%d "
+                        + "actualStroke=%s revision1Stroke=%s revision2Stroke=%s "
+                        + "actualEmphasis=%s revision1Emphasis=%s revision2Emphasis=%s%n",
+                ownerGet.status(), fetched.path("document").path("version").asInt(),
+                fetched.path("inkStrokes").get(0).path("id").asText(), firstStroke, secondStroke,
+                fetched.path("emphasisRegions").get(0).path("id").asText(), firstEmphasis, secondEmphasis);
+        assertThat(fetched.path("document").path("version").asInt()).isEqualTo(1);
+        assertThat(fetched.path("inkStrokes").findValuesAsText("id")).containsExactly(firstStroke.toString());
+        assertThat(fetched.path("emphasisRegions").findValuesAsText("id"))
+                .containsExactly(firstEmphasis.toString());
+        HttpResult foreignGet = send("GET", "/api/v1/materials/" + material + "/annotations",
+                login("annotation-reader-foreign"), null);
+        error(foreignGet, 404, "ANNOTATION_NOT_FOUND");
+        System.out.printf("ANNOTATION_SNAPSHOT ownerPutStatus=%d ownerGetStatus=%d ownerGetVersion=%d "
+                        + "ownerStroke=%s ownerEmphasis=%s foreignGetStatus=%d foreignCode=%s result=PASS%n",
+                secondPut.status(), ownerGet.status(), fetched.path("document").path("version").asInt(),
+                fetched.path("inkStrokes").get(0).path("id").asText(),
+                fetched.path("emphasisRegions").get(0).path("id").asText(), foreignGet.status(),
+                json.readTree(foreignGet.body()).path("code").asText());
+    }
+
     private Map<String, Object> stroke(UUID id, String tool, Map<String, Object> bbox, int page) {
         double x = ((Number) bbox.get("x")).doubleValue();
         double y = ((Number) bbox.get("y")).doubleValue();
@@ -296,12 +368,92 @@ class AnnotationWorkflowIT {
         assertThat(json.readTree(result.body()).path("code").asText()).isEqualTo(code);
     }
 
+    private static <T> T await(Future<T> future) throws Exception {
+        try {
+            return future.get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw exception;
+        }
+    }
+
+    private static void awaitTermination(ExecutorService executor) throws InterruptedException {
+        try {
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw exception;
+        }
+    }
+
     record HttpResult(int status, String body) {}
 
     @TestConfiguration
     static class Fakes {
         @Bean @Primary FakeHandwritingVision fakeVision() {
             return new FakeHandwritingVision();
+        }
+
+        @Bean AnnotationReadGate annotationReadGate() {
+            return new AnnotationReadGate();
+        }
+
+        @Bean @Primary JdbcClient gatedJdbcClient(DataSource dataSource, AnnotationReadGate gate) {
+            JdbcClient delegate = JdbcClient.create(dataSource);
+            return sql -> {
+                gate.before(sql);
+                return delegate.sql(sql);
+            };
+        }
+
+        static final class AnnotationReadGate {
+            private static final String GET_CHILD_SQL = """
+                    SELECT id,page_number,tool,color,width_norm,points_json::text,bbox_norm::text
+                    FROM ink_strokes WHERE annotation_document_id=:id
+                    ORDER BY page_number,created_at,id
+                    """;
+            private final AtomicReference<Gate> armed = new AtomicReference<>();
+
+            void arm() {
+                assertThat(armed.compareAndSet(null,
+                        new Gate(new CountDownLatch(1), new CountDownLatch(1)))).isTrue();
+            }
+
+            void awaitReached() throws InterruptedException {
+                Gate gate = armed.get();
+                assertThat(gate).isNotNull();
+                try {
+                    assertThat(gate.reached().await(5, TimeUnit.SECONDS)).isTrue();
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw exception;
+                }
+            }
+
+            void release() {
+                Gate gate = armed.getAndSet(null);
+                if (gate != null) gate.release().countDown();
+            }
+
+            private void before(String sql) {
+                if (!sql.equals(GET_CHILD_SQL)) return;
+                Gate gate = armed.get();
+                if (gate == null) return;
+                gate.reached().countDown();
+                try {
+                    if (!gate.release().await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Timed out waiting to release annotation GET child query");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted while waiting to release annotation GET child query",
+                            exception);
+                } finally {
+                    armed.compareAndSet(gate, null);
+                }
+            }
+
+            private record Gate(CountDownLatch reached, CountDownLatch release) {}
         }
     }
 }

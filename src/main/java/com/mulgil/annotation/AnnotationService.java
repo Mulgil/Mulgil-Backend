@@ -9,6 +9,7 @@ import com.mulgil.job.JobQueue;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Timestamp;
@@ -37,6 +38,7 @@ class AnnotationService {
         this.handwritingRevisions = new HandwritingRevisionUpdater(jdbc);
     }
 
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     Annotation get(UUID ownerId, UUID materialId) {
         StoredDocument document = document(ownerId, materialId, false);
         if (document == null) throw notFound();
