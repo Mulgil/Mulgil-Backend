@@ -102,6 +102,19 @@ class ResourceUploadService {
         return completed;
     }
 
+    List<ExamResource> examResources(UUID ownerId, UUID examId) {
+        if (!repository.ownsExam(ownerId, examId)) throw notFound();
+        return repository.examResources(ownerId, examId).stream().map(ResourceUploadService::examResource).toList();
+    }
+
+    DownloadUrl examResourceDownload(UUID ownerId, UUID resourceId) {
+        ResourceRepository.ExamResource resource = repository.examResource(ownerId, resourceId)
+                .filter(value -> value.status().equals("uploaded"))
+                .orElseThrow(ResourceUploadService::notFound);
+        Instant expiry = expiresAt();
+        return new DownloadUrl(storage.createDownloadUrl(resource.objectKey(), expiry), expiry);
+    }
+
     UploadUrl issueRecordingUpload(UUID ownerId, RecordingUpload request) {
         if (!properties.uploads().recordingMimeTypes().contains(request.mimeType())) throw unsupported();
         UUID id = UUID.randomUUID();

@@ -95,6 +95,16 @@ class AnnotationWorkflowIT {
         assertThat(jdbc.sql("SELECT tap_count FROM emphasis_regions WHERE annotation_document_id=:id")
                 .param("id", UUID.fromString(document.path("id").asText())).query(Integer.class).single())
                 .isEqualTo(4);
+        JsonNode fetched = ok(send("GET", "/api/v1/materials/" + material + "/annotations", owner, null), 200);
+        assertThat(fetched.path("document").path("id").asText()).isEqualTo(document.path("id").asText());
+        assertThat(fetched.path("document").path("version").asInt()).isEqualTo(1);
+        assertThat(fetched.path("inkStrokes")).hasSize(4);
+        assertThat(fetched.path("inkStrokes").get(0).path("pageNumber").asInt()).isEqualTo(1);
+        assertThat(fetched.path("emphasisRegions")).hasSize(1);
+        assertThat(fetched.has("handwritingBlocks")).isFalse();
+        assertThat(fetched.toString()).doesNotContain("ocrText").doesNotContain("confirmedText");
+        error(send("GET", "/api/v1/materials/" + material + "/annotations", login("annotation-reader-foreign"), null),
+                404, "ANNOTATION_NOT_FOUND");
         error(send("PUT", "/api/v1/materials/" + material + "/annotations", login("annotation-foreign"),
                 Map.of("expectedVersion", 1, "inkStrokes", List.of(), "emphasisRegions", List.of())),
                 404, "ANNOTATION_NOT_FOUND");

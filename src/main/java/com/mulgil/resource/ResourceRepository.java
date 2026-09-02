@@ -33,6 +33,11 @@ class ResourceRepository {
                 .param("ownerId", ownerId).param("id", sessionId).query(Boolean.class).single();
     }
 
+    boolean ownsExam(UUID ownerId, UUID examId) {
+        return jdbc.sql("SELECT EXISTS (SELECT 1 FROM exams WHERE owner_id = :ownerId AND id = :id)")
+                .param("ownerId", ownerId).param("id", examId).query(Boolean.class).single();
+    }
+
     int materialCount(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
                         SELECT count(*) FROM materials
@@ -121,6 +126,18 @@ class ResourceRepository {
                         """)
                 .param("ownerId", ownerId).param("id", id)
                 .query((row, ignored) -> examResource(row)).optional();
+    }
+
+    List<ExamResource> examResources(UUID ownerId, UUID examId) {
+        return jdbc.sql("""
+                        SELECT id, exam_id, resource_type, original_filename, mime_type, byte_size,
+                               page_count, status, object_key, created_at, updated_at
+                        FROM exam_resources
+                        WHERE owner_id = :ownerId AND exam_id = :examId
+                        ORDER BY created_at, id
+                        """)
+                .param("ownerId", ownerId).param("examId", examId)
+                .query((row, ignored) -> examResource(row)).list();
     }
 
     ExamResource finalizeExamResource(UUID ownerId, UUID id, int pageCount, String checksum, Instant now) {

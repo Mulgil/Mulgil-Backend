@@ -121,6 +121,14 @@ class ResourceUploadApiIT {
         assertThat(examResource.path("resourceType").asText()).isEqualTo("past_exam");
         assertThat(examResource.path("status").asText()).isEqualTo("uploaded");
         assertThat(examResource.toString()).doesNotContain("objectKey").doesNotContain("owner/");
+        JsonNode examResources = successful(get("/api/v1/exams/" + ids.examId() + "/resources", owner), 200);
+        assertThat(examResources).hasSize(1);
+        assertThat(examResources.get(0).path("id").asText()).isEqualTo(examResourceId);
+        assertThat(examResources.get(0).path("status").asText()).isEqualTo("uploaded");
+        assertThat(examResources.toString()).doesNotContain("objectKey").doesNotContain("owner/");
+        JsonNode examDownload = successful(get("/api/v1/exam-resources/" + examResourceId + "/download-url", owner), 200);
+        assertThat(examDownload.path("downloadUrl").asText()).startsWith("https://storage.test/download/");
+        assertThat(examDownload.toString()).doesNotContain("objectKey").doesNotContain("owner/");
 
         assertThat(storage.apiBodyBytes()).isZero();
         assertThat(jdbc.sql("""
@@ -274,9 +282,13 @@ class ResourceUploadApiIT {
                 404, "RESOURCE_NOT_FOUND");
         assertError(get("/api/v1/materials/" + materialId + "/download-url", foreign),
                 404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/exams/" + ids.examId() + "/resources", foreign),
+                404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/exam-resources/" + examResourceId + "/download-url", foreign),
+                404, "RESOURCE_NOT_FOUND");
         assertError(post("/api/v1/exam-resources/" + examResourceId + "/upload-complete", foreign,
                 Map.of("checksumSha256", PDF_CHECKSUM)), 404, "RESOURCE_NOT_FOUND");
-        recordHttp("foreignOwner", "404", "list;download;examResource");
+        recordHttp("foreignOwner", "404", "list;download;examResourceList;examResourceDownload");
     }
 
     @Test
