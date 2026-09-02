@@ -110,6 +110,44 @@ class LearningDomainApiIT {
     }
 
     @Test
+    void updatesOwnedCourse_whenEditableFieldsAreSubmitted() throws Exception {
+        String owner = login("course-update-owner");
+        String courseId = successful(post("/api/v1/courses", owner, Map.of(
+                "name", "Algorithms", "instructor", "Professor Kim", "term", "2026-Fall")), 201)
+                .path("id").asText();
+
+        JsonNode updated = successful(patch("/api/v1/courses/" + courseId, owner, Map.of(
+                "name", "Advanced Algorithms", "instructor", "Professor Lee", "term", "2027-Spring")), 200);
+
+        assertThat(updated.path("name").asText()).isEqualTo("Advanced Algorithms");
+        assertThat(updated.path("instructor").asText()).isEqualTo("Professor Lee");
+        assertThat(updated.path("term").asText()).isEqualTo("2027-Spring");
+    }
+
+    @Test
+    void softDeletesOwnedCourse_whenRequested() throws Exception {
+        String owner = login("course-delete-owner");
+        String courseId = createCourse(owner, "Databases");
+        successful(post("/api/v1/timetable/slots", owner, Map.of(
+                "courseId", courseId, "weekday", 1, "startTime", "09:00",
+                "endTime", "10:00", "timezone", "Asia/Seoul")), 201);
+        String sessionId = createSession(owner, courseId, 1);
+
+        HttpResult deleted = delete("/api/v1/courses/" + courseId, owner);
+
+        assertThat(deleted.status()).isEqualTo(204);
+        assertThat(successful(get("/api/v1/courses", owner), 200)).isEmpty();
+        assertThat(successful(get("/api/v1/timetable/slots", owner), 200)).isEmpty();
+        assertError(get("/api/v1/courses/" + courseId + "/sessions", owner), 404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/sessions/" + sessionId, owner), 404, "RESOURCE_NOT_FOUND");
+        assertThat(jdbc.sql("SELECT deleted_at IS NOT NULL FROM courses WHERE id = :id")
+                .param("id", UUID.fromString(courseId)).query(Boolean.class).single()).isTrue();
+        assertThat(jdbc.sql("SELECT count(*) FROM class_sessions WHERE course_id = :id")
+                .param("id", UUID.fromString(courseId)).query(Integer.class).single()).isEqualTo(1);
+        recordHttp("softDeleteCourse", 204, "courseHidden=1 sessionRetained=1");
+    }
+
+    @Test
     void rejectsDuplicateAndCrossCourseExamScope_whenPayloadIsInvalid() throws Exception {
         String ownerA = login("domain-validation-a");
         String ownerB = login("domain-validation-b");

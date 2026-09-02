@@ -32,6 +32,17 @@ class LearningDomainService {
         return repository.listCourses(ownerId);
     }
 
+    LearningDomainRepository.Course updateCourse(UUID ownerId, UUID courseId, CourseInput request) {
+        LearningDomainRepository.Course course = repository.updateCourse(
+                ownerId, courseId, request.name(), request.instructor(), request.term(), clock.instant());
+        if (course == null) throw notFound();
+        return course;
+    }
+
+    void deleteCourse(UUID ownerId, UUID courseId) {
+        if (repository.softDeleteCourse(ownerId, courseId, clock.instant()) == 0) throw notFound();
+    }
+
     LearningDomainRepository.TimetableSlot createSlot(UUID ownerId, SlotInput request) {
         validateSlot(request);
         LearningDomainRepository.TimetableSlot slot = repository.createSlot(

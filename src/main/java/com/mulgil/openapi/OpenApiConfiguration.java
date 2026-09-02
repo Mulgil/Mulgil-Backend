@@ -21,6 +21,8 @@ public class OpenApiConfiguration {
             doc("POST", "/api/v1/auth/logout", "인증", "로그아웃", "제출한 refresh token family를 revoke하여 이후 갱신을 차단합니다.", true),
             doc("GET", "/api/v1/courses", "학습 관리", "과목 목록 조회", "인증된 사용자가 소유한 과목만 반환합니다.", false),
             doc("POST", "/api/v1/courses", "학습 관리", "과목 생성", "과목명, 담당자, 학기를 저장하고 소유자 범위의 과목을 생성합니다.", false),
+            doc("PATCH", "/api/v1/courses/{courseId}", "학습 관리", "과목 수정", "소유한 과목의 과목명, 담당 교수, 강의 학기를 갱신합니다.", false),
+            doc("DELETE", "/api/v1/courses/{courseId}", "학습 관리", "과목 보관", "과목을 soft delete하여 목록과 시간표에서 숨기고 연관 데이터는 보존합니다.", false),
             doc("GET", "/api/v1/timetable/slots", "학습 관리", "시간표 슬롯 조회", "선택한 과목 또는 전체 소유 시간표 슬롯을 조회합니다.", false),
             doc("POST", "/api/v1/timetable/slots", "학습 관리", "시간표 슬롯 생성", "소유한 과목에 ISO 요일과 IANA timezone 기반 시간표 슬롯을 추가합니다.", false),
             doc("PATCH", "/api/v1/timetable/slots/{slotId}", "학습 관리", "시간표 슬롯 수정", "소유한 시간표 슬롯만 수정합니다.", false),

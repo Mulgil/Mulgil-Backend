@@ -54,7 +54,11 @@ class OpenApiDocumentationIT {
         JsonNode document = objectMapper.readTree(response.body());
         assertThat(document.at("/info/title").asText()).isEqualTo("Mulgil MVP Backend API");
         assertThat(document.at("/components/securitySchemes/bearerAuth/type").asText()).isEqualTo("http");
-        assertThat(documentedMvpOperationCount(document)).isEqualTo(47);
+        assertThat(documentedMvpOperationCount(document)).isEqualTo(49);
+        assertThat(document.at("/paths/~1api~1v1~1courses~1{courseId}/patch/summary").asText())
+                .isEqualTo("과목 수정");
+        assertThat(document.at("/paths/~1api~1v1~1courses~1{courseId}/delete/summary").asText())
+                .isEqualTo("과목 보관");
         assertThat(document.at("/paths/~1api~1v1~1sessions~1{sessionId}~1notes/get/summary").asText())
                 .isEqualTo("차시 노트 목록 조회");
         assertThat(document.at("/paths/~1api~1v1~1notes~1{noteId}/get/summary").asText())
