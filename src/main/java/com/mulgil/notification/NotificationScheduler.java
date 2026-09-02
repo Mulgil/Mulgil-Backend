@@ -55,7 +55,7 @@ class NotificationScheduler implements JobCompletionListener {
     @Override
     @Transactional
     public void onCompleted(JobQueue.CompletionEvent event) {
-        if (!PROCESSING_COMPLETIONS.contains(event.type())) return;
+        if (!PROCESSING_COMPLETIONS.contains(event.type()) || !courseActive(event.ownerId(), event.courseId())) return;
         Instant now = clock.instant();
         List<UUID> tokens = jdbc.sql("SELECT id FROM device_tokens WHERE owner_id=:owner ORDER BY id")
                 .param("owner", event.ownerId()).query(UUID.class).list();
@@ -74,6 +74,7 @@ class NotificationScheduler implements JobCompletionListener {
                        COALESCE(session.ends_at,
                            (session.session_date + slot.end_time) AT TIME ZONE slot.timezone) AS class_ends_at
                 FROM class_sessions session
+                JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
                 JOIN device_tokens token ON token.owner_id=session.owner_id
                 LEFT JOIN LATERAL (
                     SELECT timetable.end_time,timetable.timezone FROM timetable_slots timetable
@@ -81,7 +82,7 @@ class NotificationScheduler implements JobCompletionListener {
                       AND timetable.weekday=EXTRACT(ISODOW FROM session.session_date)
                     ORDER BY timetable.start_time,timetable.id LIMIT 1
                 ) slot ON true
-                WHERE session.ends_at IS NOT NULL OR slot.end_time IS NOT NULL
+                WHERE course.deleted_at IS NULL AND (session.ends_at IS NOT NULL OR slot.end_time IS NOT NULL)
                 """).query((row, ignored) -> new PostClassCandidate(row.getObject("owner_id", UUID.class),
                 row.getObject("course_id", UUID.class), row.getObject("session_id", UUID.class),
                 row.getObject("token_id", UUID.class), row.getTimestamp("class_ends_at").toInstant())).list();
@@ -100,12 +101,14 @@ class NotificationScheduler implements JobCompletionListener {
                 SELECT exam.owner_id,exam.course_id,exam.id AS exam_id,exam.exam_at,
                        token.id AS token_id,member.session_id
                 FROM exams exam
+                JOIN courses course ON course.id=exam.course_id AND course.owner_id=exam.owner_id
                 JOIN device_tokens token ON token.owner_id=exam.owner_id
                 JOIN LATERAL (
                     SELECT session_id FROM exam_session_members
                     WHERE owner_id=exam.owner_id AND course_id=exam.course_id AND exam_id=exam.id
                     ORDER BY session_id LIMIT 1
                 ) member ON true
+                WHERE course.deleted_at IS NULL
                 """).query((row, ignored) -> new ExamCandidate(row.getObject("owner_id", UUID.class),
                 row.getObject("course_id", UUID.class), row.getObject("session_id", UUID.class),
                 row.getObject("exam_id", UUID.class), row.getObject("token_id", UUID.class),
@@ -139,8 +142,13 @@ class NotificationScheduler implements JobCompletionListener {
 
     private void enqueueDue(Instant now) {
         List<DueNotification> due = jdbc.sql("""
-                SELECT id,owner_id,course_id,session_id FROM notifications
-                WHERE status='scheduled' AND scheduled_at<=:now ORDER BY scheduled_at,id
+                SELECT notification.id,notification.owner_id,notification.course_id,notification.session_id
+                FROM notifications notification
+                JOIN courses course ON course.id=notification.course_id
+                  AND course.owner_id=notification.owner_id
+                WHERE notification.status='scheduled' AND notification.scheduled_at<=:now
+                  AND course.deleted_at IS NULL
+                ORDER BY notification.scheduled_at,notification.id
                 """).param("now", Timestamp.from(now)).query((row, ignored) -> new DueNotification(
                 row.getObject("id", UUID.class), row.getObject("owner_id", UUID.class),
                 row.getObject("course_id", UUID.class), row.getObject("session_id", UUID.class))).list();
@@ -157,6 +165,16 @@ class NotificationScheduler implements JobCompletionListener {
         } catch (JsonProcessingException exception) {
             throw new IllegalStateException(exception);
         }
+    }
+
+    private boolean courseActive(UUID ownerId, UUID courseId) {
+        return jdbc.sql("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM courses
+                            WHERE owner_id=:owner AND id=:course AND deleted_at IS NULL
+                        )
+                        """)
+                .param("owner", ownerId).param("course", courseId).query(Boolean.class).single();
     }
 
     static String hash(UUID notificationId) {

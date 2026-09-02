@@ -116,8 +116,9 @@ class HandwritingService {
                        block.status,document.version document_version
                 FROM handwriting_blocks block
                 JOIN annotation_documents document ON document.id=block.annotation_document_id
-                WHERE block.owner_id=:owner AND block.id=:id
-                """ + (lock ? " FOR UPDATE OF block,document" : ""))
+                JOIN courses course ON course.id=block.course_id AND course.owner_id=block.owner_id
+                WHERE block.owner_id=:owner AND block.id=:id AND course.deleted_at IS NULL
+                """ + (lock ? " FOR UPDATE OF block,document,course" : ""))
                 .param("owner", ownerId).param("id", blockId)
                 .query((row, ignored) -> new Block(row.getObject("id", UUID.class),
                         row.getObject("owner_id", UUID.class), row.getObject("course_id", UUID.class),

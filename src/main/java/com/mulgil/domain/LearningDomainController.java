@@ -47,6 +47,20 @@ final class LearningDomainController {
         return service.createCourse(CurrentUser.id(), request.toInput());
     }
 
+    @PatchMapping("/courses/{courseId}")
+    LearningDomainRepository.Course updateCourse(
+            @PathVariable UUID courseId,
+            @Valid @RequestBody CourseUpdateRequest request
+    ) {
+        return service.updateCourse(CurrentUser.id(), courseId, request.toInput());
+    }
+
+    @DeleteMapping("/courses/{courseId}")
+    ResponseEntity<Void> deleteCourse(@PathVariable UUID courseId) {
+        service.deleteCourse(CurrentUser.id(), courseId);
+        return ResponseEntity.noContent().build();
+    }
+
     @GetMapping("/timetable/slots")
     List<LearningDomainRepository.TimetableSlot> listSlots(@RequestParam(required = false) UUID courseId) {
         return service.listSlots(CurrentUser.id(), courseId);
@@ -106,6 +120,16 @@ final class LearningDomainController {
     }
 
     record CourseCreateRequest(
+            @NotBlank @Size(max = 100) String name,
+            @Size(max = 100) String instructor,
+            @Size(max = 50) String term
+    ) {
+        LearningDomainService.CourseInput toInput() {
+            return new LearningDomainService.CourseInput(name, instructor, term);
+        }
+    }
+
+    record CourseUpdateRequest(
             @NotBlank @Size(max = 100) String name,
             @Size(max = 100) String instructor,
             @Size(max = 50) String term

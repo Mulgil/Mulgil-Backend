@@ -70,6 +70,7 @@ class ResourceUploadService {
         return repository.materials(ownerId, sessionId).stream().map(ResourceUploadService::material).toList();
     }
 
+    @Transactional
     DownloadUrl materialDownload(UUID ownerId, UUID materialId) {
         ResourceRepository.Material material = repository.material(ownerId, materialId)
                 .filter(value -> value.status().equals("uploaded"))
@@ -78,8 +79,10 @@ class ResourceUploadService {
         return new DownloadUrl(storage.createDownloadUrl(material.objectKey(), expiry), expiry);
     }
 
+    @Transactional
     UploadUrl issueExamResourceUpload(UUID ownerId, UUID examId, PdfUpload request) {
         validatePdf(request.mimeType(), request.byteSize());
+        if (!repository.lockExam(ownerId, examId)) throw notFound();
         UUID id = UUID.randomUUID();
         String key = "owner/%s/exam/%s/resource/%s/source.pdf".formatted(ownerId, examId, id);
         ResourceRepository.ExamResource resource = repository.createExamResource(ownerId, id,
@@ -107,6 +110,7 @@ class ResourceUploadService {
         return repository.examResources(ownerId, examId).stream().map(ResourceUploadService::examResource).toList();
     }
 
+    @Transactional
     DownloadUrl examResourceDownload(UUID ownerId, UUID resourceId) {
         ResourceRepository.ExamResource resource = repository.examResource(ownerId, resourceId)
                 .filter(value -> value.status().equals("uploaded"))
@@ -125,6 +129,7 @@ class ResourceUploadService {
         return uploadUrl(recording.id(), recording.objectKey(), recording.mimeType(), recording.byteSize());
     }
 
+    @Transactional
     RecordingUploadComplete finalizeRecording(UUID ownerId, UUID recordingId, String checksum) {
         ResourceRepository.Recording recording = repository.recording(ownerId, recordingId)
                 .orElseThrow(ResourceUploadService::notFound);
@@ -134,7 +139,7 @@ class ResourceUploadService {
             throw limit("durationSeconds");
         }
         ResourceRepository.Recording uploaded = repository.finalizeRecording(ownerId, recordingId,
-                inspection.durationSeconds(), checksum.toLowerCase(), clock.instant());
+                inspection.durationSeconds(), checksum.toLowerCase(), clock.instant()).orElseThrow(ResourceUploadService::notFound);
         return new RecordingUploadComplete(uploaded.id(), inspection.durationSeconds(),
                 candidates(ownerId, uploaded.startedAt(), inspection.durationSeconds()));
     }

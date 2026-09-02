@@ -27,6 +27,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -352,6 +353,100 @@ class JobQueueIT {
         assertThat(queue.complete(claimed, () -> published.set(true))).isFalse();
         assertThat(published).isFalse();
         assertThat(queue.get(ownerId, job.id()).status()).isEqualTo("outdated");
+    }
+
+    @Test
+    void archivesQueuedJobs_whenTheirCourseIsSoftDeleted() {
+        JobQueue.AiJob job = queue.enqueue(request());
+        jdbc.sql("UPDATE courses SET deleted_at=now() WHERE id=:id").param("id", courseId).update();
+
+        assertThat(queue.claim("worker", Set.of("pdf_extract"))).isNull();
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id").param("id", job.id())
+                .query(String.class).single()).isEqualTo("outdated");
+        assertThatThrownBy(() -> queue.get(ownerId, job.id()))
+                .isInstanceOf(ApiException.class)
+                .extracting(value -> ((ApiException) value).code())
+                .isEqualTo("JOB_NOT_FOUND");
+    }
+
+    @Test
+    void skipsPreclaimedJob_whenItsCourseIsSoftDeleted() throws Exception {
+        JobQueue.AiJob job = queue.enqueue(request());
+        JobQueue.ClaimedJob claimed = queue.claim("worker", Set.of("pdf_extract"));
+        jdbc.sql("UPDATE courses SET deleted_at=now() WHERE id=:id").param("id", courseId).update();
+        AtomicBoolean handled = new AtomicBoolean();
+
+        assertThat(queue.run(claimed, new JobHandler() {
+            @Override
+            public String jobType() {
+                return "pdf_extract";
+            }
+
+            @Override
+            public JobPublication handle(JobQueue.ClaimedJob ignored) {
+                handled.set(true);
+                return () -> {};
+            }
+        })).isFalse();
+
+        assertThat(handled).isFalse();
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id").param("id", job.id())
+                .query(String.class).single()).isEqualTo("outdated");
+    }
+
+    @Test
+    void waitsForRunningJobBeforeArchivingItsCourse() throws Exception {
+        queue.enqueue(request());
+        CountDownLatch handlerStarted = new CountDownLatch(1);
+        CountDownLatch releaseHandler = new CountDownLatch(1);
+        CountDownLatch archiveStarted = new CountDownLatch(1);
+        AtomicInteger publications = new AtomicInteger();
+        JobHandler handler = new JobHandler() {
+            @Override
+            public String jobType() {
+                return "pdf_extract";
+            }
+
+            @Override
+            public JobPublication handle(JobQueue.ClaimedJob ignored) throws JobExecutionException {
+                handlerStarted.countDown();
+                try {
+                    if (!releaseHandler.await(5, TimeUnit.SECONDS)) {
+                        throw new JobExecutionException("TEST_TIMEOUT", "Handler timed out.", false);
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new JobExecutionException("TEST_INTERRUPTED", "Handler interrupted.", false);
+                }
+                return publications::incrementAndGet;
+            }
+        };
+        JobWorker worker = new JobWorker(queue, java.util.List.of(handler), properties);
+        var poller = Executors.newSingleThreadExecutor();
+        var archiver = Executors.newSingleThreadExecutor();
+
+        try {
+            var workerRun = poller.submit(worker::poll);
+            assertThat(handlerStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            var archive = archiver.submit(() -> {
+                archiveStarted.countDown();
+                jdbc.sql("UPDATE courses SET deleted_at=now() WHERE id=:id").param("id", courseId).update();
+            });
+            assertThat(archiveStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> archive.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+
+            releaseHandler.countDown();
+            workerRun.get(3, TimeUnit.SECONDS);
+            archive.get(3, TimeUnit.SECONDS);
+            assertThat(publications).hasValue(1);
+            assertThat(jdbc.sql("SELECT deleted_at IS NOT NULL FROM courses WHERE id=:id").param("id", courseId)
+                    .query(Boolean.class).single()).isTrue();
+        } finally {
+            releaseHandler.countDown();
+            poller.shutdownNow();
+            archiver.shutdownNow();
+            worker.close();
+        }
     }
 
     @Test

@@ -30,8 +30,10 @@ class RecordingMappingService {
     @Transactional
     JobQueue.JobAccepted confirm(UUID ownerId, UUID recordingId, UUID sessionId) {
         Session session = jdbc.sql("""
-                        SELECT id, course_id FROM class_sessions
-                        WHERE owner_id=:owner AND id=:session FOR UPDATE
+                        SELECT session.id, session.course_id FROM class_sessions session
+                        JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                        WHERE session.owner_id=:owner AND session.id=:session AND course.deleted_at IS NULL
+                        FOR UPDATE OF session, course
                         """).param("owner", ownerId).param("session", sessionId)
                 .query((row, ignored) -> new Session(row.getObject("id", UUID.class),
                         row.getObject("course_id", UUID.class))).optional().orElseThrow(RecordingMappingService::notFound);

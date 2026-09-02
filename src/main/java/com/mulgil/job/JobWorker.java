@@ -44,7 +44,7 @@ class JobWorker {
                 () -> queue.heartbeat(job.id(), workerId), heartbeatPeriodMillis,
                 heartbeatPeriodMillis, TimeUnit.MILLISECONDS);
         try {
-            queue.complete(job, handler.handle(job));
+            queue.run(job, handler);
         } catch (JobHandler.JobExecutionException exception) {
             queue.fail(job, exception.code(), exception.getMessage(), exception.retryable());
         } catch (RuntimeException exception) {

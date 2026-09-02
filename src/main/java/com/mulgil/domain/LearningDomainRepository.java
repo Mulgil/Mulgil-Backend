@@ -35,13 +35,34 @@ class LearningDomainRepository {
     List<Course> listCourses(UUID ownerId) {
         return jdbc.sql("""
                         SELECT id, name, instructor, term, created_at, updated_at
-                        FROM courses WHERE owner_id = :ownerId ORDER BY created_at, id
+                        FROM courses WHERE owner_id = :ownerId AND deleted_at IS NULL ORDER BY created_at, id
                         """)
                 .param("ownerId", ownerId).query((row, ignored) -> course(row)).list();
     }
 
+    Course updateCourse(UUID ownerId, UUID courseId, String name, String instructor, String term, Instant now) {
+        return jdbc.sql("""
+                        UPDATE courses
+                        SET name = :name, instructor = :instructor, term = :term, updated_at = :now
+                        WHERE id = :courseId AND owner_id = :ownerId AND deleted_at IS NULL
+                        RETURNING id, name, instructor, term, created_at, updated_at
+                        """)
+                .param("ownerId", ownerId).param("courseId", courseId).param("name", name)
+                .param("instructor", instructor).param("term", term).param("now", Timestamp.from(now))
+                .query((row, ignored) -> course(row)).optional().orElse(null);
+    }
+
+    int softDeleteCourse(UUID ownerId, UUID courseId, Instant now) {
+        return jdbc.sql("""
+                        UPDATE courses SET deleted_at = :now, updated_at = :now
+                        WHERE id = :courseId AND owner_id = :ownerId AND deleted_at IS NULL
+                        """)
+                .param("ownerId", ownerId).param("courseId", courseId).param("now", Timestamp.from(now)).update();
+    }
+
     boolean ownsCourse(UUID ownerId, UUID courseId) {
-        return jdbc.sql("SELECT EXISTS (SELECT 1 FROM courses WHERE owner_id = :ownerId AND id = :courseId)")
+        return jdbc.sql("SELECT EXISTS (SELECT 1 FROM courses WHERE owner_id = :ownerId AND id = :courseId "
+                + "AND deleted_at IS NULL)")
                 .param("ownerId", ownerId).param("courseId", courseId).query(Boolean.class).single();
     }
 
@@ -50,7 +71,7 @@ class LearningDomainRepository {
                         INSERT INTO timetable_slots
                             (id, owner_id, course_id, weekday, start_time, end_time, timezone, created_at, updated_at)
                         SELECT :id, :ownerId, c.id, :weekday, :startTime, :endTime, :timezone, :now, :now
-                        FROM courses c WHERE c.id = :courseId AND c.owner_id = :ownerId
+                        FROM courses c WHERE c.id = :courseId AND c.owner_id = :ownerId AND c.deleted_at IS NULL
                         RETURNING id, course_id, weekday, start_time, end_time, timezone, created_at, updated_at
                         """)
                 .param("id", id).param("ownerId", ownerId).param("courseId", request.courseId())
@@ -63,13 +84,15 @@ class LearningDomainRepository {
     List<TimetableSlot> listSlots(UUID ownerId, UUID courseId) {
         String sql = courseId == null
                 ? """
-                  SELECT id, course_id, weekday, start_time, end_time, timezone, created_at, updated_at
-                  FROM timetable_slots WHERE owner_id = :ownerId ORDER BY weekday, start_time, id
+                  SELECT s.id, s.course_id, s.weekday, s.start_time, s.end_time, s.timezone, s.created_at, s.updated_at
+                  FROM timetable_slots s JOIN courses c ON c.id = s.course_id AND c.owner_id = s.owner_id
+                  WHERE s.owner_id = :ownerId AND c.deleted_at IS NULL ORDER BY s.weekday, s.start_time, s.id
                   """
                 : """
-                  SELECT id, course_id, weekday, start_time, end_time, timezone, created_at, updated_at
-                  FROM timetable_slots WHERE owner_id = :ownerId AND course_id = :courseId
-                  ORDER BY weekday, start_time, id
+                  SELECT s.id, s.course_id, s.weekday, s.start_time, s.end_time, s.timezone, s.created_at, s.updated_at
+                  FROM timetable_slots s JOIN courses c ON c.id = s.course_id AND c.owner_id = s.owner_id
+                  WHERE s.owner_id = :ownerId AND s.course_id = :courseId AND c.deleted_at IS NULL
+                  ORDER BY s.weekday, s.start_time, s.id
                   """;
         JdbcClient.StatementSpec statement = jdbc.sql(sql).param("ownerId", ownerId);
         if (courseId != null) statement.param("courseId", courseId);
@@ -83,7 +106,10 @@ class LearningDomainRepository {
                             end_time = :endTime, timezone = :timezone, updated_at = :now
                         FROM courses c
                         WHERE s.id = :slotId AND s.owner_id = :ownerId
-                          AND c.id = :courseId AND c.owner_id = :ownerId
+                          AND c.id = :courseId AND c.owner_id = :ownerId AND c.deleted_at IS NULL
+                          AND EXISTS (SELECT 1 FROM courses source
+                                      WHERE source.id = s.course_id AND source.owner_id = s.owner_id
+                                        AND source.deleted_at IS NULL)
                         RETURNING s.id, s.course_id, s.weekday, s.start_time, s.end_time,
                                   s.timezone, s.created_at, s.updated_at
                         """)
@@ -95,7 +121,11 @@ class LearningDomainRepository {
     }
 
     int deleteSlot(UUID ownerId, UUID slotId) {
-        return jdbc.sql("DELETE FROM timetable_slots WHERE id = :slotId AND owner_id = :ownerId")
+        return jdbc.sql("""
+                        DELETE FROM timetable_slots s USING courses c
+                        WHERE s.id = :slotId AND s.owner_id = :ownerId
+                          AND c.id = s.course_id AND c.owner_id = s.owner_id AND c.deleted_at IS NULL
+                        """)
                 .param("slotId", slotId).param("ownerId", ownerId).update();
     }
 
@@ -106,7 +136,7 @@ class LearningDomainRepository {
                              starts_at, ends_at, created_at, updated_at)
                         SELECT :id, :ownerId, c.id, :sessionNumber, :title, :sessionDate,
                                :startsAt, :endsAt, :now, :now
-                        FROM courses c WHERE c.id = :courseId AND c.owner_id = :ownerId
+                        FROM courses c WHERE c.id = :courseId AND c.owner_id = :ownerId AND c.deleted_at IS NULL
                         RETURNING id, course_id, session_number, title, session_date,
                                   starts_at, ends_at, created_at, updated_at
                         """)
@@ -131,9 +161,10 @@ class LearningDomainRepository {
 
     Optional<ClassSession> getSession(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
-                        SELECT id, course_id, session_number, title, session_date,
-                               starts_at, ends_at, created_at, updated_at
-                        FROM class_sessions WHERE owner_id = :ownerId AND id = :sessionId
+                        SELECT s.id, s.course_id, s.session_number, s.title, s.session_date,
+                               s.starts_at, s.ends_at, s.created_at, s.updated_at
+                        FROM class_sessions s JOIN courses c ON c.id = s.course_id AND c.owner_id = s.owner_id
+                        WHERE s.owner_id = :ownerId AND s.id = :sessionId AND c.deleted_at IS NULL
                         """)
                 .param("ownerId", ownerId).param("sessionId", sessionId)
                 .query((row, ignored) -> session(row)).optional();
@@ -152,7 +183,7 @@ class LearningDomainRepository {
         Exam exam = jdbc.sql("""
                         INSERT INTO exams (id, owner_id, course_id, title, exam_at, created_at, updated_at)
                         SELECT :id, :ownerId, c.id, :title, :examAt, :now, :now
-                        FROM courses c WHERE c.id = :courseId AND c.owner_id = :ownerId
+                        FROM courses c WHERE c.id = :courseId AND c.owner_id = :ownerId AND c.deleted_at IS NULL
                         RETURNING id, course_id, title, exam_at, created_at, updated_at
                         """)
                 .param("id", id).param("ownerId", ownerId).param("courseId", courseId)

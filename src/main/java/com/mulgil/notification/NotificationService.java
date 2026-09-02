@@ -55,10 +55,15 @@ final class NotificationService {
 
     List<NotificationView> list(UUID ownerId, boolean unreadOnly) {
         return jdbc.sql("""
-                        SELECT id,notification_type,title,body,deep_link,status,scheduled_at,sent_at
-                        FROM notifications
-                        WHERE owner_id=:owner AND (:unread=false OR read_at IS NULL)
-                        ORDER BY created_at DESC,id DESC
+                        SELECT notification.id,notification.notification_type,notification.title,notification.body,
+                               notification.deep_link,notification.status,notification.scheduled_at,notification.sent_at
+                        FROM notifications notification
+                        LEFT JOIN courses course ON course.id=notification.course_id
+                          AND course.owner_id=notification.owner_id
+                        WHERE notification.owner_id=:owner AND (:unread=false OR notification.read_at IS NULL)
+                          AND (notification.course_id IS NULL
+                               OR (course.id IS NOT NULL AND course.deleted_at IS NULL))
+                        ORDER BY notification.created_at DESC,notification.id DESC
                         """).param("owner", ownerId).param("unread", unreadOnly)
                 .query((row, ignored) -> notification(row)).list();
     }

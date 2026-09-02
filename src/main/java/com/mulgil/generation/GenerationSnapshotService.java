@@ -30,6 +30,7 @@ final class GenerationSnapshotService {
                                COALESCE(cb.material_id,cb.note_id,cb.handwriting_block_id,ts.recording_id) AS source_id,
                                COALESCE(m.version,n.version,h.input_version,r.version,1) AS input_version
                         FROM chunks c
+                        JOIN courses course ON course.id=c.course_id AND course.owner_id=c.owner_id
                         LEFT JOIN content_blocks cb ON cb.id=c.content_block_id
                         LEFT JOIN materials m ON m.id=cb.material_id
                         LEFT JOIN notes n ON n.id=cb.note_id
@@ -37,6 +38,7 @@ final class GenerationSnapshotService {
                         LEFT JOIN transcript_segments ts ON ts.id=c.transcript_segment_id
                         LEFT JOIN audio_recordings r ON r.id=ts.recording_id
                         WHERE c.owner_id=:owner AND c.course_id=:course AND c.session_id=:session
+                          AND course.deleted_at IS NULL
                           AND CASE WHEN :phase='preview' THEN
                                 m.source_phase='preview_pdf' AND m.status NOT IN ('cancelled','outdated')
                               ELSE
@@ -59,8 +61,10 @@ final class GenerationSnapshotService {
     Snapshot exam(UUID ownerId, UUID examId, boolean predicted) {
         ExamScope scope = jdbc.sql("""
                         SELECT e.course_id,min(member.session_id::text)::uuid AS session_id
-                        FROM exams e JOIN exam_session_members member ON member.exam_id=e.id
-                        WHERE e.owner_id=:owner AND e.id=:exam GROUP BY e.course_id
+                        FROM exams e
+                        JOIN courses course ON course.id=e.course_id AND course.owner_id=e.owner_id
+                        JOIN exam_session_members member ON member.exam_id=e.id
+                        WHERE e.owner_id=:owner AND e.id=:exam AND course.deleted_at IS NULL GROUP BY e.course_id
                         """).param("owner", ownerId).param("exam", examId)
                 .query((row, ignored) -> new ExamScope(row.getObject("course_id", UUID.class),
                         row.getObject("session_id", UUID.class))).optional().orElse(null);
