@@ -75,6 +75,16 @@ final class ResourceUploadController {
         return service.finalizeExamResource(CurrentUser.id(), examResourceId, request.checksumSha256());
     }
 
+    @GetMapping("/exams/{examId}/resources")
+    List<ResourceUploadService.ExamResource> examResources(@PathVariable UUID examId) {
+        return service.examResources(CurrentUser.id(), examId);
+    }
+
+    @GetMapping("/exam-resources/{examResourceId}/download-url")
+    ResourceUploadService.DownloadUrl examResourceDownloadUrl(@PathVariable UUID examResourceId) {
+        return service.examResourceDownload(CurrentUser.id(), examResourceId);
+    }
+
     @PostMapping("/recordings/upload-url")
     @ResponseStatus(HttpStatus.CREATED)
     ResourceUploadService.UploadUrl recordingUploadUrl(@Valid @RequestBody RecordingUploadRequest request) {

@@ -9,6 +9,7 @@ import com.mulgil.job.JobQueue;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Timestamp;
@@ -35,6 +36,14 @@ class AnnotationService {
         this.json = json;
         this.clock = clock;
         this.handwritingRevisions = new HandwritingRevisionUpdater(jdbc);
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    Annotation get(UUID ownerId, UUID materialId) {
+        StoredDocument document = document(ownerId, materialId, false);
+        if (document == null) throw notFound();
+        return new Annotation(new Document(document.id(), materialId, document.version()),
+                inkStrokes(document.id()), emphasisRegions(document.id()));
     }
 
     @Transactional
@@ -165,6 +174,30 @@ class AnnotationService {
                         row.getInt("version"), row.getInt("last_left_version"))).optional().orElse(null);
     }
 
+    private List<AnnotationController.InkStroke> inkStrokes(UUID documentId) {
+        return jdbc.sql("""
+                SELECT id,page_number,tool,color,width_norm,points_json::text,bbox_norm::text
+                FROM ink_strokes WHERE annotation_document_id=:id
+                ORDER BY page_number,created_at,id
+                """).param("id", documentId)
+                .query((row, ignored) -> new AnnotationController.InkStroke(
+                        row.getObject("id", UUID.class), row.getInt("page_number"),
+                        AnnotationController.Tool.valueOf(row.getString("tool")), row.getString("color"),
+                        row.getDouble("width_norm"), readPoints(row.getString("points_json")),
+                        readBox(row.getString("bbox_norm")))).list();
+    }
+
+    private List<AnnotationController.EmphasisRegion> emphasisRegions(UUID documentId) {
+        return jdbc.sql("""
+                SELECT id,page_number,bbox_norm::text,tap_count
+                FROM emphasis_regions WHERE annotation_document_id=:id
+                ORDER BY page_number,created_at,id
+                """).param("id", documentId)
+                .query((row, ignored) -> new AnnotationController.EmphasisRegion(
+                        row.getObject("id", UUID.class), row.getInt("page_number"),
+                        readBox(row.getString("bbox_norm")), row.getInt("tap_count"))).list();
+    }
+
     private Scope material(UUID ownerId, UUID materialId) {
         return jdbc.sql("SELECT course_id,session_id FROM materials WHERE owner_id=:owner AND id=:id FOR UPDATE")
                 .param("owner", ownerId).param("id", materialId)
@@ -175,6 +208,15 @@ class AnnotationService {
     private AnnotationController.Box readBox(String value) {
         try {
             return json.readValue(value, AnnotationController.Box.class);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException(exception);
+        }
+    }
+
+    private List<AnnotationController.Point> readPoints(String value) {
+        try {
+            return json.readValue(value, json.getTypeFactory()
+                    .constructCollectionType(List.class, AnnotationController.Point.class));
         } catch (JsonProcessingException exception) {
             throw new IllegalStateException(exception);
         }
@@ -214,6 +256,8 @@ class AnnotationService {
     }
 
     record Document(UUID id, UUID materialId, int version) {}
+    record Annotation(Document document, List<AnnotationController.InkStroke> inkStrokes,
+                      List<AnnotationController.EmphasisRegion> emphasisRegions) {}
     private record Scope(UUID courseId, UUID sessionId) {}
     private record StoredDocument(UUID id, UUID courseId, UUID sessionId, int version, int lastLeftVersion) {}
     private record Stroke(UUID id, int page, AnnotationController.Box box) {}

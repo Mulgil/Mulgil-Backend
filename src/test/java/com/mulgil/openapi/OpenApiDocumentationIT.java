@@ -54,11 +54,17 @@ class OpenApiDocumentationIT {
         JsonNode document = objectMapper.readTree(response.body());
         assertThat(document.at("/info/title").asText()).isEqualTo("Mulgil MVP Backend API");
         assertThat(document.at("/components/securitySchemes/bearerAuth/type").asText()).isEqualTo("http");
-        assertThat(documentedMvpOperationCount(document)).isEqualTo(44);
+        assertThat(documentedMvpOperationCount(document)).isEqualTo(47);
         assertThat(document.at("/paths/~1api~1v1~1sessions~1{sessionId}~1notes/get/summary").asText())
                 .isEqualTo("차시 노트 목록 조회");
         assertThat(document.at("/paths/~1api~1v1~1notes~1{noteId}/get/summary").asText())
                 .isEqualTo("노트 단건 조회");
+        assertThat(document.at("/paths/~1api~1v1~1materials~1{materialId}~1annotations/get/summary").asText())
+                .isEqualTo("PDF 필기 조회");
+        assertThat(document.at("/paths/~1api~1v1~1exams~1{examId}~1resources/get/summary").asText())
+                .isEqualTo("기출 자료 조회");
+        assertThat(document.at("/paths/~1api~1v1~1exam-resources~1{examResourceId}~1download-url/get/summary").asText())
+                .isEqualTo("기출 PDF 다운로드 URL 발급");
         assertThat(document.at("/paths/~1api~1v1~1sessions~1{sessionId}~1quiz/get/summary").asText()).isNotBlank();
         assertThat(document.at("/paths/~1api~1v1~1exams~1{examId}~1predicted-quiz~1generate/post/description").asText())
                 .contains("past_exam");
