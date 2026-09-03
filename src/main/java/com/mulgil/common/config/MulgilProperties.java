@@ -27,7 +27,8 @@ public record MulgilProperties(
         @Valid Uploads uploads,
         @Valid Demo demo,
         @Valid AiRates aiRates,
-        @Valid Notifications notifications
+        @Valid Notifications notifications,
+        @Valid Cors cors
 ) {
     public record Jwt(
             @NotBlank String secretBase64,
@@ -103,6 +104,14 @@ public record MulgilProperties(
     ) {
         public Notifications {
             examReminderDays = List.copyOf(examReminderDays);
+        }
+    }
+
+    public record Cors(
+            @NotEmpty List<@NotBlank String> allowedOriginPatterns
+    ) {
+        public Cors {
+            allowedOriginPatterns = List.copyOf(allowedOriginPatterns);
         }
     }
 }

@@ -1,0 +1,8 @@
+spring:
+  docker:
+    compose:
+      enabled: false
+
+mulgil:
+  cors:
+    allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:http://localhost:*,http://127.0.0.1:*}

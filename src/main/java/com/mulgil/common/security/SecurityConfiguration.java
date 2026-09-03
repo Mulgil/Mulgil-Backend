@@ -1,6 +1,7 @@
 package com.mulgil.common.security;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.common.error.ApiError;
 import jakarta.servlet.DispatcherType;
 import jakarta.servlet.http.HttpServletResponse;
@@ -11,7 +12,11 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
+import java.util.List;
 import java.util.Map;
 
 @Configuration
@@ -20,9 +25,11 @@ public class SecurityConfiguration {
     SecurityFilterChain securityFilterChain(
             HttpSecurity http,
             BearerTokenFilter bearerTokenFilter,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            CorsConfigurationSource corsConfigurationSource
     ) throws Exception {
         return http
+                .cors(cors -> cors.configurationSource(corsConfigurationSource))
                 .csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(requests -> requests
@@ -39,5 +46,18 @@ public class SecurityConfiguration {
                 }))
                 .addFilterBefore(bearerTokenFilter, UsernamePasswordAuthenticationFilter.class)
                 .build();
+    }
+
+    @Bean
+    CorsConfigurationSource corsConfigurationSource(MulgilProperties properties) {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOriginPatterns(properties.cors().allowedOriginPatterns());
+        configuration.setAllowedMethods(List.of("GET", "POST", "PATCH", "DELETE", "OPTIONS", "PUT"));
+        configuration.setAllowedHeaders(List.of("Authorization", "Content-Type", "Accept"));
+        configuration.setAllowCredentials(false);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
     }
 }

@@ -66,3 +66,5 @@ mulgil:
   notifications:
     post-class-reminder-hours: ${POST_CLASS_REMINDER_HOURS:3}
     exam-reminder-days: ${EXAM_REMINDER_DAYS:14,2,1}
+  cors:
+    allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:https://web-three-ochre-20.vercel.app,https://web-git-*-jungy2kyung-6444s-projects.vercel.app}
