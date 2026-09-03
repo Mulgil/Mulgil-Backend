@@ -23,11 +23,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Testcontainers
 @ActiveProfiles("test")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
-        "mulgil.cors.allowed-origin-patterns=https://web-three-ochre-20.vercel.app,http://localhost:*"
+        "mulgil.cors.allowed-origin-patterns=https://study.mulgil.app,http://localhost:*"
 })
 class CorsConfigurationIT {
-    private static final String ALLOWED_ORIGIN = "https://web-three-ochre-20.vercel.app";
-    private static final String BLOCKED_ORIGIN = "https://blocked.example";
+    private static final String ALLOWED_ORIGIN = "https://study.mulgil.app";
+    private static final String BLOCKED_ORIGIN = "https://web-three-ochre-20.vercel.app";
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("pgvector/pgvector:pg16")

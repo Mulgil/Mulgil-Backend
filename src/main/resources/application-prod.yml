@@ -1,3 +1,3 @@
 mulgil:
   cors:
-    allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:https://web-three-ochre-20.vercel.app,https://web-git-*-jungy2kyung-6444s-projects.vercel.app}
+    allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:https://study.mulgil.app,https://web-git-*-jungy2kyung-6444s-projects.vercel.app}
