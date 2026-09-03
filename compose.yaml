@@ -29,6 +29,7 @@ services:
         condition: service_healthy
     environment:
       SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-}
+      CORS_ALLOWED_ORIGIN_PATTERNS:
       DATABASE_URL: jdbc:postgresql://database:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
       DATABASE_USERNAME: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
