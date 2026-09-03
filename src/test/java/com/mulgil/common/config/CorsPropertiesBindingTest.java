@@ -14,7 +14,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class CorsPropertiesBindingTest {
     private static final List<String> PRODUCTION_ORIGINS = List.of(
-            "https://web-three-ochre-20.vercel.app",
+            "https://study.mulgil.app",
             "https://web-git-*-jungy2kyung-6444s-projects.vercel.app"
     );
 
