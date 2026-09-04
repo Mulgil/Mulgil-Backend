@@ -28,15 +28,18 @@ class ResourceUploadService {
     private final MulgilProperties properties;
     private final Clock clock;
     private final JobQueue jobs;
+    private final ResourceDeletionInvalidationService deletionInvalidations;
 
     ResourceUploadService(ResourceRepository repository, ResourceFinalizationService finalization,
-                          CloudStoragePort storage, MulgilProperties properties, Clock clock, JobQueue jobs) {
+                          CloudStoragePort storage, MulgilProperties properties, Clock clock, JobQueue jobs,
+                          ResourceDeletionInvalidationService deletionInvalidations) {
         this.repository = repository;
         this.finalization = finalization;
         this.storage = storage;
         this.properties = properties;
         this.clock = clock;
         this.jobs = jobs;
+        this.deletionInvalidations = deletionInvalidations;
     }
 
     @Transactional
@@ -95,27 +98,52 @@ class ResourceUploadService {
     }
 
     @Transactional
+    void deleteMaterial(UUID ownerId, UUID materialId) {
+        ResourceRepository.Material material = repository.material(ownerId, materialId)
+                .orElseThrow(ResourceUploadService::notFound);
+        Instant now = clock.instant();
+        repository.lockSession(ownerId, material.sessionId()).orElseThrow(ResourceUploadService::notFound);
+        deletionInvalidations.stopMaterialJobs(ownerId, material, now);
+        material = repository.materialForUpdate(ownerId, materialId).orElseThrow(ResourceUploadService::notFound);
+        deletionInvalidations.invalidateMaterialGeneration(ownerId, material, now);
+        repository.scheduleObjectDeletion(material.objectKey(), materialDeletionNotBefore(material, now), now);
+        if (!repository.deleteMaterial(ownerId, materialId)) throw notFound();
+    }
+
+    @Transactional
     UploadUrl issueExamResourceUpload(UUID ownerId, UUID examId, PdfUpload request) {
         validatePdf(request.mimeType(), request.byteSize());
         if (!repository.lockExam(ownerId, examId)) throw notFound();
         UUID id = UUID.randomUUID();
         String key = "owner/%s/exam/%s/resource/%s/source.pdf".formatted(ownerId, examId, id);
+        Instant now = clock.instant();
+        Instant expiry = expiresAt(now);
         ResourceRepository.ExamResource resource = repository.createExamResource(ownerId, id,
                 new ResourceRepository.ExamResourceWrite(examId, request.filename(), request.mimeType(),
-                        request.byteSize(), key), clock.instant());
+                        request.byteSize(), key), expiry, now);
         if (resource == null) throw notFound();
-        return uploadUrl(resource.id(), resource.objectKey(), resource.mimeType(), resource.byteSize());
+        return uploadUrl(resource.id(), resource.objectKey(), resource.mimeType(), resource.byteSize(), expiry);
     }
 
     @Transactional
     ExamResource finalizeExamResource(UUID ownerId, UUID resourceId, String checksum) {
-        ResourceRepository.ExamResource resource = repository.examResource(ownerId, resourceId)
+        Instant now = clock.instant();
+        ResourceRepository.ExamResource resource = repository.examResourceForUpdate(ownerId, resourceId)
                 .orElseThrow(ResourceUploadService::notFound);
+        if (!"created".equals(resource.status())) {
+            if (resource.uploadExpiresAt() != null && !resource.uploadExpiresAt().isAfter(now)) {
+                throw uploadExpired();
+            }
+            throw notFound();
+        }
+        if (resource.uploadExpiresAt() == null || !resource.uploadExpiresAt().isAfter(now)) {
+            throw uploadExpired();
+        }
         ResourceContentProbe.PdfInspection inspection = finalization.finalizePdf(
                 descriptor(resource.objectKey(), resource.mimeType(), resource.byteSize()), checksum);
         validatePages(inspection.pageCount());
         ExamResource completed = examResource(repository.finalizeExamResource(ownerId, resourceId,
-                inspection.pageCount(), checksum.toLowerCase(), clock.instant()));
+                inspection.pageCount(), checksum.toLowerCase(), now).orElseThrow(ResourceUploadService::uploadExpired));
         jobs.enqueuePdfExamResource(ownerId, resourceId);
         return completed;
     }
@@ -132,6 +160,19 @@ class ResourceUploadService {
                 .orElseThrow(ResourceUploadService::notFound);
         Instant expiry = expiresAt();
         return new DownloadUrl(storage.createDownloadUrl(resource.objectKey(), expiry), expiry);
+    }
+
+    @Transactional
+    void deleteExamResource(UUID ownerId, UUID resourceId) {
+        ResourceRepository.ExamResource resource = repository.examResource(ownerId, resourceId)
+                .orElseThrow(ResourceUploadService::notFound);
+        Instant now = clock.instant();
+        repository.lockExamSessions(ownerId, resource.examId());
+        deletionInvalidations.stopExamResourceJobs(ownerId, resource, now);
+        resource = repository.examResourceForUpdate(ownerId, resourceId).orElseThrow(ResourceUploadService::notFound);
+        deletionInvalidations.invalidateExamResourceGeneration(ownerId, resource, now);
+        repository.scheduleObjectDeletion(resource.objectKey(), examResourceDeletionNotBefore(resource, now), now);
+        if (!repository.deleteExamResource(ownerId, resourceId)) throw notFound();
     }
 
     UploadUrl issueRecordingUpload(UUID ownerId, RecordingUpload request) {
@@ -190,6 +231,18 @@ class ResourceUploadService {
 
     private Instant expiresAt(Instant now) {
         return now.plusSeconds(properties.gcs().signedUrlTtlSeconds()).truncatedTo(ChronoUnit.SECONDS);
+    }
+
+    private static Instant materialDeletionNotBefore(ResourceRepository.Material material, Instant now) {
+        Instant expiry = material.uploadExpiresAt();
+        return "created".equals(material.status()) && expiry != null && expiry.isAfter(now) ? expiry : now;
+    }
+
+    private Instant examResourceDeletionNotBefore(ResourceRepository.ExamResource resource, Instant now) {
+        if (!"created".equals(resource.status())) return now;
+        Instant expiry = resource.uploadExpiresAt();
+        if (expiry != null) return expiry.isAfter(now) ? expiry : now;
+        return now.plusSeconds(properties.gcs().signedUrlTtlSeconds());
     }
 
     private void validatePdf(String mimeType, long byteSize) {

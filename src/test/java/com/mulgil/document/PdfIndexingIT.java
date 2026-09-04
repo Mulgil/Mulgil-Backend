@@ -363,6 +363,7 @@ class PdfIndexingIT {
             return URI.create("https://storage.invalid/download");
         }
         @Override public StoredObjectMetadata metadata(String key) { return null; }
+        @Override public void delete(String key) { objects.remove(key); }
         @Override public byte[] read(String key) { return objects.get(key).clone(); }
     }
 

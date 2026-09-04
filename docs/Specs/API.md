@@ -164,6 +164,9 @@ Google ID token을 서버에서 issuer, audience, expiry, subject까지 검증�
 | `POST /courses/{courseId}/exams` | `ExamCreateRequest` | `201 Exam` | `404`, `422` |
 | `POST /exams/{examId}/resources` | `ExamResourceUploadRequest` | `201 UploadUrl` | `404`, `415`, `422` |
 | `POST /exam-resources/{examResourceId}/upload-complete` | `UploadCompleteRequest` | `200 ExamResource` | `404`, `415`, `422` |
+| `GET /exams/{examId}/resources` | 없음 | `200 ExamResource[]` | `404` |
+| `GET /exam-resources/{examResourceId}/download-url` | 없음 | `200 DownloadUrl` | `404` |
+| `DELETE /exam-resources/{examResourceId}` | 없음 | `204` | `404` |
 
 ```json
 {
@@ -206,6 +209,7 @@ Google ID token을 서버에서 issuer, audience, expiry, subject까지 검증�
 | `POST /materials/{materialId}/upload-complete` | `UploadCompleteRequest` | `202 JobAccepted` | `404`, `415`, `422` |
 | `GET /sessions/{sessionId}/materials` | 없음 | `200 Material[]` | `404` |
 | `GET /materials/{materialId}/download-url` | 없음 | `200 DownloadUrl` | `404` |
+| `DELETE /materials/{materialId}` | 없음 | `204` | `404` |
 
 `MaterialUploadRequest`:
 
@@ -216,7 +220,7 @@ Google ID token을 서버에서 issuer, audience, expiry, subject까지 검증�
 | `byteSize` | integer | Yes | 1~52,428,800 (50 MB) |
 | `sourcePhase` | enum | Yes | `preview_pdf` 또는 `review_pdf` |
 
-`Material`은 `{ id, sessionId, filename, mimeType, byteSize, pageCount, sourcePhase, version, status }`다. `pageCount`는 최대 150, session당 PDF는 최대 5개다. 업로드 URL이 만료된 `created` 예약은 제한에서 제외되며 완료 요청에는 `410 UPLOAD_URL_EXPIRED`를 반환한다. raw object key는 절대 반환하지 않는다. `DownloadUrl`은 `{ downloadUrl, expiresAt }`다.
+`Material`은 `{ id, sessionId, filename, mimeType, byteSize, pageCount, sourcePhase, version, status }`다. `pageCount`는 최대 150, session당 PDF는 최대 5개다. 업로드 URL이 만료된 `created` 예약은 제한에서 제외되며 완료 요청에는 `410 UPLOAD_URL_EXPIRED`를 반환한다. 삭제는 소유자에게만 `204`를 반환하고, 자료 행과 연관 데이터는 즉시 제거한다. 원본 GCS 객체는 signed URL 만료를 고려해 비동기로 정리한다. raw object key는 절대 반환하지 않는다. `DownloadUrl`은 `{ downloadUrl, expiresAt }`다.
 
 ## 5. typed note와 PDF annotation
 

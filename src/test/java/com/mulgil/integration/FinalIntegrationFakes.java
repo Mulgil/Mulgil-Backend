@@ -50,6 +50,7 @@ public class FinalIntegrationFakes {
             return value == null ? null : new StoredObjectMetadata(key.endsWith(".m4a") ? "audio/m4a" : "application/pdf",
                     value.length, hash(value));
         }
+        @Override public void delete(String key) { calls.incrementAndGet(); objects.remove(key); }
         @Override public byte[] read(String key) { calls.incrementAndGet(); return objects.get(key); }
         public void putLast(byte[] value) { objects.put(lastKey, value); }
         public String lastKey() { return lastKey; }

@@ -53,7 +53,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV014_whenDatabaseIsFresh() {
+    void appliesV001ThroughV016_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -62,7 +62,8 @@ class FlywaySchemaIT {
                             'annotation_documents', 'ink_strokes', 'emphasis_regions', 'handwriting_blocks',
                             'document_pages', 'content_blocks', 'transcript_segments', 'chunks', 'summaries',
                             'mindmaps', 'quiz_questions', 'quiz_attempts', 'progress_status', 'ai_jobs',
-                            'device_tokens', 'notifications', 'speech_input_cleanups', 'ai_provider_usage')
+                            'device_tokens', 'notifications', 'speech_input_cleanups', 'ai_provider_usage',
+                            'resource_object_deletions')
                         """).query(Integer.class).single();
         List<String> requiredIndexes = jdbc.sql("""
                         SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname IN (
@@ -71,7 +72,8 @@ class FlywaySchemaIT {
                             'ai_jobs_expired_running_idx', 'notifications_scheduled_idx',
                             'speech_input_cleanups_due_idx', 'speech_input_cleanups_owner_idx',
                             'ai_jobs_active_cache_fingerprint_uidx', 'ai_provider_usage_job_idx',
-                            'materials_pending_upload_expiry_idx') ORDER BY indexname
+                            'materials_pending_upload_expiry_idx', 'exam_resources_pending_upload_expiry_idx',
+                            'resource_object_deletions_due_idx') ORDER BY indexname
                         """).query(String.class).list();
         Integer jobColumns = jdbc.sql("""
                         SELECT count(*) FROM information_schema.columns
@@ -88,18 +90,28 @@ class FlywaySchemaIT {
                           AND column_name IN ('material_id', 'exam_resource_id')
                           AND is_nullable = 'YES'
                         """).query(Integer.class).single();
+        Integer examResourceUploadExpiryColumns = jdbc.sql("""
+                        SELECT count(*) FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'exam_resources'
+                          AND column_name = 'upload_expires_at' AND data_type = 'timestamp with time zone'
+                        """).query(Integer.class).single();
         Integer requiredConstraints = jdbc.sql("""
-                        SELECT count(*) FROM pg_constraint WHERE conname IN (
+                        SELECT count(*) FROM pg_constraint
+                        WHERE connamespace = 'public'::regnamespace AND conname IN (
                             'exam_session_members_pkey', 'document_pages_exactly_one_parent',
                             'content_blocks_exactly_one_source', 'chunks_exactly_one_source',
                             'ai_jobs_source_parent_check', 'ai_jobs_idempotency_key_key',
                             'quiz_attempts_exactly_one_scope', 'progress_status_exactly_one_scope',
                             'quiz_attempts_session_question_fkey', 'quiz_attempts_exam_question_fkey',
                             'progress_status_session_question_fkey', 'progress_status_exam_question_fkey',
-                            'materials_created_upload_expiry_check')
+                            'materials_created_upload_expiry_check', 'exam_resources_created_upload_expiry_check')
                         """).query(Integer.class).single();
         Integer requiredTriggers = jdbc.sql("""
-                        SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN (
+                        SELECT count(*) FROM pg_trigger trigger
+                        JOIN pg_class relation ON relation.oid = trigger.tgrelid
+                        WHERE NOT trigger.tgisinternal
+                          AND relation.relnamespace = 'public'::regnamespace
+                          AND trigger.tgname IN (
                             'document_pages_exam_session_check', 'content_blocks_source_check',
                             'content_blocks_exam_session_check', 'ai_jobs_exam_session_check',
                             'exam_session_members_dependents_cleanup',
@@ -108,12 +120,13 @@ class FlywaySchemaIT {
                             'ai_jobs_cache_fingerprint_default')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014");
-        assertThat(requiredTables).isEqualTo(18);
-        assertThat(requiredIndexes).hasSize(11);
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015", "016");
+        assertThat(requiredTables).isEqualTo(19);
+        assertThat(requiredIndexes).hasSize(13);
         assertThat(jobColumns).isEqualTo(7);
         assertThat(nullableSourceParents).isEqualTo(4);
-        assertThat(requiredConstraints).isEqualTo(13);
+        assertThat(examResourceUploadExpiryColumns).isOne();
+        assertThat(requiredConstraints).isEqualTo(14);
         assertThat(requiredTriggers).isEqualTo(9);
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
                         + "jobColumns=%d nullablePageBlockParents=%d result=PASS%n", versions, requiredTables,
@@ -140,6 +153,30 @@ class FlywaySchemaIT {
                 .param("id", oldFixture.materialId()).query(String.class).single()).isEqualTo("cancelled");
         assertThat(upgrade.sql("SELECT upload_expires_at IS NULL FROM materials WHERE id=:id")
                 .param("id", oldFixture.materialId()).query(Boolean.class).single()).isTrue();
+    }
+
+    @Test
+    void upgradesLegacyCreatedExamResources_toCancelledUploadReservations() {
+        String schema = "exam_resource_upload_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        String url = POSTGRES.getJdbcUrl() + "&currentSchema=" + schema + ",public";
+        Flyway throughV015 = Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).target(MigrationVersion.fromVersion("015")).load();
+        throughV015.migrate();
+        JdbcClient upgrade = JdbcClient.create(new DriverManagerDataSource(
+                url, POSTGRES.getUsername(), POSTGRES.getPassword()));
+        SchemaFixture oldFixture = new SchemaFixture(upgrade);
+        upgrade.sql("UPDATE exam_resources SET status='created' WHERE id=:id")
+                .param("id", oldFixture.examResourceId()).update();
+
+        Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).load().migrate();
+
+        assertThat(upgrade.sql("SELECT status FROM exam_resources WHERE id=:id")
+                .param("id", oldFixture.examResourceId()).query(String.class).single()).isEqualTo("cancelled");
+        assertThat(upgrade.sql("SELECT upload_expires_at IS NULL FROM exam_resources WHERE id=:id")
+                .param("id", oldFixture.examResourceId()).query(Boolean.class).single()).isTrue();
+        assertThatThrownBy(() -> upgrade.sql("UPDATE exam_resources SET status='created' WHERE id=:id")
+                .param("id", oldFixture.examResourceId()).update()).isInstanceOf(DataIntegrityViolationException.class);
     }
 
     @Test
