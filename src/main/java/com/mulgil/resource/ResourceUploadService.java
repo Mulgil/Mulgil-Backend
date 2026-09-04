@@ -12,6 +12,7 @@ import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -188,7 +189,7 @@ class ResourceUploadService {
     }
 
     private Instant expiresAt(Instant now) {
-        return now.plusSeconds(properties.gcs().signedUrlTtlSeconds());
+        return now.plusSeconds(properties.gcs().signedUrlTtlSeconds()).truncatedTo(ChronoUnit.SECONDS);
     }
 
     private void validatePdf(String mimeType, long byteSize) {

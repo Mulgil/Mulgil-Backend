@@ -64,6 +64,9 @@ class ResourceUploadApiIT {
     JdbcClient jdbc;
 
     @Autowired
+    MaterialUploadCleanupScheduler scheduler;
+
+    @Autowired
     FakeCloudStorage storage;
 
     @Autowired
@@ -267,19 +270,29 @@ class ResourceUploadApiIT {
     }
 
     @Test
-    void releasesExpiredMaterialReservations_beforeCheckingSessionLimit() throws Exception {
+    void cleanupScheduler_cancelsOnlyExpiredReservations_andReleasesUploadCapacity() throws Exception {
         String owner = login("expired-reservation-owner");
         DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
 
+        List<String> materialIds = new ArrayList<>();
         for (int index = 0; index < 5; index++) {
-            successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url", owner,
+            materialIds.add(successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url", owner,
                     Map.of("filename", "abandoned-" + index + ".pdf", "mimeType", "application/pdf",
-                            "byteSize", 100 + index, "sourcePhase", "preview_pdf")), 201);
+                            "byteSize", 100 + index, "sourcePhase", "preview_pdf")), 201).path("id").asText());
         }
         jdbc.sql("""
                         UPDATE materials SET upload_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second'
-                        WHERE session_id = :session AND status = 'created'
-                        """).param("session", java.util.UUID.fromString(ids.sessionId())).update();
+                        WHERE id = :id AND status = 'created'
+                        """).param("id", java.util.UUID.fromString(materialIds.getFirst())).update();
+
+        scheduler.cleanupExpired();
+
+        assertThat(jdbc.sql("SELECT status FROM materials WHERE id=:id")
+                .param("id", java.util.UUID.fromString(materialIds.getFirst()))
+                .query(String.class).single()).isEqualTo("cancelled");
+        assertThat(jdbc.sql("SELECT count(*) FROM materials WHERE session_id=:session AND status='created'")
+                .param("session", java.util.UUID.fromString(ids.sessionId()))
+                .query(Integer.class).single()).isEqualTo(4);
 
         JsonNode replacement = successful(post(
                 "/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url", owner,
@@ -289,11 +302,26 @@ class ResourceUploadApiIT {
         assertThat(replacement.path("expiresAt").asText()).isNotBlank();
         assertThat(jdbc.sql("SELECT count(*) FROM materials WHERE session_id=:session AND status='cancelled'")
                 .param("session", java.util.UUID.fromString(ids.sessionId()))
-                .query(Integer.class).single()).isEqualTo(5);
+                .query(Integer.class).single()).isOne();
         assertThat(jdbc.sql("SELECT count(*) FROM materials WHERE session_id=:session AND status='created'")
                 .param("session", java.util.UUID.fromString(ids.sessionId()))
-                .query(Integer.class).single()).isOne();
-        recordHttp("expiredMaterialReservations", "201", "expired-released;replacement-created");
+                .query(Integer.class).single()).isEqualTo(5);
+        recordHttp("expiredMaterialReservations", "201", "scheduler-cancelled-expired-only;replacement-created");
+    }
+
+    @Test
+    void issuesUploadExpiry_withGcsSecondPrecision() throws Exception {
+        String owner = login("upload-expiry-precision-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+
+        JsonNode upload = successful(post(
+                "/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url", owner,
+                Map.of("filename", "precision.pdf", "mimeType", "application/pdf",
+                        "byteSize", 100, "sourcePhase", "preview_pdf")), 201);
+        Instant expiresAt = Instant.parse(upload.path("expiresAt").asText());
+
+        assertThat(expiresAt.getNano()).isZero();
+        assertThat(storage.lastUploadExpiry).isEqualTo(expiresAt);
     }
 
     @Test
@@ -514,10 +542,12 @@ class ResourceUploadApiIT {
     static final class FakeCloudStorage implements CloudStoragePort {
         private final List<String> issuedKeys = new ArrayList<>();
         private final Map<String, StoredObjectMetadata> objects = new HashMap<>();
+        private Instant lastUploadExpiry;
 
         @Override
         public URI createUploadUrl(String objectKey, String contentType, long contentLength, Instant expiresAt) {
             issuedKeys.add(objectKey);
+            lastUploadExpiry = expiresAt;
             return URI.create("https://storage.test/upload/" + resourceId(objectKey));
         }
 
@@ -542,6 +572,7 @@ class ResourceUploadApiIT {
         void reset() {
             issuedKeys.clear();
             objects.clear();
+            lastUploadExpiry = null;
         }
 
         private static String resourceId(String objectKey) {
