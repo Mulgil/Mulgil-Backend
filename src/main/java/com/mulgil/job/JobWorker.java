@@ -2,6 +2,8 @@ package com.mulgil.job;
 
 import com.mulgil.common.config.MulgilProperties;
 import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.EnableScheduling;
@@ -21,6 +23,7 @@ import java.util.stream.Collectors;
 @EnableScheduling
 @Profile("!test")
 class JobWorker {
+    private static final Logger log = LoggerFactory.getLogger(JobWorker.class);
     private final JobQueue queue;
     private final Map<String, JobHandler> handlers;
     private final long heartbeatPeriodMillis;
@@ -48,6 +51,7 @@ class JobWorker {
         } catch (JobHandler.JobExecutionException exception) {
             queue.fail(job, exception.code(), exception.getMessage(), exception.retryable());
         } catch (RuntimeException exception) {
+            log.error("Job handler failed. jobId={} type={}", job.id(), job.type(), exception);
             queue.fail(job, "JOB_HANDLER_FAILED", "Job handler failed.", false);
         } finally {
             heartbeat.cancel(false);
