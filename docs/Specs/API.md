@@ -215,7 +215,7 @@ Google ID token을 서버에서 issuer, audience, expiry, subject까지 검증�
 | `byteSize` | integer | Yes | 1~52,428,800 (50 MB) |
 | `sourcePhase` | enum | Yes | `preview_pdf` 또는 `review_pdf` |
 
-`Material`은 `{ id, sessionId, filename, mimeType, byteSize, pageCount, sourcePhase, version, status }`다. `pageCount`는 최대 150, session당 PDF는 최대 5개다. raw object key는 절대 반환하지 않는다. `DownloadUrl`은 `{ downloadUrl, expiresAt }`다.
+`Material`은 `{ id, sessionId, filename, mimeType, byteSize, pageCount, sourcePhase, version, status }`다. `pageCount`는 최대 150, session당 PDF는 최대 5개다. 업로드 URL이 만료된 `created` 예약은 제한에서 제외되며 완료 요청에는 `410 UPLOAD_URL_EXPIRED`를 반환한다. raw object key는 절대 반환하지 않는다. `DownloadUrl`은 `{ downloadUrl, expiresAt }`다.
 
 ## 5. typed note와 PDF annotation
 

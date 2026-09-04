@@ -267,6 +267,57 @@ class ResourceUploadApiIT {
     }
 
     @Test
+    void releasesExpiredMaterialReservations_beforeCheckingSessionLimit() throws Exception {
+        String owner = login("expired-reservation-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+
+        for (int index = 0; index < 5; index++) {
+            successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url", owner,
+                    Map.of("filename", "abandoned-" + index + ".pdf", "mimeType", "application/pdf",
+                            "byteSize", 100 + index, "sourcePhase", "preview_pdf")), 201);
+        }
+        jdbc.sql("""
+                        UPDATE materials SET upload_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second'
+                        WHERE session_id = :session AND status = 'created'
+                        """).param("session", java.util.UUID.fromString(ids.sessionId())).update();
+
+        JsonNode replacement = successful(post(
+                "/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url", owner,
+                Map.of("filename", "replacement.pdf", "mimeType", "application/pdf",
+                        "byteSize", 200, "sourcePhase", "review_pdf")), 201);
+
+        assertThat(replacement.path("expiresAt").asText()).isNotBlank();
+        assertThat(jdbc.sql("SELECT count(*) FROM materials WHERE session_id=:session AND status='cancelled'")
+                .param("session", java.util.UUID.fromString(ids.sessionId()))
+                .query(Integer.class).single()).isEqualTo(5);
+        assertThat(jdbc.sql("SELECT count(*) FROM materials WHERE session_id=:session AND status='created'")
+                .param("session", java.util.UUID.fromString(ids.sessionId()))
+                .query(Integer.class).single()).isOne();
+        recordHttp("expiredMaterialReservations", "201", "expired-released;replacement-created");
+    }
+
+    @Test
+    void rejectsMaterialCompletion_whenUploadReservationExpired() throws Exception {
+        String owner = login("expired-completion-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        String materialId = successful(post(
+                "/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url", owner,
+                Map.of("filename", "expired.pdf", "mimeType", "application/pdf",
+                        "byteSize", 100, "sourcePhase", "preview_pdf")), 201).path("id").asText();
+        jdbc.sql("UPDATE materials SET upload_expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second' WHERE id=:id")
+                .param("id", java.util.UUID.fromString(materialId)).update();
+        storage.directPut(materialId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(materialId, 1, PDF_CHECKSUM);
+
+        assertError(post("/api/v1/materials/" + materialId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 410, "UPLOAD_URL_EXPIRED");
+        assertThat(jdbc.sql("SELECT status FROM materials WHERE id=:id")
+                .param("id", java.util.UUID.fromString(materialId))
+                .query(String.class).single()).isIn("created", "cancelled");
+        recordHttp("expiredMaterialCompletion", "410", "expired-upload-rejected");
+    }
+
+    @Test
     void hidesOwnedResources_whenAnotherUserRequestsThem() throws Exception {
         String owner = login("ownership-a");
         String foreign = login("ownership-b");
