@@ -72,7 +72,8 @@ class FlywaySchemaIT {
                             'ai_jobs_expired_running_idx', 'notifications_scheduled_idx',
                             'speech_input_cleanups_due_idx', 'speech_input_cleanups_owner_idx',
                             'ai_jobs_active_cache_fingerprint_uidx', 'ai_provider_usage_job_idx',
-                            'materials_pending_upload_expiry_idx', 'resource_object_deletions_due_idx') ORDER BY indexname
+                            'materials_pending_upload_expiry_idx', 'exam_resources_pending_upload_expiry_idx',
+                            'resource_object_deletions_due_idx') ORDER BY indexname
                         """).query(String.class).list();
         Integer jobColumns = jdbc.sql("""
                         SELECT count(*) FROM information_schema.columns
@@ -103,7 +104,7 @@ class FlywaySchemaIT {
                             'quiz_attempts_exactly_one_scope', 'progress_status_exactly_one_scope',
                             'quiz_attempts_session_question_fkey', 'quiz_attempts_exam_question_fkey',
                             'progress_status_session_question_fkey', 'progress_status_exam_question_fkey',
-                            'materials_created_upload_expiry_check')
+                            'materials_created_upload_expiry_check', 'exam_resources_created_upload_expiry_check')
                         """).query(Integer.class).single();
         Integer requiredTriggers = jdbc.sql("""
                         SELECT count(*) FROM pg_trigger trigger
@@ -121,11 +122,11 @@ class FlywaySchemaIT {
 
         assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015", "016");
         assertThat(requiredTables).isEqualTo(19);
-        assertThat(requiredIndexes).hasSize(12);
+        assertThat(requiredIndexes).hasSize(13);
         assertThat(jobColumns).isEqualTo(7);
         assertThat(nullableSourceParents).isEqualTo(4);
         assertThat(examResourceUploadExpiryColumns).isOne();
-        assertThat(requiredConstraints).isEqualTo(13);
+        assertThat(requiredConstraints).isEqualTo(14);
         assertThat(requiredTriggers).isEqualTo(9);
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
                         + "jobColumns=%d nullablePageBlockParents=%d result=PASS%n", versions, requiredTables,
@@ -152,6 +153,30 @@ class FlywaySchemaIT {
                 .param("id", oldFixture.materialId()).query(String.class).single()).isEqualTo("cancelled");
         assertThat(upgrade.sql("SELECT upload_expires_at IS NULL FROM materials WHERE id=:id")
                 .param("id", oldFixture.materialId()).query(Boolean.class).single()).isTrue();
+    }
+
+    @Test
+    void upgradesLegacyCreatedExamResources_toCancelledUploadReservations() {
+        String schema = "exam_resource_upload_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        String url = POSTGRES.getJdbcUrl() + "&currentSchema=" + schema + ",public";
+        Flyway throughV015 = Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).target(MigrationVersion.fromVersion("015")).load();
+        throughV015.migrate();
+        JdbcClient upgrade = JdbcClient.create(new DriverManagerDataSource(
+                url, POSTGRES.getUsername(), POSTGRES.getPassword()));
+        SchemaFixture oldFixture = new SchemaFixture(upgrade);
+        upgrade.sql("UPDATE exam_resources SET status='created' WHERE id=:id")
+                .param("id", oldFixture.examResourceId()).update();
+
+        Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).load().migrate();
+
+        assertThat(upgrade.sql("SELECT status FROM exam_resources WHERE id=:id")
+                .param("id", oldFixture.examResourceId()).query(String.class).single()).isEqualTo("cancelled");
+        assertThat(upgrade.sql("SELECT upload_expires_at IS NULL FROM exam_resources WHERE id=:id")
+                .param("id", oldFixture.examResourceId()).query(Boolean.class).single()).isTrue();
+        assertThatThrownBy(() -> upgrade.sql("UPDATE exam_resources SET status='created' WHERE id=:id")
+                .param("id", oldFixture.examResourceId()).update()).isInstanceOf(DataIntegrityViolationException.class);
     }
 
     @Test
