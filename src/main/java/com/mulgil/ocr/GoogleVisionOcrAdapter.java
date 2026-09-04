@@ -60,7 +60,8 @@ final class GoogleVisionOcrAdapter implements VisionOcrPort {
         try {
             batch = client.batchAnnotateImages(List.of(request));
         } catch (ApiException exception) {
-            throw providerFailure(Code.valueOf(exception.getStatusCode().getCode().name()), exception.isRetryable());
+            throw providerFailure(Code.valueOf(exception.getStatusCode().getCode().name()), exception.isRetryable(),
+                    exception.getReason());
         }
         if (batch.getResponsesCount() != 1) {
             throw new OcrProviderException("OCR_INVALID_RESPONSE", "Vision returned an invalid response.", false);
@@ -68,7 +69,7 @@ final class GoogleVisionOcrAdapter implements VisionOcrPort {
         AnnotateImageResponse response = batch.getResponses(0);
         if (response.hasError()) {
             Code code = Code.forNumber(response.getError().getCode());
-            throw providerFailure(code, retryable(code));
+            throw providerFailure(code, retryable(code), null);
         }
         List<OcrBlock> blocks = new ArrayList<>();
         response.getFullTextAnnotation().getPagesList().forEach(page -> page.getBlocksList().forEach(block -> {
@@ -135,8 +136,15 @@ final class GoogleVisionOcrAdapter implements VisionOcrPort {
         }
     }
 
-    private static OcrProviderException providerFailure(Code code, boolean retryable) {
+    private static OcrProviderException providerFailure(Code code, boolean retryable, String reason) {
         if (code == Code.INVALID_ARGUMENT) return invalidImage();
+        if ("SERVICE_DISABLED".equals(reason)) {
+            return new OcrProviderException("PROVIDER_API_DISABLED", "Cloud Vision API is disabled.", false);
+        }
+        if (code == Code.PERMISSION_DENIED) {
+            return new OcrProviderException("PROVIDER_AUTHENTICATION_FAILED",
+                    "Vision authentication or access failed.", false);
+        }
         if (code == Code.DEADLINE_EXCEEDED) {
             return new OcrProviderException("PROVIDER_TIMEOUT", "Vision request timed out.", true);
         }
