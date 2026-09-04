@@ -99,7 +99,10 @@ class ResourceUploadApiIT {
         assertThat(materialJob.path("status").asText()).isEqualTo("queued");
         JsonNode polled = successful(get("/api/v1/jobs/" + materialJob.path("jobId").asText(), owner), 200);
         assertThat(polled.path("type").asText()).isEqualTo("pdf_extract");
-        assertThat(successful(get("/api/v1/sessions/" + ids.sessionId() + "/jobs", owner), 200)).hasSize(1);
+        assertThat(polled.path("materialId").asText()).isEqualTo(materialId);
+        JsonNode sessionJobs = successful(get("/api/v1/sessions/" + ids.sessionId() + "/jobs", owner), 200);
+        assertThat(sessionJobs).hasSize(1);
+        assertThat(sessionJobs.get(0).path("materialId").asText()).isEqualTo(materialId);
         assertError(get("/api/v1/jobs/" + materialJob.path("jobId").asText(), login("job-foreigner")),
                 404, "JOB_NOT_FOUND");
         JsonNode materials = successful(get("/api/v1/sessions/" + ids.sessionId() + "/materials", owner), 200);
