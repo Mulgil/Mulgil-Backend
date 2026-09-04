@@ -46,6 +46,7 @@
 | `409` | `STALE_VERSION` | `expectedVersion`/`changedVersion`이 최신 version과 다름 |
 | `409` | `INSUFFICIENT_SOURCE_DATA` | 최신 scope에 생성 가능한 유효 source가 없음 |
 | `409` | `JOB_NOT_RETRYABLE` | retry 대상이 아니거나 retry 한도를 모두 사용함 |
+| `410` | `UPLOAD_URL_EXPIRED` | 업로드 URL이 만료되어 완료 처리할 수 없음. 새 업로드 URL을 발급받아 다시 업로드해야 함 |
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | 허용되지 않은 파일 MIME type |
 | `422` | `VALIDATION_FAILED` | request field 또는 도메인 validation 실패 |
 | `422` | `UPLOAD_LIMIT_EXCEEDED` | PDF/오디오 개별·차시 한도 초과 |
