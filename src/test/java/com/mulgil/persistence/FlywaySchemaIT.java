@@ -53,7 +53,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV013_whenDatabaseIsFresh() {
+    void appliesV001ThroughV014_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -70,7 +70,8 @@ class FlywaySchemaIT {
                             'chunks_embedding_hnsw_idx', 'ai_jobs_queued_claim_idx',
                             'ai_jobs_expired_running_idx', 'notifications_scheduled_idx',
                             'speech_input_cleanups_due_idx', 'speech_input_cleanups_owner_idx',
-                            'ai_jobs_active_cache_fingerprint_uidx', 'ai_provider_usage_job_idx') ORDER BY indexname
+                            'ai_jobs_active_cache_fingerprint_uidx', 'ai_provider_usage_job_idx',
+                            'materials_pending_upload_expiry_idx') ORDER BY indexname
                         """).query(String.class).list();
         Integer jobColumns = jdbc.sql("""
                         SELECT count(*) FROM information_schema.columns
@@ -94,7 +95,8 @@ class FlywaySchemaIT {
                             'ai_jobs_source_parent_check', 'ai_jobs_idempotency_key_key',
                             'quiz_attempts_exactly_one_scope', 'progress_status_exactly_one_scope',
                             'quiz_attempts_session_question_fkey', 'quiz_attempts_exam_question_fkey',
-                            'progress_status_session_question_fkey', 'progress_status_exam_question_fkey')
+                            'progress_status_session_question_fkey', 'progress_status_exam_question_fkey',
+                            'materials_created_upload_expiry_check')
                         """).query(Integer.class).single();
         Integer requiredTriggers = jdbc.sql("""
                         SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN (
@@ -106,16 +108,38 @@ class FlywaySchemaIT {
                             'ai_jobs_cache_fingerprint_default')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013");
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014");
         assertThat(requiredTables).isEqualTo(18);
-        assertThat(requiredIndexes).hasSize(10);
+        assertThat(requiredIndexes).hasSize(11);
         assertThat(jobColumns).isEqualTo(7);
         assertThat(nullableSourceParents).isEqualTo(4);
-        assertThat(requiredConstraints).isEqualTo(12);
+        assertThat(requiredConstraints).isEqualTo(13);
         assertThat(requiredTriggers).isEqualTo(9);
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
                         + "jobColumns=%d nullablePageBlockParents=%d result=PASS%n", versions, requiredTables,
                 requiredIndexes.size(), requiredConstraints, requiredTriggers, jobColumns, nullableSourceParents);
+    }
+
+    @Test
+    void upgradesLegacyCreatedMaterials_toCancelledUploadReservations() {
+        String schema = "material_upload_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        String url = POSTGRES.getJdbcUrl() + "&currentSchema=" + schema + ",public";
+        Flyway throughV013 = Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).target(MigrationVersion.fromVersion("013")).load();
+        throughV013.migrate();
+        JdbcClient upgrade = JdbcClient.create(new DriverManagerDataSource(
+                url, POSTGRES.getUsername(), POSTGRES.getPassword()));
+        SchemaFixture oldFixture = new SchemaFixture(upgrade);
+        upgrade.sql("UPDATE materials SET status='created' WHERE id=:id")
+                .param("id", oldFixture.materialId()).update();
+
+        Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).load().migrate();
+
+        assertThat(upgrade.sql("SELECT status FROM materials WHERE id=:id")
+                .param("id", oldFixture.materialId()).query(String.class).single()).isEqualTo("cancelled");
+        assertThat(upgrade.sql("SELECT upload_expires_at IS NULL FROM materials WHERE id=:id")
+                .param("id", oldFixture.materialId()).query(Boolean.class).single()).isTrue();
     }
 
     @Test

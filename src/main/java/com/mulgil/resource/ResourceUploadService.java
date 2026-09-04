@@ -12,6 +12,7 @@ import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -41,27 +42,41 @@ class ResourceUploadService {
     @Transactional
     UploadUrl issueMaterialUpload(UUID ownerId, UUID sessionId, MaterialUpload request) {
         validatePdf(request.mimeType(), request.byteSize());
+        Instant now = clock.instant();
         ResourceRepository.SessionScope session = repository.lockSession(ownerId, sessionId)
                 .orElseThrow(ResourceUploadService::notFound);
+        repository.expireMaterialUploads(ownerId, sessionId, now);
         if (repository.materialCount(ownerId, sessionId) >= properties.uploads().maxPdfsPerSession()) {
             throw limit("files");
         }
         UUID id = UUID.randomUUID();
         String key = "owner/%s/session/%s/material/%s/source.pdf".formatted(ownerId, sessionId, id);
+        Instant expiry = expiresAt(now);
         ResourceRepository.Material material = repository.createMaterial(ownerId, session, id,
                 new ResourceRepository.MaterialWrite(request.filename(), request.mimeType(), request.byteSize(),
-                        request.sourcePhase(), key), clock.instant());
-        return uploadUrl(material.id(), material.objectKey(), material.mimeType(), material.byteSize());
+                        request.sourcePhase(), key), expiry, now);
+        return uploadUrl(material.id(), material.objectKey(), material.mimeType(), material.byteSize(), expiry);
     }
 
     @Transactional
     JobQueue.JobAccepted finalizeMaterial(UUID ownerId, UUID materialId, String checksum) {
-        ResourceRepository.Material material = repository.material(ownerId, materialId)
+        Instant now = clock.instant();
+        ResourceRepository.Material material = repository.materialForUpdate(ownerId, materialId)
                 .orElseThrow(ResourceUploadService::notFound);
+        if (!"created".equals(material.status())) {
+            if (material.uploadExpiresAt() != null && !material.uploadExpiresAt().isAfter(now)) {
+                throw uploadExpired();
+            }
+            throw notFound();
+        }
+        if (material.uploadExpiresAt() == null || !material.uploadExpiresAt().isAfter(now)) {
+            throw uploadExpired();
+        }
         ResourceContentProbe.PdfInspection inspection = finalization.finalizePdf(
                 descriptor(material.objectKey(), material.mimeType(), material.byteSize()), checksum);
         validatePages(inspection.pageCount());
-        repository.finalizeMaterial(ownerId, materialId, inspection.pageCount(), checksum.toLowerCase(), clock.instant());
+        repository.finalizeMaterial(ownerId, materialId, inspection.pageCount(), checksum.toLowerCase(), now)
+                .orElseThrow(ResourceUploadService::uploadExpired);
         return jobs.enqueuePdfMaterial(ownerId, materialId);
     }
 
@@ -160,13 +175,21 @@ class ResourceUploadService {
 
     private UploadUrl uploadUrl(UUID id, String objectKey, String mimeType, long byteSize) {
         Instant expiry = expiresAt();
+        return uploadUrl(id, objectKey, mimeType, byteSize, expiry);
+    }
+
+    private UploadUrl uploadUrl(UUID id, String objectKey, String mimeType, long byteSize, Instant expiry) {
         URI url = storage.createUploadUrl(objectKey, mimeType, byteSize, expiry);
         return new UploadUrl(id, url, expiry,
                 Map.of("Content-Type", mimeType, "Content-Length", Long.toString(byteSize)));
     }
 
     private Instant expiresAt() {
-        return clock.instant().plusSeconds(properties.gcs().signedUrlTtlSeconds());
+        return expiresAt(clock.instant());
+    }
+
+    private Instant expiresAt(Instant now) {
+        return now.plusSeconds(properties.gcs().signedUrlTtlSeconds()).truncatedTo(ChronoUnit.SECONDS);
     }
 
     private void validatePdf(String mimeType, long byteSize) {
@@ -207,6 +230,11 @@ class ResourceUploadService {
     private static ApiException limit(String field) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UPLOAD_LIMIT_EXCEEDED",
                 "Upload limit exceeded.", Map.of("field", field));
+    }
+
+    private static ApiException uploadExpired() {
+        return new ApiException(HttpStatus.GONE, "UPLOAD_URL_EXPIRED",
+                "Upload URL has expired.", Map.of("field", "uploadUrl"));
     }
 
     private static ApiException validation(String field) {

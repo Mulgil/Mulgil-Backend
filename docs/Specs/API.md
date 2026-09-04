@@ -46,6 +46,7 @@
 | `409` | `STALE_VERSION` | `expectedVersion`/`changedVersion`이 최신 version과 다름 |
 | `409` | `INSUFFICIENT_SOURCE_DATA` | 최신 scope에 생성 가능한 유효 source가 없음 |
 | `409` | `JOB_NOT_RETRYABLE` | retry 대상이 아니거나 retry 한도를 모두 사용함 |
+| `410` | `UPLOAD_URL_EXPIRED` | 업로드 URL이 만료되어 완료 처리할 수 없음. 새 업로드 URL을 발급받아 다시 업로드해야 함 |
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | 허용되지 않은 파일 MIME type |
 | `422` | `VALIDATION_FAILED` | request field 또는 도메인 validation 실패 |
 | `422` | `UPLOAD_LIMIT_EXCEEDED` | PDF/오디오 개별·차시 한도 초과 |
@@ -215,7 +216,7 @@ Google ID token을 서버에서 issuer, audience, expiry, subject까지 검증�
 | `byteSize` | integer | Yes | 1~52,428,800 (50 MB) |
 | `sourcePhase` | enum | Yes | `preview_pdf` 또는 `review_pdf` |
 
-`Material`은 `{ id, sessionId, filename, mimeType, byteSize, pageCount, sourcePhase, version, status }`다. `pageCount`는 최대 150, session당 PDF는 최대 5개다. raw object key는 절대 반환하지 않는다. `DownloadUrl`은 `{ downloadUrl, expiresAt }`다.
+`Material`은 `{ id, sessionId, filename, mimeType, byteSize, pageCount, sourcePhase, version, status }`다. `pageCount`는 최대 150, session당 PDF는 최대 5개다. 업로드 URL이 만료된 `created` 예약은 제한에서 제외되며 완료 요청에는 `410 UPLOAD_URL_EXPIRED`를 반환한다. raw object key는 절대 반환하지 않는다. `DownloadUrl`은 `{ downloadUrl, expiresAt }`다.
 
 ## 5. typed note와 PDF annotation
 
