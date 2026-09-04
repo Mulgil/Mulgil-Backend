@@ -52,6 +52,11 @@ final class GcsCloudStorageAdapter implements CloudStoragePort {
     }
 
     @Override
+    public void delete(String objectKey) {
+        storage.delete(bucket, objectKey);
+    }
+
+    @Override
     public byte[] read(String objectKey) {
         Blob blob = storage.get(bucket, objectKey);
         return blob == null ? null : blob.getContent();

@@ -61,6 +61,19 @@ class ResourceRepository {
                 .param("ownerId", ownerId).param("id", examId).query(UUID.class).optional().isPresent();
     }
 
+    void lockExamSessions(UUID ownerId, UUID examId) {
+        jdbc.sql("""
+                        SELECT session.id FROM exam_session_members member
+                        JOIN class_sessions session ON session.id=member.session_id
+                          AND session.owner_id=member.owner_id AND session.course_id=member.course_id
+                        JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                        WHERE member.owner_id=:ownerId AND member.exam_id=:examId AND course.deleted_at IS NULL
+                        ORDER BY session.id
+                        FOR UPDATE OF session, course
+                        """)
+                .param("ownerId", ownerId).param("examId", examId).query(UUID.class).list();
+    }
+
     int materialCount(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
                         SELECT count(*) FROM materials material
@@ -99,7 +112,7 @@ class ResourceRepository {
                         VALUES
                             (:id, :ownerId, :courseId, :sessionId, :sourcePhase, :objectKey,
                              :filename, :mimeType, :byteSize, 1, 'created', :uploadExpiresAt, :now, :now)
-                        RETURNING id, session_id, original_filename, mime_type, byte_size, page_count,
+                        RETURNING id, course_id, session_id, original_filename, mime_type, byte_size, page_count,
                                   source_phase, version, status, object_key, upload_expires_at,
                                   created_at, updated_at
                         """)
@@ -113,7 +126,7 @@ class ResourceRepository {
 
     Optional<Material> material(UUID ownerId, UUID materialId) {
         return jdbc.sql("""
-                        SELECT material.id, material.session_id, material.original_filename, material.mime_type,
+                        SELECT material.id, material.course_id, material.session_id, material.original_filename, material.mime_type,
                                material.byte_size, material.page_count, material.source_phase, material.version,
                                material.status, material.object_key, material.upload_expires_at,
                                material.created_at, material.updated_at
@@ -128,7 +141,7 @@ class ResourceRepository {
 
     Optional<Material> materialForUpdate(UUID ownerId, UUID materialId) {
         return jdbc.sql("""
-                        SELECT material.id, material.session_id, material.original_filename, material.mime_type,
+                        SELECT material.id, material.course_id, material.session_id, material.original_filename, material.mime_type,
                                material.byte_size, material.page_count, material.source_phase, material.version,
                                material.status, material.object_key, material.upload_expires_at,
                                material.created_at, material.updated_at
@@ -143,7 +156,7 @@ class ResourceRepository {
 
     List<Material> materials(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
-                        SELECT material.id, material.session_id, material.original_filename, material.mime_type,
+                        SELECT material.id, material.course_id, material.session_id, material.original_filename, material.mime_type,
                                material.byte_size, material.page_count, material.source_phase, material.version,
                                material.status, material.object_key, material.upload_expires_at,
                                material.created_at, material.updated_at
@@ -166,7 +179,7 @@ class ResourceRepository {
                           AND course.id = material.course_id AND course.owner_id = material.owner_id
                           AND course.deleted_at IS NULL
                           AND material.status = 'created' AND material.upload_expires_at > :now
-                        RETURNING material.id, material.session_id, material.original_filename, material.mime_type,
+                        RETURNING material.id, material.course_id, material.session_id, material.original_filename, material.mime_type,
                                   material.byte_size, material.page_count, material.source_phase, material.version,
                                   material.status, material.object_key, material.upload_expires_at,
                                   material.created_at, material.updated_at
@@ -186,7 +199,7 @@ class ResourceRepository {
                         FROM exams e
                         JOIN courses course ON course.id = e.course_id AND course.owner_id = e.owner_id
                         WHERE e.owner_id = :ownerId AND e.id = :examId AND course.deleted_at IS NULL
-                        RETURNING id, exam_id, resource_type, original_filename, mime_type, byte_size,
+                        RETURNING id, course_id, exam_id, resource_type, original_filename, mime_type, byte_size,
                                   page_count, status, object_key, created_at, updated_at
                         """)
                 .param("id", id).param("ownerId", ownerId).param("examId", write.examId())
@@ -198,7 +211,7 @@ class ResourceRepository {
 
     Optional<ExamResource> examResource(UUID ownerId, UUID id) {
         return jdbc.sql("""
-                        SELECT resource.id, resource.exam_id, resource.resource_type, resource.original_filename,
+                        SELECT resource.id, resource.course_id, resource.exam_id, resource.resource_type, resource.original_filename,
                                resource.mime_type, resource.byte_size, resource.page_count, resource.status,
                                resource.object_key, resource.created_at, resource.updated_at
                         FROM exam_resources resource
@@ -210,9 +223,24 @@ class ResourceRepository {
                 .query((row, ignored) -> examResource(row)).optional();
     }
 
+    Optional<ExamResource> examResourceForUpdate(UUID ownerId, UUID id) {
+        return jdbc.sql("""
+                        SELECT resource.id, resource.course_id, resource.exam_id, resource.resource_type,
+                               resource.original_filename, resource.mime_type, resource.byte_size,
+                               resource.page_count, resource.status, resource.object_key,
+                               resource.created_at, resource.updated_at
+                        FROM exam_resources resource
+                        JOIN courses course ON course.id = resource.course_id AND course.owner_id = resource.owner_id
+                        WHERE resource.owner_id = :ownerId AND resource.id = :id AND course.deleted_at IS NULL
+                        FOR UPDATE OF resource
+                        """)
+                .param("ownerId", ownerId).param("id", id)
+                .query((row, ignored) -> examResource(row)).optional();
+    }
+
     List<ExamResource> examResources(UUID ownerId, UUID examId) {
         return jdbc.sql("""
-                        SELECT resource.id, resource.exam_id, resource.resource_type, resource.original_filename,
+                        SELECT resource.id, resource.course_id, resource.exam_id, resource.resource_type, resource.original_filename,
                                resource.mime_type, resource.byte_size, resource.page_count, resource.status,
                                resource.object_key, resource.created_at, resource.updated_at
                         FROM exam_resources resource
@@ -233,7 +261,7 @@ class ResourceRepository {
                         WHERE resource.owner_id = :ownerId AND resource.id = :id
                           AND course.id = resource.course_id AND course.owner_id = resource.owner_id
                           AND course.deleted_at IS NULL
-                        RETURNING resource.id, resource.exam_id, resource.resource_type,
+                        RETURNING resource.id, resource.course_id, resource.exam_id, resource.resource_type,
                                   resource.original_filename, resource.mime_type, resource.byte_size,
                                   resource.page_count, resource.status, resource.object_key,
                                   resource.created_at, resource.updated_at
@@ -241,6 +269,27 @@ class ResourceRepository {
                 .param("pageCount", pageCount).param("checksum", checksum).param("now", Timestamp.from(now))
                 .param("ownerId", ownerId).param("id", id)
                 .query((row, ignored) -> examResource(row)).single();
+    }
+
+    void scheduleObjectDeletion(String objectKey, Instant notBefore, Instant now) {
+        jdbc.sql("""
+                        INSERT INTO resource_object_deletions
+                            (object_key,not_before,attempt_count,status,last_error,created_at,updated_at)
+                        VALUES (:key,:notBefore,0,'pending',NULL,:now,:now)
+                        ON CONFLICT (object_key) DO NOTHING
+                        """)
+                .param("key", objectKey).param("notBefore", Timestamp.from(notBefore))
+                .param("now", Timestamp.from(now)).update();
+    }
+
+    boolean deleteMaterial(UUID ownerId, UUID id) {
+        return jdbc.sql("DELETE FROM materials WHERE owner_id=:ownerId AND id=:id")
+                .param("ownerId", ownerId).param("id", id).update() == 1;
+    }
+
+    boolean deleteExamResource(UUID ownerId, UUID id) {
+        return jdbc.sql("DELETE FROM exam_resources WHERE owner_id=:ownerId AND id=:id")
+                .param("ownerId", ownerId).param("id", id).update() == 1;
     }
 
     Recording createRecording(UUID ownerId, UUID id, RecordingWrite write, Instant now) {
@@ -312,7 +361,8 @@ class ResourceRepository {
     }
 
     private static Material material(java.sql.ResultSet row) throws java.sql.SQLException {
-        return new Material(row.getObject("id", UUID.class), row.getObject("session_id", UUID.class),
+        return new Material(row.getObject("id", UUID.class), row.getObject("course_id", UUID.class),
+                row.getObject("session_id", UUID.class),
                 row.getString("original_filename"), row.getString("mime_type"), row.getLong("byte_size"),
                 (Integer) row.getObject("page_count"), row.getString("source_phase"), row.getInt("version"),
                 row.getString("status"), row.getString("object_key"), nullableInstant(row, "upload_expires_at"),
@@ -320,7 +370,8 @@ class ResourceRepository {
     }
 
     private static ExamResource examResource(java.sql.ResultSet row) throws java.sql.SQLException {
-        return new ExamResource(row.getObject("id", UUID.class), row.getObject("exam_id", UUID.class),
+        return new ExamResource(row.getObject("id", UUID.class), row.getObject("course_id", UUID.class),
+                row.getObject("exam_id", UUID.class),
                 row.getString("resource_type"), row.getString("original_filename"), row.getString("mime_type"),
                 row.getLong("byte_size"), (Integer) row.getObject("page_count"), row.getString("status"),
                 row.getString("object_key"), instant(row, "created_at"), instant(row, "updated_at"));
@@ -348,10 +399,11 @@ class ResourceRepository {
     }
 
     record SessionScope(UUID id, UUID courseId, String title, Instant startsAt, Instant endsAt) {}
-    record Material(UUID id, UUID sessionId, String filename, String mimeType, long byteSize, Integer pageCount,
+    record Material(UUID id, UUID courseId, UUID sessionId, String filename, String mimeType, long byteSize,
+                    Integer pageCount,
                     String sourcePhase, int version, String status, String objectKey,
                     Instant uploadExpiresAt, Instant createdAt, Instant updatedAt) {}
-    record ExamResource(UUID id, UUID examId, String resourceType, String filename, String mimeType,
+    record ExamResource(UUID id, UUID courseId, UUID examId, String resourceType, String filename, String mimeType,
                         long byteSize, Integer pageCount, String status, String objectKey,
                         Instant createdAt, Instant updatedAt) {}
     record Recording(UUID id, String filename, String mimeType, long byteSize, Instant startedAt,

@@ -2,6 +2,7 @@ package com.mulgil.resource;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.storage.CloudStoragePort;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -30,6 +31,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -65,6 +67,9 @@ class ResourceUploadApiIT {
 
     @Autowired
     MaterialUploadCleanupScheduler scheduler;
+
+    @Autowired
+    ResourceObjectDeletionScheduler deletionScheduler;
 
     @Autowired
     FakeCloudStorage storage;
@@ -443,6 +448,325 @@ class ResourceUploadApiIT {
     }
 
     @Test
+    void deletesMaterialWithItsDerivedDataAndSourceGroundedArtifacts() throws Exception {
+        String owner = login("delete-material-owner");
+        String foreign = login("delete-material-foreign");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        String materialId = successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url",
+                owner, Map.of("filename", "delete.pdf", "mimeType", "application/pdf", "byteSize", 100,
+                        "sourcePhase", "preview_pdf")), 201).path("id").asText();
+        UUID material = UUID.fromString(materialId);
+        storage.directPut(materialId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(materialId, 1, PDF_CHECKSUM);
+        UUID directJob = UUID.fromString(successful(post("/api/v1/materials/" + materialId + "/upload-complete",
+                owner, Map.of("checksumSha256", PDF_CHECKSUM)), 202).path("jobId").asText());
+        successful(put("/api/v1/materials/" + materialId + "/annotations", owner,
+                Map.of("expectedVersion", 0, "inkStrokes", List.of(), "emphasisRegions", List.of())), 200);
+
+        UUID ownerId = jdbc.sql("SELECT owner_id FROM materials WHERE id=:id")
+                .param("id", material).query(UUID.class).single();
+        UUID courseId = UUID.fromString(ids.courseId());
+        UUID sessionId = UUID.fromString(ids.sessionId());
+        UUID pageId = UUID.randomUUID();
+        UUID blockId = UUID.randomUUID();
+        UUID chunkId = UUID.randomUUID();
+        String text = "indexed material";
+        String chunkHash = ContentIndexingService.sha256(blockId + ":" + text);
+        String sourceRef = objectMapper.writeValueAsString(Map.of(
+                "sourceType", "pdf_text", "materialId", materialId,
+                "contentBlockId", blockId.toString(), "pageNumber", 1, "inputVersion", 1));
+        jdbc.sql("""
+                        INSERT INTO document_pages
+                            (id,owner_id,course_id,session_id,material_id,page_number,text_content,text_hash,
+                             extraction_method,created_at)
+                        VALUES (:id,:owner,:course,:session,:material,1,:text,:hash,'pdf_text',CURRENT_TIMESTAMP)
+                        """).param("id", pageId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("material", material).param("text", text)
+                .param("hash", ContentIndexingService.sha256(text)).update();
+        jdbc.sql("""
+                        INSERT INTO content_blocks
+                            (id,owner_id,course_id,session_id,material_id,page_id,block_type,text_content,
+                             source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:material,:page,'text',:text,:hash,CURRENT_TIMESTAMP)
+                        """).param("id", blockId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("material", material).param("page", pageId).param("text", text)
+                .param("hash", chunkHash).update();
+        jdbc.sql("""
+                        INSERT INTO chunks
+                            (id,owner_id,course_id,session_id,content_block_id,chunk_index,text_content,source_ref,
+                             source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:block,0,:text,CAST(:reference AS jsonb),:hash,
+                                CURRENT_TIMESTAMP)
+                        """).param("id", chunkId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("block", blockId).param("text", text)
+                .param("reference", sourceRef).param("hash", chunkHash).update();
+
+        UUID chunkJob = UUID.randomUUID();
+        UUID generationJob = UUID.randomUUID();
+        String generationHash = ContentIndexingService.sha256(
+                "pdf_text\u001f" + materialId + "\u001f1\u001f" + chunkHash);
+        jdbc.sql("""
+                        INSERT INTO ai_jobs
+                            (id,owner_id,course_id,session_id,job_type,status,input_version,idempotency_key,
+                             attempt_count,max_attempts,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,'chunk_embed','queued',1,:key,0,3,:hash,CURRENT_TIMESTAMP)
+                        """).param("id", chunkJob).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("key", "f".repeat(64)).param("hash", chunkHash).update();
+        jdbc.sql("""
+                        INSERT INTO ai_jobs
+                            (id,owner_id,course_id,session_id,job_type,status,input_version,idempotency_key,
+                             attempt_count,max_attempts,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,'preview_generate','queued',1,:key,0,3,:hash,
+                                CURRENT_TIMESTAMP)
+                        """).param("id", generationJob).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("key", "g".repeat(64)).param("hash", generationHash).update();
+        String refs = "[{\"materialId\":\"" + materialId + "\"}]";
+        String unrelatedRefs = "[{\"materialId\":\"" + UUID.randomUUID() + "\"}]";
+        UUID matchingSummary = UUID.randomUUID();
+        UUID unrelatedSummary = UUID.randomUUID();
+        UUID mindmap = UUID.randomUUID();
+        UUID question = UUID.randomUUID();
+        jdbc.sql("""
+                        INSERT INTO summaries
+                            (id,owner_id,course_id,session_id,summary_type,input_version,content_json,source_refs,
+                             status,model_id,prompt_version,created_at,updated_at)
+                        VALUES (:id,:owner,:course,:session,:type,1,CAST('{"items":[]}' AS jsonb),
+                                CAST(:refs AS jsonb),'succeeded','test','test',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                        """).param("id", matchingSummary).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("type", "preview").param("refs", refs).update();
+        jdbc.sql("""
+                        INSERT INTO summaries
+                            (id,owner_id,course_id,session_id,summary_type,input_version,content_json,source_refs,
+                             status,model_id,prompt_version,created_at,updated_at)
+                        VALUES (:id,:owner,:course,:session,'review',1,CAST('{"items":[]}' AS jsonb),
+                                CAST(:refs AS jsonb),'succeeded','test','test',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                        """).param("id", unrelatedSummary).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("refs", unrelatedRefs).update();
+        jdbc.sql("""
+                        INSERT INTO mindmaps
+                            (id,owner_id,course_id,session_id,input_version,nodes_json,edges_json,source_refs,status,
+                             model_id,prompt_version,created_at,updated_at)
+                        VALUES (:id,:owner,:course,:session,1,'[]','[]',CAST(:refs AS jsonb),'succeeded','test','test',
+                                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                        """).param("id", mindmap).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("refs", refs).update();
+        String questionJson = "{\"text\":\"Question\",\"sourceRefs\":" + refs + "}";
+        String answerJson = "{\"value\":true,\"sourceRefs\":" + refs + "}";
+        String explanationJson = "{\"text\":\"Explanation\",\"sourceRefs\":" + refs + "}";
+        jdbc.sql("""
+                        INSERT INTO quiz_questions
+                            (id,owner_id,course_id,session_id,quiz_scope,question_type,input_version,question_json,
+                             answer_json,explanation_json,status,model_id,prompt_version,created_at)
+                        VALUES (:id,:owner,:course,:session,'practice','true_false',1,CAST(:question AS jsonb),
+                                CAST(:answer AS jsonb),CAST(:explanation AS jsonb),'succeeded','test','test',
+                                CURRENT_TIMESTAMP)
+                        """).param("id", question).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("question", questionJson).param("answer", answerJson)
+                .param("explanation", explanationJson).update();
+        UUID usage = UUID.randomUUID();
+        jdbc.sql("""
+                        INSERT INTO ai_provider_usage
+                            (id,job_id,owner_id,operation,provider,model_id,status,unit_type,started_at)
+                        VALUES (:id,:job,:owner,'test','test','test','started','unit',CURRENT_TIMESTAMP)
+                        """).param("id", usage).param("job", directJob).param("owner", ownerId).update();
+
+        assertError(delete("/api/v1/materials/" + materialId, foreign), 404, "RESOURCE_NOT_FOUND");
+        successful(delete("/api/v1/materials/" + materialId, owner), 204);
+
+        assertThat(successful(get("/api/v1/sessions/" + ids.sessionId() + "/materials", owner), 200)).isEmpty();
+        assertError(get("/api/v1/materials/" + materialId + "/download-url", owner), 404, "RESOURCE_NOT_FOUND");
+        assertError(post("/api/v1/materials/" + materialId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/jobs/" + directJob, owner), 404, "JOB_NOT_FOUND");
+        assertError(delete("/api/v1/materials/" + materialId, owner), 404, "RESOURCE_NOT_FOUND");
+        assertThat(jdbc.sql("SELECT count(*) FROM annotation_documents WHERE material_id=:id")
+                .param("id", material).query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT count(*) FROM document_pages WHERE material_id=:id")
+                .param("id", material).query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT count(*) FROM content_blocks WHERE material_id=:id")
+                .param("id", material).query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE id=:id")
+                .param("id", chunkId).query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
+                .param("id", chunkJob).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
+                .param("id", generationJob).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM summaries WHERE id=:id")
+                .param("id", matchingSummary).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM mindmaps WHERE id=:id")
+                .param("id", mindmap).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM quiz_questions WHERE id=:id")
+                .param("id", question).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM summaries WHERE id=:id")
+                .param("id", unrelatedSummary).query(String.class).single()).isEqualTo("succeeded");
+        assertThat(jdbc.sql("SELECT job_id IS NULL FROM ai_provider_usage WHERE id=:id")
+                .param("id", usage).query(Boolean.class).single()).isTrue();
+
+        String materialKey = deletionKey(materialId);
+        deletionScheduler.cleanupDue();
+        assertThat(storage.hasObject(materialId)).isFalse();
+        assertThat(jdbc.sql("SELECT count(*) FROM resource_object_deletions WHERE object_key=:key")
+                .param("key", materialKey).query(Integer.class).single()).isZero();
+        recordHttp("deleteMaterial", "204,404", "cascade;generated-artifacts-outdated;gcs-cleanup;usage-preserved");
+    }
+
+    @Test
+    void deletesExamResourceAndHidesItImmediately() throws Exception {
+        String owner = login("delete-exam-resource-owner");
+        String foreign = login("delete-exam-resource-foreign");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        String resourceId = successful(post("/api/v1/exams/" + ids.examId() + "/resources", owner,
+                Map.of("filename", "past-exam.pdf", "mimeType", "application/pdf", "byteSize", 100)), 201)
+                .path("id").asText();
+        UUID resource = UUID.fromString(resourceId);
+        storage.directPut(resourceId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(resourceId, 1, PDF_CHECKSUM);
+        successful(post("/api/v1/exam-resources/" + resourceId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 200);
+        UUID directJob = jdbc.sql("SELECT id FROM ai_jobs WHERE exam_resource_id=:id")
+                .param("id", resource).query(UUID.class).single();
+        UUID ownerId = jdbc.sql("SELECT owner_id FROM exam_resources WHERE id=:id")
+                .param("id", resource).query(UUID.class).single();
+        UUID courseId = UUID.fromString(ids.courseId());
+        UUID sessionId = UUID.fromString(ids.sessionId());
+        UUID examId = UUID.fromString(ids.examId());
+        UUID pageId = UUID.randomUUID();
+        UUID blockId = UUID.randomUUID();
+        UUID chunkId = UUID.randomUUID();
+        String text = "past exam";
+        String chunkHash = ContentIndexingService.sha256(blockId + ":" + text);
+        String sourceRef = objectMapper.writeValueAsString(Map.of(
+                "sourceType", "past_exam", "examResourceId", resourceId,
+                "contentBlockId", blockId.toString(), "pageNumber", 1, "inputVersion", 1));
+        jdbc.sql("""
+                        INSERT INTO document_pages
+                            (id,owner_id,course_id,session_id,exam_resource_id,page_number,text_content,text_hash,
+                             extraction_method,created_at)
+                        VALUES (:id,:owner,:course,:session,:resource,1,:text,:hash,'pdf_text',CURRENT_TIMESTAMP)
+                        """).param("id", pageId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("resource", resource).param("text", text)
+                .param("hash", ContentIndexingService.sha256(text)).update();
+        jdbc.sql("""
+                        INSERT INTO content_blocks
+                            (id,owner_id,course_id,session_id,exam_resource_id,page_id,block_type,text_content,
+                             source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:resource,:page,'text',:text,:hash,CURRENT_TIMESTAMP)
+                        """).param("id", blockId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("resource", resource).param("page", pageId).param("text", text)
+                .param("hash", chunkHash).update();
+        jdbc.sql("""
+                        INSERT INTO chunks
+                            (id,owner_id,course_id,session_id,content_block_id,chunk_index,text_content,source_ref,
+                             source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:block,0,:text,CAST(:reference AS jsonb),:hash,
+                                CURRENT_TIMESTAMP)
+                        """).param("id", chunkId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("block", blockId).param("text", text)
+                .param("reference", sourceRef).param("hash", chunkHash).update();
+        UUID chunkJob = UUID.randomUUID();
+        UUID generationJob = UUID.randomUUID();
+        String generationHash = ContentIndexingService.sha256(
+                "past_exam\u001f" + resourceId + "\u001f1\u001f" + chunkHash);
+        jdbc.sql("""
+                        INSERT INTO ai_jobs
+                            (id,owner_id,course_id,session_id,job_type,status,input_version,idempotency_key,
+                             attempt_count,max_attempts,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,'chunk_embed','queued',1,:key,0,3,:hash,CURRENT_TIMESTAMP)
+                        """).param("id", chunkJob).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("key", "h".repeat(64)).param("hash", chunkHash).update();
+        jdbc.sql("""
+                        INSERT INTO ai_jobs
+                            (id,owner_id,course_id,session_id,exam_id,job_type,status,input_version,idempotency_key,
+                             attempt_count,max_attempts,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:exam,'exam_quiz_generate','queued',1,:key,0,3,:hash,
+                                CURRENT_TIMESTAMP)
+                        """).param("id", generationJob).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("exam", examId).param("key", "i".repeat(64))
+                .param("hash", generationHash).update();
+        String refs = "[{\"examResourceId\":\"" + resourceId + "\"}]";
+        UUID question = UUID.randomUUID();
+        jdbc.sql("""
+                        INSERT INTO quiz_questions
+                            (id,owner_id,course_id,exam_id,quiz_scope,question_type,input_version,question_json,
+                             answer_json,explanation_json,status,model_id,prompt_version,created_at)
+                        VALUES (:id,:owner,:course,:exam,'past_exam_based','true_false',1,
+                                CAST(:question AS jsonb),CAST(:answer AS jsonb),CAST(:explanation AS jsonb),
+                                'succeeded','test','test',CURRENT_TIMESTAMP)
+                        """).param("id", question).param("owner", ownerId).param("course", courseId)
+                .param("exam", examId).param("question", "{\"text\":\"Question\",\"sourceRefs\":" + refs + "}")
+                .param("answer", "{\"value\":true,\"sourceRefs\":" + refs + "}")
+                .param("explanation", "{\"text\":\"Explanation\",\"sourceRefs\":" + refs + "}").update();
+
+        assertError(delete("/api/v1/exam-resources/" + resourceId, foreign), 404, "RESOURCE_NOT_FOUND");
+        successful(delete("/api/v1/exam-resources/" + resourceId, owner), 204);
+
+        assertThat(successful(get("/api/v1/exams/" + ids.examId() + "/resources", owner), 200)).isEmpty();
+        assertError(get("/api/v1/exam-resources/" + resourceId + "/download-url", owner), 404,
+                "RESOURCE_NOT_FOUND");
+        assertError(post("/api/v1/exam-resources/" + resourceId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 404, "RESOURCE_NOT_FOUND");
+        assertError(get("/api/v1/jobs/" + directJob, owner), 404, "JOB_NOT_FOUND");
+        assertError(delete("/api/v1/exam-resources/" + resourceId, owner), 404, "RESOURCE_NOT_FOUND");
+        assertThat(jdbc.sql("SELECT count(*) FROM exam_resources WHERE id=:id")
+                .param("id", resource).query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT count(*) FROM document_pages WHERE exam_resource_id=:id")
+                .param("id", resource).query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE id=:id")
+                .param("id", chunkId).query(Integer.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
+                .param("id", chunkJob).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
+                .param("id", generationJob).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM quiz_questions WHERE id=:id")
+                .param("id", question).query(String.class).single()).isEqualTo("outdated");
+        deletionScheduler.cleanupDue();
+        assertThat(storage.hasObject(resourceId)).isFalse();
+        recordHttp("deleteExamResource", "204,404", "list;download;job;gcs-cleanup");
+    }
+
+    @Test
+    void defersCreatedObjectDeletionAndRecordsTerminalStorageFailures() throws Exception {
+        String owner = login("delete-outbox-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        String deferredId = successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url",
+                owner, Map.of("filename", "pending.pdf", "mimeType", "application/pdf", "byteSize", 100,
+                        "sourcePhase", "preview_pdf")), 201).path("id").asText();
+        storage.directPut(deferredId, "application/pdf", 100, PDF_CHECKSUM);
+        successful(delete("/api/v1/materials/" + deferredId, owner), 204);
+
+        deletionScheduler.cleanupDue();
+        assertThat(storage.hasObject(deferredId)).isTrue();
+        String deferredKey = deletionKey(deferredId);
+        jdbc.sql("UPDATE resource_object_deletions SET not_before=created_at WHERE object_key=:key")
+                .param("key", deferredKey).update();
+        deletionScheduler.cleanupDue();
+        assertThat(storage.hasObject(deferredId)).isFalse();
+
+        String failedId = successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url",
+                owner, Map.of("filename", "retry.pdf", "mimeType", "application/pdf", "byteSize", 100,
+                        "sourcePhase", "preview_pdf")), 201).path("id").asText();
+        storage.directPut(failedId, "application/pdf", 100, PDF_CHECKSUM);
+        successful(delete("/api/v1/materials/" + failedId, owner), 204);
+        String failedKey = deletionKey(failedId);
+        jdbc.sql("UPDATE resource_object_deletions SET not_before=created_at WHERE object_key=:key")
+                .param("key", failedKey).update();
+        storage.failDeletes(3);
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            deletionScheduler.cleanupDue();
+            if (attempt < 3) {
+                jdbc.sql("UPDATE resource_object_deletions SET not_before=created_at WHERE object_key=:key")
+                        .param("key", failedKey).update();
+            }
+        }
+        assertThat(storage.hasObject(failedId)).isTrue();
+        assertThat(jdbc.sql("SELECT status FROM resource_object_deletions WHERE object_key=:key")
+                .param("key", failedKey).query(String.class).single()).isEqualTo("failed");
+        assertThat(jdbc.sql("SELECT attempt_count FROM resource_object_deletions WHERE object_key=:key")
+                .param("key", failedKey).query(Integer.class).single()).isEqualTo(3);
+        recordHttp("deleteOutbox", "204", "signed-url-delay;gcs-retry;terminal-failure-retained");
+    }
+
+    @Test
     void appliesV003_whenDatabaseIsFresh() {
         assertThat(jdbc.sql("SELECT success FROM flyway_schema_history WHERE version = '003'")
                 .query(Boolean.class).single()).isTrue();
@@ -452,6 +776,14 @@ class ResourceUploadApiIT {
                             ('materials', 'notes', 'audio_recordings', 'exam_resources')
                         """).query(Integer.class).single()).isEqualTo(4);
         System.out.println("RESOURCE_DB migrationOrder=V001,V002,V003 tables=4 result=PASS");
+    }
+
+    private String deletionKey(String resourceId) {
+        return jdbc.sql("""
+                        SELECT object_key FROM resource_object_deletions
+                        WHERE object_key LIKE :suffix
+                        """).param("suffix", "%/" + resourceId + "/source.pdf")
+                .query(String.class).single();
     }
 
     private DomainIds domain(String token, String startsAt, String endsAt) throws Exception {
@@ -546,6 +878,7 @@ class ResourceUploadApiIT {
         private final List<String> issuedKeys = new ArrayList<>();
         private final Map<String, StoredObjectMetadata> objects = new HashMap<>();
         private Instant lastUploadExpiry;
+        private int deleteFailures;
 
         @Override
         public URI createUploadUrl(String objectKey, String contentType, long contentLength, Instant expiresAt) {
@@ -564,6 +897,15 @@ class ResourceUploadApiIT {
             return objects.get(resourceId(objectKey));
         }
 
+        @Override
+        public void delete(String objectKey) {
+            if (deleteFailures > 0) {
+                deleteFailures--;
+                throw new IllegalStateException("planned deletion failure");
+            }
+            objects.remove(resourceId(objectKey));
+        }
+
         void directPut(String resourceId, String mimeType, long byteSize, String checksum) {
             objects.put(resourceId, new StoredObjectMetadata(mimeType, byteSize, checksum));
         }
@@ -572,10 +914,19 @@ class ResourceUploadApiIT {
             return 0;
         }
 
+        boolean hasObject(String resourceId) {
+            return objects.containsKey(resourceId);
+        }
+
+        void failDeletes(int count) {
+            deleteFailures = count;
+        }
+
         void reset() {
             issuedKeys.clear();
             objects.clear();
             lastUploadExpiry = null;
+            deleteFailures = 0;
         }
 
         private static String resourceId(String objectKey) {

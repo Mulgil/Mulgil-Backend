@@ -9,6 +9,7 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -58,6 +59,12 @@ final class ResourceUploadController {
         return service.materialDownload(CurrentUser.id(), materialId);
     }
 
+    @DeleteMapping("/materials/{materialId}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    void deleteMaterial(@PathVariable UUID materialId) {
+        service.deleteMaterial(CurrentUser.id(), materialId);
+    }
+
     @PostMapping("/exams/{examId}/resources")
     @ResponseStatus(HttpStatus.CREATED)
     ResourceUploadService.UploadUrl examResourceUploadUrl(
@@ -83,6 +90,12 @@ final class ResourceUploadController {
     @GetMapping("/exam-resources/{examResourceId}/download-url")
     ResourceUploadService.DownloadUrl examResourceDownloadUrl(@PathVariable UUID examResourceId) {
         return service.examResourceDownload(CurrentUser.id(), examResourceId);
+    }
+
+    @DeleteMapping("/exam-resources/{examResourceId}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    void deleteExamResource(@PathVariable UUID examResourceId) {
+        service.deleteExamResource(CurrentUser.id(), examResourceId);
     }
 
     @PostMapping("/recordings/upload-url")

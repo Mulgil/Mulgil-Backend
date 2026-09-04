@@ -10,6 +10,8 @@ public interface CloudStoragePort {
 
     StoredObjectMetadata metadata(String objectKey);
 
+    void delete(String objectKey);
+
     default byte[] read(String objectKey) {
         return null;
     }

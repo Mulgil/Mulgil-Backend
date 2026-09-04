@@ -26,6 +26,9 @@ final class TestCloudStorageAdapter implements CloudStoragePort {
     }
 
     @Override
+    public void delete(String objectKey) {}
+
+    @Override
     public byte[] read(String objectKey) {
         return null;
     }

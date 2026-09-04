@@ -12,7 +12,7 @@ import java.util.List;
 import java.util.UUID;
 
 @Service
-final class GenerationSnapshotService {
+public final class GenerationSnapshotService {
     private final JdbcClient jdbc;
     private final ObjectMapper json;
     private final GenerationReadinessService readiness;
@@ -23,7 +23,7 @@ final class GenerationSnapshotService {
         this.readiness = readiness;
     }
 
-    Snapshot session(UUID ownerId, UUID courseId, UUID sessionId, String phase) {
+    public Snapshot session(UUID ownerId, UUID courseId, UUID sessionId, String phase) {
         List<Source> sources = jdbc.sql("""
                         SELECT c.text_content,c.source_ref::text,c.source_hash,c.embedding IS NOT NULL AS indexed,
                                c.source_ref->>'sourceType' AS source_type,
@@ -58,7 +58,7 @@ final class GenerationSnapshotService {
                 state.expectedSources(), state.blocked());
     }
 
-    Snapshot exam(UUID ownerId, UUID examId, boolean predicted) {
+    public Snapshot exam(UUID ownerId, UUID examId, boolean predicted) {
         ExamScope scope = jdbc.sql("""
                         SELECT e.course_id,min(member.session_id::text)::uuid AS session_id
                         FROM exams e
@@ -128,7 +128,7 @@ final class GenerationSnapshotService {
         }
     }
 
-    record Snapshot(String phase, UUID ownerId, UUID courseId, UUID sessionId, UUID examId,
+    public record Snapshot(String phase, UUID ownerId, UUID courseId, UUID sessionId, UUID examId,
                     List<Source> sources, String canonical, String snapshotHash, boolean ready) {
         Snapshot withReady(boolean value) {
             return new Snapshot(phase, ownerId, courseId, sessionId, examId,
@@ -136,7 +136,7 @@ final class GenerationSnapshotService {
         }
     }
 
-    record Source(String type, UUID sourceId, int inputVersion, String sourceHash, String text,
+    public record Source(String type, UUID sourceId, int inputVersion, String sourceHash, String text,
                   JsonNode sourceReference, boolean indexed) {
         String canonical() {
             return String.join("\u001f", type, sourceId.toString(), Integer.toString(inputVersion), sourceHash);
