@@ -59,7 +59,7 @@ class ChunkEmbedJobHandlerTest {
         };
         when(ports.getIfAvailable()).thenReturn(port);
         MulgilProperties properties = mock(MulgilProperties.class);
-        when(properties.vertex()).thenReturn(new MulgilProperties.Vertex("generation", "embedding", 5));
+        when(properties.vertex()).thenReturn(new MulgilProperties.Vertex("generation", "embedding", "us-central1", 5));
         AiProviderUsageLedger usage = mock(AiProviderUsageLedger.class);
         AiProviderUsageLedger.UsageHandle firstUsage = usageHandle();
         AiProviderUsageLedger.UsageHandle failedUsage = usageHandle();
@@ -102,7 +102,7 @@ class ChunkEmbedJobHandlerTest {
         };
         when(ports.getIfAvailable()).thenReturn(mismatched);
         MulgilProperties properties = mock(MulgilProperties.class);
-        when(properties.vertex()).thenReturn(new MulgilProperties.Vertex("generation", "embedding", 5));
+        when(properties.vertex()).thenReturn(new MulgilProperties.Vertex("generation", "embedding", "us-central1", 5));
         ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(
                 jdbc, ports, properties, mock(AiProviderUsageLedger.class));
         assertThatThrownBy(() -> handler.handle(job()))

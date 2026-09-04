@@ -39,6 +39,33 @@ import static org.mockito.Mockito.when;
 
 class VertexChunkEmbeddingAdapterTest {
     @Test
+    void usesUsCentral1EmbeddingEndpointWhenCloudLocationIsGlobal() {
+        PredictionServiceClient client = mock(PredictionServiceClient.class);
+        List<String> endpoints = new ArrayList<>();
+        when(client.predict(anyString(), anyList(), any())).thenAnswer(invocation -> {
+            endpoints.add(invocation.getArgument(0));
+            return response(List.of(1f), 768);
+        });
+        MulgilProperties properties = mock(MulgilProperties.class);
+        when(properties.google()).thenReturn(new MulgilProperties.Google("oauth", "project", "global"));
+        when(properties.vertex()).thenReturn(new MulgilProperties.Vertex(
+                "generation", "text-multilingual-embedding-002", "us-central1", 5));
+        VertexChunkEmbeddingAdapter adapter = new VertexChunkEmbeddingAdapter(
+                properties, new SimpleMeterRegistry(), () -> client);
+
+        adapter.embed("1");
+
+        assertThat(endpoints).containsExactly(
+                "projects/project/locations/us-central1/publishers/google/models/text-multilingual-embedding-002");
+    }
+
+    @Test
+    void usesGlobalApiHostForGlobalEmbeddingLocation() {
+        assertThat(VertexChunkEmbeddingAdapter.apiEndpoint("global"))
+                .isEqualTo("aiplatform.googleapis.com:443");
+    }
+
+    @Test
     void capsRequestsAtFive_mapsVertexRequest_andPreservesOrderWithConfigTwenty() {
         PredictionServiceClient client = mock(PredictionServiceClient.class);
         List<String> endpoints = new ArrayList<>();
@@ -153,7 +180,7 @@ class VertexChunkEmbeddingAdapterTest {
         MulgilProperties properties = mock(MulgilProperties.class);
         when(properties.google()).thenReturn(new MulgilProperties.Google("oauth", "project", "location"));
         when(properties.vertex()).thenReturn(new MulgilProperties.Vertex(
-                "generation", "text-multilingual-embedding-002", 5));
+                "generation", "text-multilingual-embedding-002", "location", 5));
         VertexChunkEmbeddingAdapter adapter = new VertexChunkEmbeddingAdapter(
                 properties, new SimpleMeterRegistry(), () -> { throw new IOException("credential=secret"); });
 
@@ -232,10 +259,10 @@ class VertexChunkEmbeddingAdapterTest {
         try (var factory = Validation.buildDefaultValidatorFactory()) {
             var validator = factory.getValidator();
 
-            assertThat(validator.validate(new MulgilProperties.Vertex("generation", "embedding", 1))).isEmpty();
-            assertThat(validator.validate(new MulgilProperties.Vertex("generation", "embedding", 20))).isEmpty();
-            assertThat(validator.validate(new MulgilProperties.Vertex("generation", "embedding", 0))).hasSize(1);
-            assertThat(validator.validate(new MulgilProperties.Vertex("generation", "embedding", 21))).hasSize(1);
+            assertThat(validator.validate(new MulgilProperties.Vertex("generation", "embedding", "location", 1))).isEmpty();
+            assertThat(validator.validate(new MulgilProperties.Vertex("generation", "embedding", "location", 20))).isEmpty();
+            assertThat(validator.validate(new MulgilProperties.Vertex("generation", "embedding", "location", 0))).hasSize(1);
+            assertThat(validator.validate(new MulgilProperties.Vertex("generation", "embedding", "location", 21))).hasSize(1);
         }
     }
 
@@ -246,6 +273,16 @@ class VertexChunkEmbeddingAdapterTest {
                 .load("application", new ClassPathResource("application.yml")).getFirst());
 
         assertThat(environment.getRequiredProperty("mulgil.vertex.embedding-batch-size", Integer.class)).isEqualTo(5);
+    }
+
+    @Test
+    void defaultsEmbeddingLocationToUsCentral1() throws Exception {
+        var environment = new MockEnvironment();
+        environment.getPropertySources().addFirst(new YamlPropertySourceLoader()
+                .load("application", new ClassPathResource("application.yml")).getFirst());
+
+        assertThat(environment.getRequiredProperty("mulgil.vertex.embedding-location"))
+                .isEqualTo("us-central1");
     }
 
     @Test
@@ -264,7 +301,7 @@ class VertexChunkEmbeddingAdapterTest {
         MulgilProperties properties = mock(MulgilProperties.class);
         when(properties.google()).thenReturn(new MulgilProperties.Google("oauth", "project", "location"));
         when(properties.vertex()).thenReturn(new MulgilProperties.Vertex(
-                "generation", "text-multilingual-embedding-002", batchSize));
+                "generation", "text-multilingual-embedding-002", "location", batchSize));
         return new VertexChunkEmbeddingAdapter(properties, metrics, () -> client);
     }
 

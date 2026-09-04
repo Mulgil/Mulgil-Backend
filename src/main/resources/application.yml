@@ -36,6 +36,7 @@ mulgil:
   vertex:
     generation-model: ${VERTEX_GENERATION_MODEL:gemini-2.5-flash}
     embedding-model: ${VERTEX_EMBEDDING_MODEL:text-multilingual-embedding-002}
+    embedding-location: ${VERTEX_EMBEDDING_LOCATION:us-central1}
     embedding-batch-size: ${VERTEX_EMBEDDING_BATCH_SIZE:5}
   fcm:
     enabled: ${FCM_ENABLED:true}
