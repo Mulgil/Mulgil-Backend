@@ -1,5 +1,7 @@
 package com.mulgil.ocr;
 
+import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.rpc.StatusCode;
 import com.google.cloud.vision.v1.AnnotateImageRequest;
 import com.google.cloud.vision.v1.AnnotateImageResponse;
 import com.google.cloud.vision.v1.BatchAnnotateImagesResponse;
@@ -131,6 +133,26 @@ class GoogleVisionOcrAdapterTest {
         assertThatThrownBy(() -> adapter.extract(png(10, 10)))
                 .isInstanceOfSatisfying(OcrProviderException.class, exception -> {
                     assertThat(exception.code()).isEqualTo("PROVIDER_AUTHENTICATION_FAILED");
+                    assertThat(exception.retryable()).isFalse();
+                });
+    }
+
+    @Test
+    void mapsServiceDisabled_toTerminalProviderApiDisabled() throws Exception {
+        ImageAnnotatorClient client = mock(ImageAnnotatorClient.class);
+        ApiException failure = mock(ApiException.class);
+        StatusCode statusCode = mock(StatusCode.class);
+        when(statusCode.getCode()).thenReturn(StatusCode.Code.PERMISSION_DENIED);
+        when(failure.getStatusCode()).thenReturn(statusCode);
+        when(failure.isRetryable()).thenReturn(false);
+        when(failure.getReason()).thenReturn("SERVICE_DISABLED");
+        when(client.batchAnnotateImages(org.mockito.ArgumentMatchers.<AnnotateImageRequest>anyList()))
+                .thenThrow(failure);
+        GoogleVisionOcrAdapter adapter = new GoogleVisionOcrAdapter(client, "DOCUMENT_TEXT_DETECTION");
+
+        assertThatThrownBy(() -> adapter.extract(png(10, 10)))
+                .isInstanceOfSatisfying(OcrProviderException.class, exception -> {
+                    assertThat(exception.code()).isEqualTo("PROVIDER_API_DISABLED");
                     assertThat(exception.retryable()).isFalse();
                 });
     }
