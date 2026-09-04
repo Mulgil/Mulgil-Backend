@@ -58,6 +58,7 @@ public record MulgilProperties(
     public record Vertex(
             @NotBlank String generationModel,
             @NotBlank String embeddingModel,
+            @NotBlank String embeddingLocation,
             @Min(1) @Max(20) int embeddingBatchSize
     ) {}
 

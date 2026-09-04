@@ -8,6 +8,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class VertexGenerationModelAdapterTest {
     @Test
+    void usesGlobalApiHostForGlobalLocation() {
+        assertThat(VertexGenerationModelAdapter.apiEndpoint("global"))
+                .isEqualTo("aiplatform.googleapis.com:443");
+    }
+
+    @Test
     void enforcesGroundedStructuredJsonSchema_inVertexRequestConfiguration() {
         GenerationConfig config = VertexGenerationModelAdapter.generationConfig();
 

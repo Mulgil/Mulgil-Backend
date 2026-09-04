@@ -35,7 +35,7 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
     @Autowired
     VertexChunkEmbeddingAdapter(MulgilProperties properties, MeterRegistry metrics) {
         this(properties, metrics, () -> PredictionServiceClient.create(PredictionServiceSettings.newBuilder()
-                .setEndpoint(properties.google().cloudLocation() + "-aiplatform.googleapis.com:443").build()));
+                .setEndpoint(apiEndpoint(properties.vertex().embeddingLocation())).build()));
     }
 
     VertexChunkEmbeddingAdapter(MulgilProperties properties, MeterRegistry metrics, ClientFactory clients) {
@@ -52,7 +52,7 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
     @Override
     public List<Embedding> embedAll(List<String> texts, ProviderCallObserver observer) {
         if (texts.isEmpty()) return List.of();
-        String location = properties.google().cloudLocation();
+        String location = properties.vertex().embeddingLocation();
         String model = properties.vertex().embeddingModel();
         String endpoint = "projects/%s/locations/%s/publishers/google/models/%s".formatted(
                 properties.google().cloudProject(), location, model);
@@ -106,6 +106,10 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
                 .putFields("content", Value.newBuilder().setStringValue(text).build())
                 .putFields("task_type", Value.newBuilder().setStringValue("RETRIEVAL_DOCUMENT").build())
                 .build()).build();
+    }
+
+    static String apiEndpoint(String location) {
+        return ("global".equals(location) ? "" : location + "-") + "aiplatform.googleapis.com:443";
     }
 
     private static List<Embedding> embeddings(PredictResponse response, int expectedCount, String model) {

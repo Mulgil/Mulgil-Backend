@@ -48,11 +48,15 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
                 .build();
         try (PredictionServiceClient client = PredictionServiceClient.create(
                 PredictionServiceSettings.newBuilder()
-                        .setEndpoint(location + "-aiplatform.googleapis.com:443").build())) {
+                        .setEndpoint(apiEndpoint(location)).build())) {
             return responseText(client.generateContent(request));
         } catch (IOException exception) {
             throw new IllegalStateException("Could not create Vertex generation client.", exception);
         }
+    }
+
+    static String apiEndpoint(String location) {
+        return ("global".equals(location) ? "" : location + "-") + "aiplatform.googleapis.com:443";
     }
 
     private static String responseText(GenerateContentResponse response) {
