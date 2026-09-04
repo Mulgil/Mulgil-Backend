@@ -187,7 +187,7 @@ class PdfIndexingIT {
                 .extracting(value -> ((ApiException) value).code())
                 .isEqualTo("JOB_NOT_RETRYABLE");
         assertThat(jobs.get(owner, jobId).status()).isEqualTo("failed");
-        assertThat(jobs.get(owner, jobId).errorCode()).isEqualTo("PROVIDER_FAILED");
+        assertThat(jobs.get(owner, jobId).errorCode()).isEqualTo("PROVIDER_AUTHENTICATION_FAILED");
     }
 
     @Test

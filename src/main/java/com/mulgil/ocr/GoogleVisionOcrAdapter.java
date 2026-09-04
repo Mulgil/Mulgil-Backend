@@ -137,6 +137,10 @@ final class GoogleVisionOcrAdapter implements VisionOcrPort {
 
     private static OcrProviderException providerFailure(Code code, boolean retryable) {
         if (code == Code.INVALID_ARGUMENT) return invalidImage();
+        if (code == Code.PERMISSION_DENIED) {
+            return new OcrProviderException("PROVIDER_AUTHENTICATION_FAILED",
+                    "Vision authentication or access failed.", false);
+        }
         if (code == Code.DEADLINE_EXCEEDED) {
             return new OcrProviderException("PROVIDER_TIMEOUT", "Vision request timed out.", true);
         }

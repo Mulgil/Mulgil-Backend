@@ -120,7 +120,7 @@ class GoogleVisionOcrAdapterTest {
     }
 
     @Test
-    void mapsGenericTerminalProviderFailure_toTerminalProviderFailed() throws Exception {
+    void mapsPermissionDenied_toTerminalProviderAuthenticationFailed() throws Exception {
         ImageAnnotatorClient client = mock(ImageAnnotatorClient.class);
         when(client.batchAnnotateImages(org.mockito.ArgumentMatchers.<AnnotateImageRequest>anyList()))
                 .thenReturn(BatchAnnotateImagesResponse.newBuilder().addResponses(
@@ -130,7 +130,7 @@ class GoogleVisionOcrAdapterTest {
 
         assertThatThrownBy(() -> adapter.extract(png(10, 10)))
                 .isInstanceOfSatisfying(OcrProviderException.class, exception -> {
-                    assertThat(exception.code()).isEqualTo("PROVIDER_FAILED");
+                    assertThat(exception.code()).isEqualTo("PROVIDER_AUTHENTICATION_FAILED");
                     assertThat(exception.retryable()).isFalse();
                 });
     }
