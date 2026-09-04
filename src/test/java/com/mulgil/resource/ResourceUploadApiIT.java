@@ -2,7 +2,9 @@ package com.mulgil.resource;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulgil.generation.GenerationSnapshotService;
 import com.mulgil.indexing.ContentIndexingService;
+import com.mulgil.job.JobQueue;
 import com.mulgil.storage.CloudStoragePort;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -26,12 +28,15 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -70,6 +75,12 @@ class ResourceUploadApiIT {
 
     @Autowired
     ResourceObjectDeletionScheduler deletionScheduler;
+
+    @Autowired
+    JobQueue jobs;
+
+    @Autowired
+    GenerationSnapshotService snapshots;
 
     @Autowired
     FakeCloudStorage storage;
@@ -767,6 +778,85 @@ class ResourceUploadApiIT {
     }
 
     @Test
+    void preventsHistoricalGenerationJobFromPublishingAfterMaterialDeletion() throws Exception {
+        String owner = login("historical-generation-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        String firstId = successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url",
+                owner, Map.of("filename", "first.pdf", "mimeType", "application/pdf", "byteSize", 100,
+                        "sourcePhase", "preview_pdf")), 201).path("id").asText();
+        storage.directPut(firstId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(firstId, 1, PDF_CHECKSUM);
+        successful(post("/api/v1/materials/" + firstId + "/upload-complete",
+                owner, Map.of("checksumSha256", PDF_CHECKSUM)), 202);
+
+        UUID ownerId = jdbc.sql("SELECT owner_id FROM materials WHERE id=:id")
+                .param("id", UUID.fromString(firstId)).query(UUID.class).single();
+        UUID courseId = UUID.fromString(ids.courseId());
+        UUID sessionId = UUID.fromString(ids.sessionId());
+        insertPreviewMaterialChunk(ownerId, courseId, sessionId, UUID.fromString(firstId), firstId, "first source");
+        String historicalHash = snapshots.session(ownerId, courseId, sessionId, "preview").snapshotHash();
+
+        String secondId = successful(post("/api/v1/sessions/" + ids.sessionId() + "/materials/upload-url",
+                owner, Map.of("filename", "second.pdf", "mimeType", "application/pdf", "byteSize", 100,
+                        "sourcePhase", "preview_pdf")), 201).path("id").asText();
+        storage.directPut(secondId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(secondId, 1, PDF_CHECKSUM);
+        successful(post("/api/v1/materials/" + secondId + "/upload-complete",
+                owner, Map.of("checksumSha256", PDF_CHECKSUM)), 202);
+        insertPreviewMaterialChunk(ownerId, courseId, sessionId, UUID.fromString(secondId), secondId, "second source");
+        assertThat(snapshots.session(ownerId, courseId, sessionId, "preview").snapshotHash())
+                .isNotEqualTo(historicalHash);
+
+        UUID historicalJob = UUID.randomUUID();
+        jdbc.sql("""
+                        INSERT INTO ai_jobs
+                            (id,owner_id,course_id,session_id,job_type,status,input_version,idempotency_key,
+                             attempt_count,max_attempts,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,'preview_generate','queued',1,:key,0,3,:hash,CURRENT_TIMESTAMP)
+                        """).param("id", historicalJob).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("key", "j".repeat(64)).param("hash", historicalHash).update();
+
+        successful(delete("/api/v1/materials/" + firstId, owner), 204);
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
+                .param("id", historicalJob).query(String.class).single()).isEqualTo("queued");
+
+        JobQueue.ClaimedJob claimed = jobs.claim("historical-generation-worker", Set.of("preview_generate"));
+        assertThat(claimed).isNotNull();
+        AtomicBoolean published = new AtomicBoolean();
+        assertThat(jobs.complete(claimed, () -> published.set(true))).isFalse();
+        assertThat(published).isFalse();
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
+                .param("id", historicalJob).query(String.class).single()).isEqualTo("outdated");
+        recordHttp("historicalGenerationAfterDeletion", "204", "generation-publication-blocked;job-outdated");
+    }
+
+    @Test
+    void defersExamResourceObjectDeletionUntilItsIssuedUploadUrlExpires() throws Exception {
+        String owner = login("exam-resource-upload-expiry-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        JsonNode upload = successful(post("/api/v1/exams/" + ids.examId() + "/resources", owner,
+                Map.of("filename", "pending-past-exam.pdf", "mimeType", "application/pdf", "byteSize", 100)), 201);
+        String resourceId = upload.path("id").asText();
+        Instant issuedExpiry = Instant.parse(upload.path("expiresAt").asText());
+
+        successful(delete("/api/v1/exam-resources/" + resourceId, owner), 204);
+        Instant notBefore = jdbc.sql("SELECT not_before FROM resource_object_deletions WHERE object_key=:key")
+                .param("key", deletionKey(resourceId)).query(Timestamp.class).single().toInstant();
+
+        assertThat(notBefore).isEqualTo(issuedExpiry);
+        recordHttp("examResourceDeleteUploadExpiry", "204", "outbox-notBefore=issued-expiresAt");
+    }
+
+    @Test
+    void returnsNotFoundForUnknownResourceDeletionIds() throws Exception {
+        String owner = login("unknown-resource-delete-owner");
+
+        assertError(delete("/api/v1/materials/" + UUID.randomUUID(), owner), 404, "RESOURCE_NOT_FOUND");
+        assertError(delete("/api/v1/exam-resources/" + UUID.randomUUID(), owner), 404, "RESOURCE_NOT_FOUND");
+        recordHttp("unknownResourceDelete", "404", "material;exam-resource");
+    }
+
+    @Test
     void appliesV003_whenDatabaseIsFresh() {
         assertThat(jdbc.sql("SELECT success FROM flyway_schema_history WHERE version = '003'")
                 .query(Boolean.class).single()).isTrue();
@@ -784,6 +874,41 @@ class ResourceUploadApiIT {
                         WHERE object_key LIKE :suffix
                         """).param("suffix", "%/" + resourceId + "/source.pdf")
                 .query(String.class).single();
+    }
+
+    private void insertPreviewMaterialChunk(UUID ownerId, UUID courseId, UUID sessionId, UUID materialId,
+                                            String materialIdText, String text) throws Exception {
+        UUID pageId = UUID.randomUUID();
+        UUID blockId = UUID.randomUUID();
+        String sourceHash = ContentIndexingService.sha256(blockId + ":" + text);
+        String sourceRef = objectMapper.writeValueAsString(Map.of(
+                "sourceType", "pdf_text", "materialId", materialIdText,
+                "contentBlockId", blockId.toString(), "pageNumber", 1, "inputVersion", 1));
+        jdbc.sql("""
+                        INSERT INTO document_pages
+                            (id,owner_id,course_id,session_id,material_id,page_number,text_content,text_hash,
+                             extraction_method,created_at)
+                        VALUES (:id,:owner,:course,:session,:material,1,:text,:hash,'pdf_text',CURRENT_TIMESTAMP)
+                        """).param("id", pageId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("material", materialId).param("text", text)
+                .param("hash", ContentIndexingService.sha256(text)).update();
+        jdbc.sql("""
+                        INSERT INTO content_blocks
+                            (id,owner_id,course_id,session_id,material_id,page_id,block_type,text_content,
+                             source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:material,:page,'text',:text,:hash,CURRENT_TIMESTAMP)
+                        """).param("id", blockId).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("material", materialId).param("page", pageId).param("text", text)
+                .param("hash", sourceHash).update();
+        jdbc.sql("""
+                        INSERT INTO chunks
+                            (id,owner_id,course_id,session_id,content_block_id,chunk_index,text_content,source_ref,
+                             source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:block,0,:text,CAST(:reference AS jsonb),:hash,
+                                CURRENT_TIMESTAMP)
+                        """).param("id", UUID.randomUUID()).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("block", blockId).param("text", text)
+                .param("reference", sourceRef).param("hash", sourceHash).update();
     }
 
     private DomainIds domain(String token, String startsAt, String endsAt) throws Exception {

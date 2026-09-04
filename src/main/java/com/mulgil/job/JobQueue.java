@@ -2,6 +2,7 @@ package com.mulgil.job;
 
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.common.error.ApiException;
+import com.mulgil.generation.GenerationSnapshotService;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
@@ -37,14 +38,16 @@ public class JobQueue {
     private final AiJobAdmissionGuard admission;
     private final Clock clock;
     private final List<JobCompletionListener> listeners;
+    private final GenerationSnapshotService snapshots;
 
     JobQueue(JdbcClient jdbc, MulgilProperties properties, AiJobAdmissionGuard admission,
-             Clock clock, List<JobCompletionListener> listeners) {
+             Clock clock, List<JobCompletionListener> listeners, GenerationSnapshotService snapshots) {
         this.jdbc = jdbc;
         this.properties = properties;
         this.admission = admission;
         this.clock = clock;
         this.listeners = List.copyOf(listeners);
+        this.snapshots = snapshots;
     }
 
     @Transactional
@@ -315,6 +318,7 @@ public class JobQueue {
 
     private boolean sourceIsCurrent(AiJob job) {
         if (!courseActive(job.ownerId(), job.courseId())) return false;
+        if (GENERATION_TYPES.contains(job.type())) return generationSourceIsCurrent(job);
         if (job.materialId() != null) {
             return jdbc.sql("""
                     SELECT id FROM materials WHERE id=:id AND owner_id=:owner
@@ -338,6 +342,18 @@ public class JobQueue {
                     .param("hash", job.sourceHash()).query(UUID.class).optional().isPresent();
         }
         return true;
+    }
+
+    private boolean generationSourceIsCurrent(AiJob job) {
+        if (!lockActiveSession(job.ownerId(), job.courseId(), job.sessionId())) return false;
+        GenerationSnapshotService.Snapshot snapshot = switch (job.type()) {
+            case "preview_generate" -> snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "preview");
+            case "review_generate" -> snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "review");
+            case "exam_summary_generate" -> snapshots.exam(job.ownerId(), job.examId(), false);
+            case "exam_quiz_generate" -> snapshots.exam(job.ownerId(), job.examId(), true);
+            default -> throw new IllegalStateException("Unsupported generation job type.");
+        };
+        return snapshot != null && snapshot.snapshotHash().equals(job.sourceHash());
     }
 
     private void markOutdated(UUID id, String workerId) {
@@ -375,6 +391,18 @@ public class JobQueue {
                         FOR SHARE
                         """)
                 .param("owner", ownerId).param("course", courseId).query(UUID.class).optional().isPresent();
+    }
+
+    private boolean lockActiveSession(UUID ownerId, UUID courseId, UUID sessionId) {
+        return jdbc.sql("""
+                        SELECT session.id FROM class_sessions session
+                        JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                        WHERE session.owner_id=:owner AND session.course_id=:course AND session.id=:session
+                          AND course.deleted_at IS NULL
+                        FOR SHARE OF session, course
+                        """)
+                .param("owner", ownerId).param("course", courseId).param("session", sessionId)
+                .query(UUID.class).optional().isPresent();
     }
 
     private void notifyAfterCommit(CompletionEvent event) {

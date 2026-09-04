@@ -1,5 +1,6 @@
 package com.mulgil.job;
 
+import com.mulgil.indexing.ContentIndexingService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import com.mulgil.common.config.MulgilProperties;
@@ -153,13 +154,14 @@ class JobQueueIT {
 
     @Test
     void reusesSucceededGeneration_whenOnlyAllocatedArtifactVersionChanges() {
+        String snapshotHash = ContentIndexingService.sha256("");
         JobQueue.EnqueueRequest firstRequest = new JobQueue.EnqueueRequest("review_generate", ownerId, courseId,
-                sessionId, null, null, null, null, null, 1, HASH, "vertex", "generation-v1", "prompt-v1");
+                sessionId, null, null, null, null, null, 1, snapshotHash, "vertex", "generation-v1", "prompt-v1");
         JobQueue.AiJob first = queue.enqueue(firstRequest);
         queue.complete(queue.claim("generation-cache", Set.of("review_generate")), () -> {});
 
         JobQueue.AiJob replay = queue.enqueue(new JobQueue.EnqueueRequest("review_generate", ownerId, courseId,
-                sessionId, null, null, null, null, null, 2, HASH, "vertex", "generation-v1", "prompt-v1"));
+                sessionId, null, null, null, null, null, 2, snapshotHash, "vertex", "generation-v1", "prompt-v1"));
 
         assertThat(replay.id()).isEqualTo(first.id());
         assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type='review_generate'")

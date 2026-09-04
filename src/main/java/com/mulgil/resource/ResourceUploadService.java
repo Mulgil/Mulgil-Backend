@@ -116,11 +116,13 @@ class ResourceUploadService {
         if (!repository.lockExam(ownerId, examId)) throw notFound();
         UUID id = UUID.randomUUID();
         String key = "owner/%s/exam/%s/resource/%s/source.pdf".formatted(ownerId, examId, id);
+        Instant now = clock.instant();
+        Instant expiry = expiresAt(now);
         ResourceRepository.ExamResource resource = repository.createExamResource(ownerId, id,
                 new ResourceRepository.ExamResourceWrite(examId, request.filename(), request.mimeType(),
-                        request.byteSize(), key), clock.instant());
+                        request.byteSize(), key), expiry, now);
         if (resource == null) throw notFound();
-        return uploadUrl(resource.id(), resource.objectKey(), resource.mimeType(), resource.byteSize());
+        return uploadUrl(resource.id(), resource.objectKey(), resource.mimeType(), resource.byteSize(), expiry);
     }
 
     @Transactional
@@ -227,8 +229,10 @@ class ResourceUploadService {
     }
 
     private Instant examResourceDeletionNotBefore(ResourceRepository.ExamResource resource, Instant now) {
-        Instant expiry = resource.createdAt().plusSeconds(properties.gcs().signedUrlTtlSeconds());
-        return "created".equals(resource.status()) && expiry.isAfter(now) ? expiry : now;
+        if (!"created".equals(resource.status())) return now;
+        Instant expiry = resource.uploadExpiresAt();
+        if (expiry != null) return expiry.isAfter(now) ? expiry : now;
+        return now.plusSeconds(properties.gcs().signedUrlTtlSeconds());
     }
 
     private void validatePdf(String mimeType, long byteSize) {

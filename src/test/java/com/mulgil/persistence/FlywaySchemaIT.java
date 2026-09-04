@@ -53,7 +53,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV015_whenDatabaseIsFresh() {
+    void appliesV001ThroughV016_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -89,6 +89,11 @@ class FlywaySchemaIT {
                           AND column_name IN ('material_id', 'exam_resource_id')
                           AND is_nullable = 'YES'
                         """).query(Integer.class).single();
+        Integer examResourceUploadExpiryColumns = jdbc.sql("""
+                        SELECT count(*) FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'exam_resources'
+                          AND column_name = 'upload_expires_at' AND data_type = 'timestamp with time zone'
+                        """).query(Integer.class).single();
         Integer requiredConstraints = jdbc.sql("""
                         SELECT count(*) FROM pg_constraint
                         WHERE connamespace = 'public'::regnamespace AND conname IN (
@@ -114,11 +119,12 @@ class FlywaySchemaIT {
                             'ai_jobs_cache_fingerprint_default')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015");
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015", "016");
         assertThat(requiredTables).isEqualTo(19);
         assertThat(requiredIndexes).hasSize(12);
         assertThat(jobColumns).isEqualTo(7);
         assertThat(nullableSourceParents).isEqualTo(4);
+        assertThat(examResourceUploadExpiryColumns).isOne();
         assertThat(requiredConstraints).isEqualTo(13);
         assertThat(requiredTriggers).isEqualTo(9);
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
