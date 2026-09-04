@@ -365,6 +365,26 @@ class ResourceUploadApiIT {
     }
 
     @Test
+    void rejectsExamResourceCompletion_whenUploadReservationExpired() throws Exception {
+        String owner = login("expired-exam-resource-completion-owner");
+        DomainIds ids = domain(owner, "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z");
+        String resourceId = successful(post("/api/v1/exams/" + ids.examId() + "/resources", owner,
+                Map.of("filename", "expired-past-exam.pdf", "mimeType", "application/pdf", "byteSize", 100)), 201)
+                .path("id").asText();
+        jdbc.sql("UPDATE exam_resources SET upload_expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second' WHERE id=:id")
+                .param("id", java.util.UUID.fromString(resourceId)).update();
+        storage.directPut(resourceId, "application/pdf", 100, PDF_CHECKSUM);
+        probe.pdf(resourceId, 1, PDF_CHECKSUM);
+
+        assertError(post("/api/v1/exam-resources/" + resourceId + "/upload-complete", owner,
+                Map.of("checksumSha256", PDF_CHECKSUM)), 410, "UPLOAD_URL_EXPIRED");
+        assertThat(jdbc.sql("SELECT status FROM exam_resources WHERE id=:id")
+                .param("id", java.util.UUID.fromString(resourceId))
+                .query(String.class).single()).isEqualTo("created");
+        recordHttp("expiredExamResourceCompletion", "410", "expired-upload-rejected");
+    }
+
+    @Test
     void hidesOwnedResources_whenAnotherUserRequestsThem() throws Exception {
         String owner = login("ownership-a");
         String foreign = login("ownership-b");

@@ -127,13 +127,23 @@ class ResourceUploadService {
 
     @Transactional
     ExamResource finalizeExamResource(UUID ownerId, UUID resourceId, String checksum) {
-        ResourceRepository.ExamResource resource = repository.examResource(ownerId, resourceId)
+        Instant now = clock.instant();
+        ResourceRepository.ExamResource resource = repository.examResourceForUpdate(ownerId, resourceId)
                 .orElseThrow(ResourceUploadService::notFound);
+        if (!"created".equals(resource.status())) {
+            if (resource.uploadExpiresAt() != null && !resource.uploadExpiresAt().isAfter(now)) {
+                throw uploadExpired();
+            }
+            throw notFound();
+        }
+        if (resource.uploadExpiresAt() == null || !resource.uploadExpiresAt().isAfter(now)) {
+            throw uploadExpired();
+        }
         ResourceContentProbe.PdfInspection inspection = finalization.finalizePdf(
                 descriptor(resource.objectKey(), resource.mimeType(), resource.byteSize()), checksum);
         validatePages(inspection.pageCount());
         ExamResource completed = examResource(repository.finalizeExamResource(ownerId, resourceId,
-                inspection.pageCount(), checksum.toLowerCase(), clock.instant()));
+                inspection.pageCount(), checksum.toLowerCase(), now).orElseThrow(ResourceUploadService::uploadExpired));
         jobs.enqueuePdfExamResource(ownerId, resourceId);
         return completed;
     }

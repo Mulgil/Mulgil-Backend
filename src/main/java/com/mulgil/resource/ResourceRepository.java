@@ -255,7 +255,7 @@ class ResourceRepository {
                 .query((row, ignored) -> examResource(row)).list();
     }
 
-    ExamResource finalizeExamResource(UUID ownerId, UUID id, int pageCount, String checksum, Instant now) {
+    Optional<ExamResource> finalizeExamResource(UUID ownerId, UUID id, int pageCount, String checksum, Instant now) {
         return jdbc.sql("""
                         UPDATE exam_resources resource SET page_count = :pageCount, checksum = :checksum,
                             status = 'uploaded', updated_at = :now
@@ -263,6 +263,7 @@ class ResourceRepository {
                         WHERE resource.owner_id = :ownerId AND resource.id = :id
                           AND course.id = resource.course_id AND course.owner_id = resource.owner_id
                           AND course.deleted_at IS NULL
+                          AND resource.status = 'created' AND resource.upload_expires_at > :now
                         RETURNING resource.id, resource.course_id, resource.exam_id, resource.resource_type,
                                   resource.original_filename, resource.mime_type, resource.byte_size,
                                   resource.page_count, resource.status, resource.object_key, resource.upload_expires_at,
@@ -270,7 +271,7 @@ class ResourceRepository {
                         """)
                 .param("pageCount", pageCount).param("checksum", checksum).param("now", Timestamp.from(now))
                 .param("ownerId", ownerId).param("id", id)
-                .query((row, ignored) -> examResource(row)).single();
+                .query((row, ignored) -> examResource(row)).optional();
     }
 
     void scheduleObjectDeletion(String objectKey, Instant notBefore, Instant now) {
