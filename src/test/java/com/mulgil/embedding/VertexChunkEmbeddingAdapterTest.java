@@ -99,6 +99,22 @@ class VertexChunkEmbeddingAdapterTest {
     }
 
     @Test
+    void observesOnePhysicalRequestForFiveTextsWithOnlyStableTags() {
+        PredictionServiceClient client = mock(PredictionServiceClient.class);
+        when(client.predict(anyString(), anyList(), any())).thenReturn(response(List.of(0f, 1f, 2f, 3f, 4f), 768));
+        SimpleMeterRegistry metrics = new SimpleMeterRegistry();
+
+        adapter(5, client, metrics).embedAll(List.of("0", "1", "2", "3", "4"));
+
+        var timer = metrics.get("mulgil.embedding.provider.request")
+                .tags("provider", "vertex", "model", "text-multilingual-embedding-002",
+                        "batchSize", "5", "code", "OK").timer();
+        assertThat(timer.count()).isEqualTo(1L);
+        assertThat(timer.getId().getTags()).extracting(io.micrometer.core.instrument.Tag::getKey)
+                .containsExactlyInAnyOrder("provider", "model", "batchSize", "code");
+    }
+
+    @Test
     void checkpointsSuccessfulSingletonBeforeLaterFallbackFailure_andDoesNotAttemptRemainingInput() {
         PredictionServiceClient client = mock(PredictionServiceClient.class);
         InvalidArgumentException batchFailure = mock(InvalidArgumentException.class);

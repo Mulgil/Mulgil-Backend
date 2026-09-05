@@ -3,6 +3,7 @@ package com.mulgil.job;
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.common.error.ApiException;
 import com.mulgil.generation.GenerationSnapshotService;
+import com.mulgil.indexing.ChunkEmbedJobHandler;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
@@ -94,7 +95,10 @@ public class JobQueue {
 
     @Transactional
     public AiJob enqueue(EnqueueRequest request) {
-        if (!courseActive(request.ownerId(), request.courseId())) throw notFound();
+        boolean active = request.type().equals("chunk_embed")
+                ? lockActiveSession(request.ownerId(), request.courseId(), request.sessionId())
+                : courseActive(request.ownerId(), request.courseId());
+        if (!active) throw notFound();
         String fingerprint = idempotencyKey(request);
         admission.lockOwner(request.ownerId());
         boolean reuseSucceeded = properties.demo().cacheEnabled() || !admission.isBillable(request.type());
@@ -188,6 +192,45 @@ public class JobQueue {
                 .query((row, ignored) -> claimed(row)).optional().orElse(null);
     }
 
+    @Transactional
+    public List<ClaimedJob> claimChunkEmbeddings(String workerId, int maxJobs) {
+        if (maxJobs < 1) throw new IllegalArgumentException("maxJobs must be positive.");
+        recoverExpired();
+        discardQueuedArchived();
+        Instant now = clock.instant();
+        return jdbc.sql("""
+                        WITH seed AS (
+                            SELECT job.owner_id, job.course_id, job.session_id
+                            FROM ai_jobs job
+                            JOIN courses course ON course.id=job.course_id AND course.owner_id=job.owner_id
+                            WHERE job.status='queued' AND job.attempt_count < job.max_attempts
+                              AND job.job_type='chunk_embed' AND course.deleted_at IS NULL
+                            ORDER BY job.created_at, job.id
+                            FOR UPDATE OF job SKIP LOCKED LIMIT 1
+                        ), selected AS (
+                            SELECT job.id
+                            FROM ai_jobs job
+                            JOIN seed ON seed.owner_id=job.owner_id AND seed.course_id=job.course_id
+                                     AND seed.session_id=job.session_id
+                            WHERE job.status='queued' AND job.attempt_count < job.max_attempts
+                              AND job.job_type='chunk_embed'
+                            ORDER BY job.created_at, job.id
+                            FOR UPDATE OF job SKIP LOCKED LIMIT :maxJobs
+                        ), updated AS (
+                            UPDATE ai_jobs job SET status='running', attempt_count=attempt_count + 1,
+                                claimed_by=:workerId, last_heartbeat_at=:now,
+                                lease_expires_at=:lease, started_at=COALESCE(started_at, :now),
+                                error_code=NULL, error_message=NULL, finished_at=NULL
+                            FROM selected WHERE job.id=selected.id
+                            RETURNING job.*
+                        )
+                        SELECT * FROM updated ORDER BY created_at, id
+                        """)
+                .param("maxJobs", maxJobs).param("workerId", workerId).param("now", Timestamp.from(now))
+                .param("lease", Timestamp.from(now.plusSeconds(properties.jobs().leaseSeconds())))
+                .query((row, ignored) -> claimed(row)).list();
+    }
+
     public boolean heartbeat(UUID jobId, String workerId) {
         Instant now = clock.instant();
         return jdbc.sql("""
@@ -211,11 +254,37 @@ public class JobQueue {
 
     @Transactional
     public boolean complete(ClaimedJob claimed, JobHandler.JobPublication publication) {
+        AiJob completed = completeCurrent(claimed, publication);
+        if (completed != null) notifyAfterCommit(event(completed));
+        return completed != null;
+    }
+
+    @Transactional
+    public void finishChunkEmbeddings(List<ChunkEmbedJobHandler.BatchOutcome> outcomes) {
+        if (outcomes.isEmpty()) return;
+        ClaimedJob scope = outcomes.getFirst().job();
+        boolean activeSession = lockChunkCompletionSession(scope.ownerId(), scope.courseId(), scope.sessionId());
+        AiJob representative = null;
+        for (ChunkEmbedJobHandler.BatchOutcome outcome : outcomes) {
+            if (!outcome.succeeded()) {
+                JobHandler.JobExecutionException failure = outcome.failure();
+                fail(outcome.job(), failure.code(), failure.getMessage(), failure.retryable());
+                continue;
+            }
+            AiJob completed = completeCurrent(outcome.job(), outcome.publication());
+            if (representative == null && completed != null) representative = completed;
+        }
+        if (representative != null && activeSession && chunkSessionIdle(representative)) {
+            notifyAfterCommit(event(representative));
+        }
+    }
+
+    private AiJob completeCurrent(ClaimedJob claimed, JobHandler.JobPublication publication) {
         AiJob current = lockRunning(claimed.id(), claimed.claimedBy());
-        if (current == null) return false;
+        if (current == null) return null;
         if (!sourceIsCurrent(current)) {
             markOutdated(current.id(), claimed.claimedBy());
-            return false;
+            return null;
         }
         publication.publish();
         Instant now = clock.instant();
@@ -225,8 +294,7 @@ public class JobQueue {
                         WHERE id = :id AND status = 'running' AND claimed_by = :workerId
                         """).param("now", Timestamp.from(now)).param("id", current.id())
                 .param("workerId", claimed.claimedBy()).update();
-        if (updated == 1) notifyAfterCommit(event(current));
-        return updated == 1;
+        return updated == 1 ? current : null;
     }
 
     public void fail(ClaimedJob claimed, String code, String message, boolean retryable) {
@@ -403,6 +471,29 @@ public class JobQueue {
                         """)
                 .param("owner", ownerId).param("course", courseId).param("session", sessionId)
                 .query(UUID.class).optional().isPresent();
+    }
+
+    private boolean lockChunkCompletionSession(UUID ownerId, UUID courseId, UUID sessionId) {
+        return jdbc.sql("""
+                        SELECT session.id FROM class_sessions session
+                        JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
+                        WHERE session.owner_id=:owner AND session.course_id=:course AND session.id=:session
+                          AND course.deleted_at IS NULL
+                        FOR UPDATE OF session, course
+                        """)
+                .param("owner", ownerId).param("course", courseId).param("session", sessionId)
+                .query(UUID.class).optional().isPresent();
+    }
+
+    private boolean chunkSessionIdle(AiJob job) {
+        return jdbc.sql("""
+                        SELECT NOT EXISTS(
+                            SELECT 1 FROM ai_jobs
+                            WHERE owner_id=:owner AND course_id=:course AND session_id=:session
+                              AND job_type='chunk_embed' AND status IN ('queued','running')
+                        )
+                        """).param("owner", job.ownerId()).param("course", job.courseId())
+                .param("session", job.sessionId()).query(Boolean.class).single();
     }
 
     private void notifyAfterCommit(CompletionEvent event) {
