@@ -87,7 +87,8 @@ class ChunkEmbedJobHandlerTest {
                     .thenAnswer(ignored -> usageHandle());
 
             List<ChunkEmbedJobHandler.BatchOutcome> outcomes =
-                    new ChunkEmbedJobHandler(jdbc, ports, properties, usage).handleBatch(List.of(expired));
+                    new ChunkEmbedJobHandler(jdbc, ports, properties, usage, rejectedQueue())
+                            .handleBatch(List.of(expired));
 
             assertThat(outcomes).singleElement().satisfies(outcome -> {
                 assertThat(outcome.succeeded()).isFalse();
@@ -145,7 +146,7 @@ class ChunkEmbedJobHandlerTest {
             AiProviderUsageLedger usage = mock(AiProviderUsageLedger.class);
             when(usage.begin(any(), any(), anyString(), anyString(), anyString(), anyString(), anyLong()))
                     .thenAnswer(ignored -> usageHandle());
-            ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage);
+            ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage, currentQueue());
 
             List<ChunkEmbedJobHandler.BatchOutcome> outcomes = handler.handleBatch(List.of(staleJob, currentJob));
 
@@ -209,7 +210,7 @@ class ChunkEmbedJobHandlerTest {
             AiProviderUsageLedger usage = mock(AiProviderUsageLedger.class);
             when(usage.begin(any(), any(), anyString(), anyString(), anyString(), anyString(), anyLong()))
                     .thenAnswer(ignored -> usageHandle());
-            ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage);
+            ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage, currentQueue());
 
             List<ChunkEmbedJobHandler.BatchOutcome> outcomes = handler.handleBatch(List.of(staleJob, currentJob));
 
@@ -255,7 +256,7 @@ class ChunkEmbedJobHandlerTest {
         AiProviderUsageLedger usage = mock(AiProviderUsageLedger.class);
         when(usage.begin(any(), any(), anyString(), anyString(), anyString(), anyString(), anyLong()))
                 .thenAnswer(ignored -> usageHandle());
-        ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage);
+        ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage, currentQueue());
 
         List<ChunkEmbedJobHandler.BatchOutcome> outcomes = handler.handleBatch(jobs);
         outcomes.forEach(outcome -> outcome.publication().publish());
@@ -302,7 +303,7 @@ class ChunkEmbedJobHandlerTest {
         AiProviderUsageLedger usage = mock(AiProviderUsageLedger.class);
         when(usage.begin(any(), any(), anyString(), anyString(), anyString(), anyString(), anyLong()))
                 .thenAnswer(ignored -> usageHandle());
-        ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage);
+        ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage, currentQueue());
 
         List<ChunkEmbedJobHandler.BatchOutcome> outcomes = handler.handleBatch(jobs);
 
@@ -340,7 +341,7 @@ class ChunkEmbedJobHandlerTest {
         AiProviderUsageLedger usage = mock(AiProviderUsageLedger.class);
         when(usage.begin(any(), any(), anyString(), anyString(), anyString(), anyString(), anyLong()))
                 .thenAnswer(ignored -> usageHandle());
-        ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage);
+        ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage, currentQueue());
 
         List<ChunkEmbedJobHandler.BatchOutcome> outcomes = handler.handleBatch(jobs);
 
@@ -383,7 +384,7 @@ class ChunkEmbedJobHandlerTest {
         AiProviderUsageLedger.UsageHandle failedUsage = usageHandle();
         when(usage.begin(any(), any(), anyString(), anyString(), anyString(), anyString(), anyLong()))
                 .thenReturn(firstUsage, failedUsage);
-        ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage);
+        ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(jdbc, ports, properties, usage, currentQueue());
 
         assertThatThrownBy(() -> handler.handle(job()))
                 .isInstanceOfSatisfying(JobHandler.JobExecutionException.class, exception -> {
@@ -422,7 +423,7 @@ class ChunkEmbedJobHandlerTest {
         MulgilProperties properties = mock(MulgilProperties.class);
         when(properties.vertex()).thenReturn(new MulgilProperties.Vertex("generation", "embedding", "us-central1", 5));
         ChunkEmbedJobHandler handler = new ChunkEmbedJobHandler(
-                jdbc, ports, properties, mock(AiProviderUsageLedger.class));
+                jdbc, ports, properties, mock(AiProviderUsageLedger.class), currentQueue());
         assertThatThrownBy(() -> handler.handle(job()))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Embedding count must match chunk count.");
@@ -462,6 +463,21 @@ class ChunkEmbedJobHandlerTest {
     private static AiProviderUsageLedger.UsageHandle usageHandle() {
         return new AiProviderUsageLedger.UsageHandle(
                 UUID.randomUUID(), UUID.randomUUID(), "vertex.embed", "vertex", "embedding", 1L);
+    }
+
+    private static JobQueue currentQueue() {
+        JobQueue queue = mock(JobQueue.class);
+        when(queue.publishWhileRunning(any(), any())).thenAnswer(invocation -> {
+            invocation.<JobHandler.JobPublication>getArgument(1).publish();
+            return true;
+        });
+        return queue;
+    }
+
+    private static JobQueue rejectedQueue() {
+        JobQueue queue = mock(JobQueue.class);
+        when(queue.publishWhileRunning(any(), any())).thenReturn(false);
+        return queue;
     }
 
     private static ApiException unavailable() {

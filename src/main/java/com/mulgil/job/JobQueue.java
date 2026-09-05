@@ -260,6 +260,11 @@ public class JobQueue {
     }
 
     @Transactional
+    public boolean publishWhileRunning(ClaimedJob claimed, JobHandler.JobPublication publication) {
+        return lockAndPublish(claimed, publication) != null;
+    }
+
+    @Transactional
     public void finishChunkEmbeddings(List<ChunkEmbedJobHandler.BatchOutcome> outcomes) {
         if (outcomes.isEmpty()) return;
         ClaimedJob scope = outcomes.getFirst().job();
@@ -280,13 +285,8 @@ public class JobQueue {
     }
 
     private AiJob completeCurrent(ClaimedJob claimed, JobHandler.JobPublication publication) {
-        AiJob current = lockRunning(claimed.id(), claimed.claimedBy());
+        AiJob current = lockAndPublish(claimed, publication);
         if (current == null) return null;
-        if (!sourceIsCurrent(current)) {
-            markOutdated(current.id(), claimed.claimedBy());
-            return null;
-        }
-        publication.publish();
         Instant now = clock.instant();
         int updated = jdbc.sql("""
                         UPDATE ai_jobs SET status = 'succeeded', claimed_by = NULL, last_heartbeat_at = NULL,
@@ -295,6 +295,17 @@ public class JobQueue {
                         """).param("now", Timestamp.from(now)).param("id", current.id())
                 .param("workerId", claimed.claimedBy()).update();
         return updated == 1 ? current : null;
+    }
+
+    private AiJob lockAndPublish(ClaimedJob claimed, JobHandler.JobPublication publication) {
+        AiJob current = lockRunning(claimed.id(), claimed.claimedBy());
+        if (current == null) return null;
+        if (!sourceIsCurrent(current)) {
+            markOutdated(current.id(), claimed.claimedBy());
+            return null;
+        }
+        publication.publish();
+        return current;
     }
 
     public void fail(ClaimedJob claimed, String code, String message, boolean retryable) {

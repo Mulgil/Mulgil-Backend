@@ -593,6 +593,55 @@ class JobQueueIT {
     }
 
     @Test
+    void blocksLeaseRecoveryUntilLockedPublicationCommits_andRejectsOldWorkerAfterReclaim() throws Exception {
+        JobQueue.AiJob job = enqueueChunks(sessionId, 1, 0).getFirst();
+        JobQueue.ClaimedJob oldClaim = queue.claimChunkEmbeddings("old-worker", 1).getFirst();
+        Instant lease = jdbc.sql("SELECT lease_expires_at FROM ai_jobs WHERE id=:id")
+                .param("id", job.id()).query(Instant.class).single();
+        CountDownLatch publicationEntered = new CountDownLatch(1);
+        CountDownLatch releasePublication = new CountDownLatch(1);
+        CountDownLatch recoveryStarted = new CountDownLatch(1);
+        AtomicBoolean rejectedPublication = new AtomicBoolean();
+
+        try (var workers = Executors.newScheduledThreadPool(2)) {
+            var publication = workers.submit(() -> queue.publishWhileRunning(oldClaim, () -> {
+                publicationEntered.countDown();
+                try {
+                    if (!releasePublication.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("Publication release timed out.");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("Publication interrupted.", exception);
+                }
+                jdbc.sql("UPDATE courses SET name='published' WHERE id=:id").param("id", courseId).update();
+            }));
+            assertThat(publicationEntered.await(2, TimeUnit.SECONDS)).isTrue();
+            long afterLease = Math.max(1, Duration.between(Instant.now(), lease).toMillis() + 100);
+            var recovery = workers.schedule(() -> {
+                recoveryStarted.countDown();
+                return queue.claimChunkEmbeddings("recovery-worker", 1).getFirst();
+            }, afterLease, TimeUnit.MILLISECONDS);
+
+            assertThat(recoveryStarted.await(3, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> recovery.get(300, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+            releasePublication.countDown();
+
+            assertThat(publication.get(3, TimeUnit.SECONDS)).isTrue();
+            JobQueue.ClaimedJob reclaimed = recovery.get(3, TimeUnit.SECONDS);
+            assertThat(reclaimed.claimedBy()).isEqualTo("recovery-worker");
+            assertThat(reclaimed.attemptCount()).isEqualTo(2);
+            assertThat(jdbc.sql("SELECT name FROM courses WHERE id=:id").param("id", courseId)
+                    .query(String.class).single()).isEqualTo("published");
+            assertThat(queue.publishWhileRunning(oldClaim, () -> rejectedPublication.set(true))).isFalse();
+            assertThat(rejectedPublication).isFalse();
+        } finally {
+            releasePublication.countDown();
+        }
+    }
+
+    @Test
     void keepsSingleClaimAndPublication_whenHandlerExceedsOneSecondLease() throws Exception {
         JobQueue.AiJob job = queue.enqueue(request());
         CountDownLatch handlerStarted = new CountDownLatch(1);
