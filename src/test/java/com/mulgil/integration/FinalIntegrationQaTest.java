@@ -265,7 +265,7 @@ class FinalIntegrationQaTest {
 
         int count = jdbc.sql("""
                         SELECT count(*) FROM ai_jobs WHERE owner_id=:owner AND created_at>=date_trunc('day',now())
-                          AND job_type IN ('pdf_ocr','handwriting_ocr','stt','chunk_embed',
+                          AND job_type IN ('pdf_ocr','handwriting_ocr','stt',
                                            'preview_generate','review_generate',
                                            'exam_summary_generate','exam_quiz_generate')
                         """)

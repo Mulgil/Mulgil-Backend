@@ -251,14 +251,14 @@ class JobQueueIT {
 
     @Test
     void rejectsEveryBillableJobTypeAfterThirtyCanonicalJobs_withoutChargingDuplicate() {
-        JobQueue.AiJob first = queue.enqueue(billable("chunk_embed", 0));
-        JobQueue.ClaimedJob claimed = queue.claim("quota-retry", Set.of("chunk_embed"));
+        JobQueue.AiJob first = queue.enqueue(billable("pdf_ocr", 0));
+        JobQueue.ClaimedJob claimed = queue.claim("quota-retry", Set.of("pdf_ocr"));
         queue.fail(claimed, "PROVIDER_TIMEOUT", "Provider timed out.", true);
-        for (int index = 1; index < 30; index++) queue.enqueue(billable("chunk_embed", index));
+        for (int index = 1; index < 30; index++) queue.enqueue(billable("pdf_ocr", index));
 
         assertThat(queue.retry(ownerId, first.id()).status()).isEqualTo("queued");
-        assertThat(queue.enqueue(billable("chunk_embed", 0)).id()).isEqualTo(first.id());
-        for (String type : Set.of("pdf_ocr", "handwriting_ocr", "stt", "chunk_embed", "review_generate")) {
+        assertThat(queue.enqueue(billable("pdf_ocr", 0)).id()).isEqualTo(first.id());
+        for (String type : Set.of("pdf_ocr", "handwriting_ocr", "stt", "review_generate")) {
             assertThatThrownBy(() -> queue.enqueue(billable(type, 100)))
                     .isInstanceOf(ApiException.class)
                     .extracting(value -> ((ApiException) value).code())
@@ -268,8 +268,15 @@ class JobQueueIT {
     }
 
     @Test
+    void acceptsChunkEmbedAfterDailyLimit_whenItIsAnInternalChildJob() {
+        for (int index = 0; index < 30; index++) queue.enqueue(billable("pdf_ocr", index));
+
+        assertThat(queue.enqueue(billable("chunk_embed", 100)).status()).isEqualTo("queued");
+    }
+
+    @Test
     void admitsOnlyOneBillableJob_whenTwoEnqueuesRaceAtDailyBoundary() throws Exception {
-        for (int index = 0; index < 29; index++) queue.enqueue(billable("chunk_embed", index));
+        for (int index = 0; index < 29; index++) queue.enqueue(billable("pdf_ocr", index));
 
         try (var workers = Executors.newFixedThreadPool(2)) {
             var first = workers.submit(() -> enqueueResult(billable("stt", 100)));

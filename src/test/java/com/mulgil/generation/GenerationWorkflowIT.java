@@ -224,17 +224,19 @@ class GenerationWorkflowIT {
     }
 
     @Test
-    void bypassesSucceededBillableJob_whenOutputCacheIsDisabled() {
-        JobQueue.EnqueueRequest request = cacheContractRequest("review_generate", "succeeded-billable");
-        JobQueue.AiJob first = jobs.enqueue(request);
-        jobs.complete(jobs.claim("succeeded-billable", Set.of(request.type())), () -> {});
+    void bypassesSucceededBillableJobs_whenOutputCacheIsDisabled() {
+        for (String type : List.of("review_generate", "chunk_embed")) {
+            JobQueue.EnqueueRequest request = cacheContractRequest(type, "succeeded-billable-" + type);
+            JobQueue.AiJob first = jobs.enqueue(request);
+            jobs.complete(jobs.claim("succeeded-billable-" + type, Set.of(type)), () -> {});
 
-        JobQueue.AiJob replay = jobs.enqueue(request);
+            JobQueue.AiJob replay = jobs.enqueue(request);
 
-        assertThat(replay.id()).isNotEqualTo(first.id());
-        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type=:type AND source_hash=:hash")
-                .param("type", request.type()).param("hash", request.sourceHash())
-                .query(Integer.class).single()).isEqualTo(2);
+            assertThat(replay.id()).as(type).isNotEqualTo(first.id());
+            assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type=:type AND source_hash=:hash")
+                    .param("type", type).param("hash", request.sourceHash())
+                    .query(Integer.class).single()).as(type).isEqualTo(2);
+        }
     }
 
     @Test
