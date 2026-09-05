@@ -18,6 +18,7 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -32,6 +33,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -59,7 +66,9 @@ class GenerationWorkflowIT {
     @Autowired JobQueue jobs;
     @Autowired List<JobHandler> handlers;
     @Autowired List<JobCompletionListener> listeners;
+    @Autowired GenerationScheduler scheduler;
     @Autowired FakeGenerationModel model;
+    @Autowired TransactionTemplate transactions;
     private final HttpClient http = HttpClient.newHttpClient();
 
     String token;
@@ -260,6 +269,164 @@ class GenerationWorkflowIT {
     }
 
     @Test
+    void serializesConcurrentExamGenerationTypes_onTheirSharedVersionCounter() throws Exception {
+        sources.addReviewNote("shared exam source", 0);
+        runOne("chunk_embed");
+        UUID exam = createExam();
+        sources.addPastExam(exam, "past exam source");
+        runOne("chunk_embed");
+        jdbc.sql("DELETE FROM ai_jobs WHERE job_type IN ('exam_summary_generate','exam_quiz_generate')").update();
+
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<JobQueue.JobAccepted> summary = executor.submit(() -> {
+                start.await();
+                return scheduler.scheduleExam(owner, exam, false);
+            });
+            Future<JobQueue.JobAccepted> quiz = executor.submit(() -> {
+                start.await();
+                return scheduler.scheduleExam(owner, exam, true);
+            });
+            start.countDown();
+
+            assertThat(summary.get(10, TimeUnit.SECONDS)).isNotNull();
+            assertThat(quiz.get(10, TimeUnit.SECONDS)).isNotNull();
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertThat(jdbc.sql("""
+                        SELECT input_version FROM ai_jobs
+                        WHERE exam_id=:exam AND job_type IN ('exam_summary_generate','exam_quiz_generate')
+                        """).param("exam", exam).query(Integer.class).list()).containsExactlyInAnyOrder(1, 2);
+        System.out.println("GENERATION_WORKFLOW scenario=concurrent_exam_types "
+                + "observable=shared_counter_versions_1_and_2 result=PASS");
+    }
+
+    @Test
+    void ignoresCompletionEvents_forWrongOwnerAbsentSessionAndArchivedCourse() throws Exception {
+        sources.addReviewNote("ready source", 0);
+        runOne("chunk_embed");
+        JobQueue.CompletionEvent event = completionEvent();
+        jdbc.sql("DELETE FROM ai_jobs WHERE job_type IN ('preview_generate','review_generate')").update();
+
+        scheduler.onCompleted(new JobQueue.CompletionEvent(event.jobId(), event.type(), UUID.randomUUID(),
+                event.courseId(), event.sessionId(), event.materialId(), event.examResourceId(), event.noteId(),
+                event.recordingId(), event.examId(), event.inputVersion(), event.sourceHash()));
+        scheduler.onCompleted(new JobQueue.CompletionEvent(event.jobId(), event.type(), event.ownerId(),
+                event.courseId(), UUID.randomUUID(), event.materialId(), event.examResourceId(), event.noteId(),
+                event.recordingId(), event.examId(), event.inputVersion(), event.sourceHash()));
+        jdbc.sql("UPDATE courses SET deleted_at=CURRENT_TIMESTAMP WHERE id=:course")
+                .param("course", course).update();
+        scheduler.onCompleted(event);
+
+        assertThat(jobCount("preview_generate") + jobCount("review_generate")).isZero();
+        System.out.println("GENERATION_WORKFLOW scenario=invalid_completion_scope "
+                + "observable=wrong_owner_absent_session_archived_course_create_zero_jobs result=PASS");
+    }
+
+    @Test
+    void blocksBehindSharedSessionLock_evenWhenCompletionSourcesAreInsufficient() throws Exception {
+        CountDownLatch holderLocked = new CountDownLatch(1);
+        CountDownLatch releaseHolder = new CountDownLatch(1);
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        CountDownLatch workerCompleted = new CountDownLatch(1);
+        AtomicInteger holderPid = new AtomicInteger();
+        AtomicInteger workerPid = new AtomicInteger();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        Future<?> holder = null;
+        Future<?> worker = null;
+        try {
+            holder = executor.submit(() -> transactions.executeWithoutResult(ignored -> {
+                holderPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                jdbc.sql("SELECT id FROM class_sessions WHERE id=:session FOR SHARE")
+                        .param("session", session).query(UUID.class).single();
+                holderLocked.countDown();
+                await(releaseHolder);
+            }));
+            assertThat(holderLocked.await(5, TimeUnit.SECONDS)).isTrue();
+            worker = executor.submit(() -> {
+                try {
+                    transactions.executeWithoutResult(ignored -> {
+                        workerPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                        workerStarted.countDown();
+                        scheduler.onCompleted(insufficientCompletionEvent());
+                    });
+                } finally {
+                    workerCompleted.countDown();
+                }
+            });
+            assertThat(workerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            awaitBlockedBy(holderPid.get(), workerPid.get(), workerCompleted, "shared session lock");
+            releaseHolder.countDown();
+            holder.get(10, TimeUnit.SECONDS);
+            worker.get(10, TimeUnit.SECONDS);
+
+            assertThat(jobCount("preview_generate") + jobCount("review_generate")).isZero();
+            System.out.println("GENERATION_WORKFLOW scenario=session_lock_contract "
+                    + "observable=share_holder_blocks_scheduler_update_then_zero_jobs result=PASS");
+        } finally {
+            releaseHolder.countDown();
+            if (holder != null) holder.cancel(true);
+            if (worker != null) worker.cancel(true);
+            executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void blocksBehindCourseArchival_thenSkipsSchedulingAfterCommit() throws Exception {
+        CountDownLatch archiveUpdated = new CountDownLatch(1);
+        CountDownLatch commitArchive = new CountDownLatch(1);
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        CountDownLatch workerCompleted = new CountDownLatch(1);
+        AtomicInteger archiverPid = new AtomicInteger();
+        AtomicInteger workerPid = new AtomicInteger();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        Future<?> archiver = null;
+        Future<?> worker = null;
+        try {
+            archiver = executor.submit(() -> transactions.executeWithoutResult(ignored -> {
+                archiverPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                jdbc.sql("UPDATE courses SET deleted_at=CURRENT_TIMESTAMP WHERE id=:course")
+                        .param("course", course).update();
+                archiveUpdated.countDown();
+                await(commitArchive);
+            }));
+            assertThat(archiveUpdated.await(5, TimeUnit.SECONDS)).isTrue();
+            worker = executor.submit(() -> {
+                try {
+                    transactions.executeWithoutResult(ignored -> {
+                        workerPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                        workerStarted.countDown();
+                        scheduler.onCompleted(insufficientCompletionEvent());
+                    });
+                } finally {
+                    workerCompleted.countDown();
+                }
+            });
+            assertThat(workerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            awaitBlockedBy(archiverPid.get(), workerPid.get(), workerCompleted, "course archival");
+            commitArchive.countDown();
+            archiver.get(10, TimeUnit.SECONDS);
+            worker.get(10, TimeUnit.SECONDS);
+
+            assertThat(jobCount("preview_generate") + jobCount("review_generate")).isZero();
+            System.out.println("GENERATION_WORKFLOW scenario=course_lock_contract "
+                    + "observable=uncommitted_archive_blocks_scheduler_then_zero_jobs result=PASS");
+        } finally {
+            commitArchive.countDown();
+            if (archiver != null) archiver.cancel(true);
+            if (worker != null) worker.cancel(true);
+            executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void bypassesSucceededBillableJobs_whenOutputCacheIsDisabled() {
         for (String type : List.of("review_generate", "chunk_embed")) {
             JobQueue.EnqueueRequest request = cacheContractRequest(type, "succeeded-billable-" + type);
@@ -354,13 +521,52 @@ class GenerationWorkflowIT {
     }
 
     private void runCompletionReplay() {
+        listeners.forEach(listener -> listener.onCompleted(completionEvent()));
+    }
+
+    private JobQueue.CompletionEvent completionEvent() {
         JobQueue.AiJob embedded = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='chunk_embed' ORDER BY created_at LIMIT 1")
                 .query((row, ignored) -> jobs.get(owner, row.getObject("id", UUID.class))).single();
-        JobQueue.CompletionEvent replay = new JobQueue.CompletionEvent(embedded.id(), embedded.type(),
+        return new JobQueue.CompletionEvent(embedded.id(), embedded.type(),
                 embedded.ownerId(), embedded.courseId(), embedded.sessionId(), embedded.materialId(),
                 embedded.examResourceId(), embedded.noteId(), embedded.recordingId(), embedded.examId(),
                 embedded.inputVersion(), embedded.sourceHash());
-        listeners.forEach(listener -> listener.onCompleted(replay));
+    }
+
+    private JobQueue.CompletionEvent insufficientCompletionEvent() {
+        return new JobQueue.CompletionEvent(UUID.randomUUID(), "chunk_embed", owner, course, session,
+                null, null, null, null, null, 1, ContentIndexingService.sha256("insufficient"));
+    }
+
+    private void awaitBlockedBy(int blockerPid, int workerPid, CountDownLatch completed, String lock) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (true) {
+            if (completed.getCount() == 0) {
+                throw new AssertionError("Scheduler completed before blocking behind " + lock + ".");
+            }
+            boolean blocked = jdbc.sql("""
+                            SELECT EXISTS(
+                                SELECT 1 FROM pg_stat_activity
+                                WHERE pid=:workerPid AND wait_event_type='Lock'
+                                  AND :blockerPid = ANY(pg_blocking_pids(pid))
+                            )
+                            """)
+                    .param("blockerPid", blockerPid).param("workerPid", workerPid)
+                    .query(Boolean.class).single();
+            if (blocked) return;
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("Scheduler did not block behind " + lock + ".");
+            }
+        }
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            if (!latch.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("Latch timed out.");
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Latch interrupted.", exception);
+        }
     }
 
     private int jobCount(String type) {

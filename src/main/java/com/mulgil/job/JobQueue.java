@@ -27,7 +27,8 @@ import java.util.UUID;
 @Service
 public class JobQueue {
     private static final Set<String> RETRYABLE_ERRORS = Set.of(
-            "PROVIDER_TIMEOUT", "PROVIDER_RATE_LIMIT", "PROVIDER_UNAVAILABLE", "LEASE_EXPIRED");
+            "PROVIDER_TIMEOUT", "PROVIDER_RATE_LIMIT", "PROVIDER_UNAVAILABLE", "LEASE_EXPIRED",
+            "DATABASE_DEADLOCK");
     private static final String PDF_PROVIDER = "pdfbox";
     private static final String PDF_MODEL = "pdfbox-3";
     private static final String NO_PROMPT = "none";
@@ -490,7 +491,7 @@ public class JobQueue {
                         JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
                         WHERE session.owner_id=:owner AND session.course_id=:course AND session.id=:session
                           AND course.deleted_at IS NULL
-                        FOR UPDATE OF session, course
+                        FOR UPDATE OF session FOR SHARE OF course
                         """)
                 .param("owner", ownerId).param("course", courseId).param("session", sessionId)
                 .query(UUID.class).optional().isPresent();

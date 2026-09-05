@@ -2,8 +2,10 @@ package com.mulgil.document;
 
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.common.error.ApiException;
+import com.mulgil.indexing.ChunkEmbedJobHandler;
 import com.mulgil.indexing.ChunkEmbeddingPort;
 import com.mulgil.indexing.ContentIndexingService;
+import com.mulgil.job.JobCompletionListener;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
 import com.mulgil.job.JobWorkerTestDriver;
@@ -21,6 +23,7 @@ import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
@@ -30,6 +33,7 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -39,6 +43,7 @@ import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.security.MessageDigest;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.HashMap;
@@ -47,6 +52,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -75,6 +87,8 @@ class PdfIndexingIT {
     @Autowired FakeVision vision;
     @Autowired ContentIndexingService indexing;
     @Autowired MulgilProperties properties;
+    @Autowired TransactionTemplate transactions;
+    @Autowired @Qualifier("generationScheduler") JobCompletionListener generationScheduler;
 
     UUID owner;
     UUID course;
@@ -276,6 +290,291 @@ class PdfIndexingIT {
         assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE content_block_id IN "
                         + "(SELECT id FROM content_blocks WHERE material_id=:id)")
                 .param("id", material).query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void completesPdfOcrPublication_whenChunkFinalizationRunsConcurrently() throws Exception {
+        byte[] source = pdf("x".repeat(79), false);
+        UUID material = insertMaterial(source);
+        jobs.enqueuePdfMaterial(owner, material);
+        JobQueue.ClaimedJob extract = jobs.claim("deadlock-extract", Set.of("pdf_extract"));
+        assertThat(jobs.run(extract, handler("pdf_extract"))).isTrue();
+        JobQueue.ClaimedJob ocr = jobs.claim("deadlock-ocr", Set.of("pdf_ocr"));
+        jobs.enqueue(JobQueue.EnqueueRequest.material("chunk_embed", owner, course, session,
+                material, 1, checksum(source), "vertex", "fake-768", "none"));
+        JobQueue.ClaimedJob chunk = jobs.claim("deadlock-chunk", Set.of("chunk_embed"));
+        jdbc.sql("UPDATE ai_jobs SET lease_expires_at=now() + interval '1 minute' WHERE id IN (:ids)")
+                .param("ids", List.of(ocr.id(), chunk.id())).update();
+
+        CountDownLatch ocrEntered = new CountDownLatch(1);
+        CountDownLatch releaseOcr = new CountDownLatch(1);
+        CountDownLatch controlledSessionLockHeld = new CountDownLatch(1);
+        CountDownLatch finalizerCompleted = new CountDownLatch(1);
+        AtomicInteger ocrPid = new AtomicInteger();
+        AtomicInteger finalizerPid = new AtomicInteger();
+        vision.delegate(ignored -> {
+            ocrPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+            ocrEntered.countDown();
+            await(releaseOcr);
+            return new VisionOcrPort.OcrResult(List.of(
+                    new VisionOcrPort.OcrBlock("recognized text", 0.91,
+                            new VisionOcrPort.NormalizedBox(0.1, 0.1, 0.7, 0.15))),
+                    "fake-vision", "fake-ocr");
+        });
+
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        Future<Boolean> ocrRun = null;
+        Future<?> finalizer = null;
+        try {
+            ocrRun = workers.submit(() -> jobs.run(ocr, handler("pdf_ocr")));
+            assertThat(ocrEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            finalizer = workers.submit(() -> {
+                try {
+                    transactions.executeWithoutResult(ignored -> {
+                        finalizerPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                        holdControlledSessionLock();
+                        controlledSessionLockHeld.countDown();
+                        jobs.finishChunkEmbeddings(List.of(
+                                new ChunkEmbedJobHandler.BatchOutcome(chunk, () -> {}, null)));
+                    });
+                } finally {
+                    finalizerCompleted.countDown();
+                }
+            });
+            assertThat(controlledSessionLockHeld.await(5, TimeUnit.SECONDS)).isTrue();
+            awaitFinalizerBlockedByOcrOrCompleted(ocrPid.get(), finalizerPid.get(), finalizerCompleted);
+            releaseOcr.countDown();
+
+            List<Throwable> failures = java.util.stream.Stream.of(failure(ocrRun), failure(finalizer))
+                    .filter(java.util.Objects::nonNull).toList();
+            assertThat(failures).allMatch(PdfIndexingIT::isPostgresDeadlock);
+            assertThat(failures)
+                    .withFailMessage("Expected compatible publication locks, but got %s",
+                            failures.stream().map(PdfIndexingIT::failureChain).toList())
+                    .isEmpty();
+        } finally {
+            ocrEntered.countDown();
+            releaseOcr.countDown();
+            controlledSessionLockHeld.countDown();
+            finalizerCompleted.countDown();
+            if (ocrRun != null) ocrRun.cancel(true);
+            if (finalizer != null) finalizer.cancel(true);
+            workers.shutdownNow();
+            workers.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void controlledSchedulerCompletion_doesNotDeadlockWithPdfOcrPublication() throws Exception {
+        byte[] source = pdf("x".repeat(79), false);
+        UUID material = insertMaterial(source);
+        String sourceHash = checksum(source);
+        jobs.enqueuePdfMaterial(owner, material);
+        JobQueue.ClaimedJob extract = jobs.claim("scheduler-extract", Set.of("pdf_extract"));
+        assertThat(jobs.run(extract, handler("pdf_extract"))).isTrue();
+
+        JobQueue.AiJob terminalChunk = jobs.enqueue(JobQueue.EnqueueRequest.material(
+                "chunk_embed", owner, course, session, material, 1, sourceHash, "vertex", "fake-768", "none"));
+        JobQueue.ClaimedJob terminalChunkClaim = jobs.claim("scheduler-terminal-chunk", Set.of("chunk_embed"));
+        assertThat(jobs.run(terminalChunkClaim, handler("chunk_embed"))).isTrue();
+        terminalChunk = jobs.get(owner, terminalChunk.id());
+        JobQueue.CompletionEvent event = completionEvent(terminalChunk);
+
+        JobQueue.ClaimedJob ocr = jobs.claim("scheduler-ocr", Set.of("pdf_ocr"));
+        jdbc.sql("UPDATE ai_jobs SET lease_expires_at=now() + interval '1 minute' WHERE id=:id")
+                .param("id", ocr.id()).update();
+
+        CountDownLatch ocrEntered = new CountDownLatch(1);
+        CountDownLatch releaseOcr = new CountDownLatch(1);
+        CountDownLatch controlledSessionLockHeld = new CountDownLatch(1);
+        CountDownLatch schedulerCompleted = new CountDownLatch(1);
+        AtomicInteger ocrPid = new AtomicInteger();
+        AtomicInteger schedulerPid = new AtomicInteger();
+        vision.delegate(ignored -> {
+            ocrPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+            ocrEntered.countDown();
+            await(releaseOcr);
+            return new VisionOcrPort.OcrResult(List.of(
+                    new VisionOcrPort.OcrBlock("recognized text", 0.91,
+                            new VisionOcrPort.NormalizedBox(0.1, 0.1, 0.7, 0.15))),
+                    "fake-vision", "fake-ocr");
+        });
+
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        Future<Boolean> ocrRun = null;
+        Future<?> schedulerRun = null;
+        try {
+            ocrRun = workers.submit(() -> jobs.run(ocr, handler("pdf_ocr")));
+            assertThat(ocrEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            schedulerRun = workers.submit(() -> {
+                try {
+                    transactions.executeWithoutResult(ignored -> {
+                        schedulerPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                        // Controlled reproduction: establishes session-first state, not listener query lock order.
+                        holdControlledSessionLock();
+                        controlledSessionLockHeld.countDown();
+                        generationScheduler.onCompleted(event);
+                    });
+                } finally {
+                    schedulerCompleted.countDown();
+                }
+            });
+            assertThat(controlledSessionLockHeld.await(5, TimeUnit.SECONDS)).isTrue();
+            awaitWorkerBlockedByOcrOrCompleted(
+                    ocrPid.get(), schedulerPid.get(), schedulerCompleted, "Generation scheduler");
+            releaseOcr.countDown();
+
+            List<Throwable> failures = java.util.stream.Stream.of(failure(ocrRun), failure(schedulerRun))
+                    .filter(java.util.Objects::nonNull).toList();
+            assertThat(failures).allMatch(PdfIndexingIT::isPostgresDeadlock);
+            assertThat(failures)
+                    .withFailMessage("Expected compatible scheduler/OCR locks, but got %s",
+                            failures.stream().map(PdfIndexingIT::failureChain).toList())
+                    .isEmpty();
+
+            assertThat(jobs.get(owner, ocr.id()).status()).isEqualTo("succeeded");
+            assertThat(jobs.get(owner, terminalChunk.id()).status()).isEqualTo("succeeded");
+            assertThat(vision.calls()).isOne();
+            assertThat(jdbc.sql("SELECT extraction_method FROM document_pages WHERE material_id=:id")
+                    .param("id", material).query(String.class).single()).isEqualTo("ocr");
+            assertThat(jdbc.sql("SELECT count(*) FROM content_blocks WHERE material_id=:id")
+                    .param("id", material).query(Integer.class).single()).isOne();
+            assertThat(jdbc.sql("""
+                            SELECT operation||':'||status FROM ai_provider_usage
+                            WHERE job_id=:job
+                            """).param("job", ocr.id()).query(String.class).single())
+                    .isEqualTo("vision.ocr:succeeded");
+            assertThat(jdbc.sql("""
+                            SELECT id::text||':'||status FROM ai_jobs
+                            WHERE owner_id=:owner AND course_id=:course AND session_id=:session
+                              AND material_id=:material AND job_type='chunk_embed'
+                            """).param("owner", owner).param("course", course).param("session", session)
+                    .param("material", material).query(String.class).list())
+                    .containsExactly(terminalChunk.id() + ":succeeded");
+            assertThat(jdbc.sql("""
+                            SELECT count(*) FROM chunks
+                            WHERE content_block_id IN (
+                                SELECT id FROM content_blocks WHERE material_id=:material
+                            )
+                            """).param("material", material).query(Integer.class).single()).isOne();
+            assertThat(jdbc.sql("""
+                            SELECT job.status FROM ai_jobs job
+                            JOIN chunks chunk ON chunk.owner_id=job.owner_id
+                             AND chunk.course_id=job.course_id AND chunk.session_id=job.session_id
+                             AND chunk.source_hash=job.source_hash
+                            JOIN content_blocks block ON block.id=chunk.content_block_id
+                            WHERE block.material_id=:material AND job.job_type='chunk_embed'
+                              AND job.material_id IS NULL AND job.exam_resource_id IS NULL
+                              AND job.note_id IS NULL AND job.recording_id IS NULL
+                            """).param("material", material).query(String.class).list())
+                    .containsExactly("queued");
+            assertThat(jdbc.sql("""
+                            SELECT count(*) FROM ai_jobs
+                            WHERE owner_id=:owner AND session_id=:session
+                              AND job_type IN ('preview_generate','review_generate')
+                            """).param("owner", owner).param("session", session)
+                    .query(Integer.class).single()).isZero();
+        } finally {
+            ocrEntered.countDown();
+            releaseOcr.countDown();
+            controlledSessionLockHeld.countDown();
+            schedulerCompleted.countDown();
+            if (ocrRun != null) ocrRun.cancel(true);
+            if (schedulerRun != null) schedulerRun.cancel(true);
+            workers.shutdownNow();
+            workers.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private void holdControlledSessionLock() {
+        jdbc.sql("SELECT id FROM class_sessions WHERE id=:id FOR UPDATE")
+                .param("id", session).query(UUID.class).single();
+    }
+
+    private void awaitFinalizerBlockedByOcrOrCompleted(
+            int ocrPid, int finalizerPid, CountDownLatch finalizerCompleted) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (finalizerCompleted.getCount() != 0) {
+            boolean blockedByOcr = jdbc.sql("""
+                            SELECT EXISTS(
+                                SELECT 1 FROM pg_stat_activity
+                                WHERE pid=:finalizerPid AND wait_event_type='Lock'
+                                  AND :ocrPid = ANY(pg_blocking_pids(pid))
+                            )
+                            """)
+                    .param("ocrPid", ocrPid).param("finalizerPid", finalizerPid)
+                    .query(Boolean.class).single();
+            if (blockedByOcr) return;
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("Chunk finalizer neither completed nor blocked behind PDF OCR.");
+            }
+        }
+    }
+
+    private void awaitWorkerBlockedByOcrOrCompleted(
+            int ocrPid, int workerPid, CountDownLatch completed, String worker) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (completed.getCount() != 0) {
+            boolean blockedByOcr = jdbc.sql("""
+                            SELECT EXISTS(
+                                SELECT 1 FROM pg_stat_activity
+                                WHERE pid=:workerPid AND wait_event_type='Lock'
+                                  AND :ocrPid = ANY(pg_blocking_pids(pid))
+                            )
+                            """)
+                    .param("ocrPid", ocrPid).param("workerPid", workerPid)
+                    .query(Boolean.class).single();
+            if (blockedByOcr) return;
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError(worker + " neither completed nor blocked behind PDF OCR.");
+            }
+        }
+    }
+
+    private static JobQueue.CompletionEvent completionEvent(JobQueue.AiJob job) {
+        return new JobQueue.CompletionEvent(job.id(), job.type(), job.ownerId(), job.courseId(), job.sessionId(),
+                job.materialId(), job.examResourceId(), job.noteId(), job.recordingId(), job.examId(),
+                job.inputVersion(), job.sourceHash());
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            if (!latch.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("Latch timed out.");
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Latch interrupted.", exception);
+        }
+    }
+
+    private static Throwable failure(Future<?> future) {
+        try {
+            future.get(10, TimeUnit.SECONDS);
+            return null;
+        } catch (ExecutionException exception) {
+            return exception.getCause();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            return exception;
+        } catch (TimeoutException exception) {
+            return exception;
+        }
+    }
+
+    private static boolean isPostgresDeadlock(Throwable failure) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof SQLException sql && "40P01".equals(sql.getSQLState())) return true;
+        }
+        return false;
+    }
+
+    private static String failureChain(Throwable failure) {
+        StringBuilder chain = new StringBuilder();
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (!chain.isEmpty()) chain.append(" -> ");
+            chain.append(cause.getClass().getSimpleName()).append(": ").append(cause.getMessage());
+            if (cause instanceof SQLException sql) chain.append(" [SQLState=").append(sql.getSQLState()).append(']');
+        }
+        return chain.toString();
     }
 
     private UUID insertMaterial(byte[] pdf) throws Exception {

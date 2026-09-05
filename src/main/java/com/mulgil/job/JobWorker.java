@@ -6,9 +6,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 
+import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -53,10 +55,22 @@ class JobWorker {
             queue.fail(job, exception.code(), exception.getMessage(), exception.retryable());
         } catch (RuntimeException exception) {
             log.error("Job handler failed. jobId={} type={}", job.id(), job.type(), exception);
-            queue.fail(job, "JOB_HANDLER_FAILED", "Job handler failed.", false);
+            if (isDatabaseDeadlock(exception)) {
+                queue.fail(job, "DATABASE_DEADLOCK", "Job handler failed.", true);
+            } else {
+                queue.fail(job, "JOB_HANDLER_FAILED", "Job handler failed.", false);
+            }
         } finally {
             heartbeat.cancel(false);
         }
+    }
+
+    private static boolean isDatabaseDeadlock(Throwable exception) {
+        for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
+            if (cause instanceof PessimisticLockingFailureException
+                    || cause instanceof SQLException sql && "40P01".equals(sql.getSQLState())) return true;
+        }
+        return false;
     }
 
     @PreDestroy
