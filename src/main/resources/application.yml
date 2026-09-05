@@ -48,6 +48,7 @@ mulgil:
     max-retry: ${MAX_JOB_RETRY:2}
     lease-seconds: ${JOB_LEASE_SECONDS:60}
     provider-timeout-seconds: ${PROVIDER_TIMEOUT_SECONDS:60}
+    chunk-embed-concurrency: ${CHUNK_EMBED_CONCURRENCY:4}
   uploads:
     max-pdf-bytes: ${MAX_PDF_BYTES:52428800}
     max-pdf-pages: ${MAX_PDF_PAGES:150}

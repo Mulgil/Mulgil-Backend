@@ -73,7 +73,8 @@ public record MulgilProperties(
     public record Jobs(
             @Min(0) int maxRetry,
             @Min(1) long leaseSeconds,
-            @Min(1) long providerTimeoutSeconds
+            @Min(1) long providerTimeoutSeconds,
+            @Min(1) @Max(32) int chunkEmbedConcurrency
     ) {}
 
     public record Uploads(

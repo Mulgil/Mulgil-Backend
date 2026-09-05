@@ -154,8 +154,12 @@ class NotificationWorkflowIT {
                 VALUES(:id,:owner,:course,1,'Session','2026-09-01',:now,:now)
                 """).param("id", session).param("owner", owner).param("course", course)
                 .param("now", Timestamp.from(NOW)).update();
-        fcm.failNext("PROVIDER_TIMEOUT", true);
         scheduler.onCompleted(new JobQueue.CompletionEvent(UUID.randomUUID(), "chunk_embed", owner, course, session,
+                null, null, null, null, null, 1, "sensitive chunk input"));
+        assertThat(jdbc.sql("SELECT count(*) FROM notifications WHERE notification_type='processing_complete'")
+                .query(Integer.class).single()).isZero();
+        fcm.failNext("PROVIDER_TIMEOUT", true);
+        scheduler.onCompleted(new JobQueue.CompletionEvent(UUID.randomUUID(), "preview_generate", owner, course, session,
                 null, null, null, null, null, 1, "source text transcript signed URL token object key"));
         JobQueue.ClaimedJob claimed = jobs.claim("notification-failure-test", Set.of("notification_send"));
 
@@ -178,7 +182,7 @@ class NotificationWorkflowIT {
         assertThatThrownBy(() -> fcm.sent().getFirst()).isInstanceOf(java.util.NoSuchElementException.class);
 
         fcm.failNext("INVALID_ARGUMENT", false);
-        scheduler.onCompleted(new JobQueue.CompletionEvent(UUID.randomUUID(), "chunk_embed", owner, course, session,
+        scheduler.onCompleted(new JobQueue.CompletionEvent(UUID.randomUUID(), "preview_generate", owner, course, session,
                 null, null, null, null, null, 1, "different-sensitive-input"));
         JobQueue.ClaimedJob nonRetryable = jobs.claim("notification-nonretryable-test", Set.of("notification_send"));
         JobHandler.JobExecutionException terminalFailure = org.assertj.core.api.Assertions.catchThrowableOfType(

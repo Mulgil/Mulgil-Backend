@@ -50,7 +50,7 @@ final class GenerationController {
             @ApiResponse(responseCode = "404", description = "EXAM_NOT_FOUND or GENERATION_NOT_FOUND",
                     content = @Content(mediaType = MediaType.APPLICATION_JSON_VALUE,
                             schema = @Schema(implementation = ApiError.class))),
-            @ApiResponse(responseCode = "409", description = "INSUFFICIENT_SOURCE_DATA",
+            @ApiResponse(responseCode = "409", description = "INSUFFICIENT_SOURCE_DATA or EMBEDDING_NOT_READY",
                     content = @Content(mediaType = MediaType.APPLICATION_JSON_VALUE,
                             schema = @Schema(implementation = ApiError.class)))
     })

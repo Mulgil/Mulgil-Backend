@@ -26,7 +26,7 @@ import java.util.UUID;
 @Component
 class NotificationScheduler implements JobCompletionListener {
     private static final Set<String> PROCESSING_COMPLETIONS = Set.of(
-            "chunk_embed", "preview_generate", "review_generate", "exam_summary_generate", "exam_quiz_generate");
+            "preview_generate", "review_generate", "exam_summary_generate", "exam_quiz_generate");
 
     private final JdbcClient jdbc;
     private final ObjectProvider<JobQueue> jobs;

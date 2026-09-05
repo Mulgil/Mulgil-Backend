@@ -43,7 +43,7 @@ final class GenerationService {
         if (summary == null) {
             GenerationSnapshotService.Snapshot snapshot = snapshots.session(
                     ownerId, scope.courseId(), sessionId, type);
-            if (!snapshot.ready()) throw insufficient();
+            if (!snapshot.ready()) throw notReady(snapshot);
             throw new ApiException(HttpStatus.NOT_FOUND, "GENERATION_NOT_FOUND",
                     "Generated session content is not available yet.");
         }
@@ -84,7 +84,8 @@ final class GenerationService {
                 .optional().orElse(null);
         if (summary == null) {
             GenerationSnapshotService.Snapshot snapshot = snapshots.exam(ownerId, examId, false);
-            if (snapshot == null || !snapshot.ready()) throw insufficient();
+            if (snapshot == null) throw insufficient();
+            if (!snapshot.ready()) throw notReady(snapshot);
             throw new ApiException(HttpStatus.NOT_FOUND, "GENERATION_NOT_FOUND",
                     "Generated exam content is not available yet.");
         }
@@ -103,7 +104,11 @@ final class GenerationService {
                 .param("owner", ownerId).param("exam", examId).query(Boolean.class).single();
         if (!exists) throw new ApiException(HttpStatus.NOT_FOUND, "EXAM_NOT_FOUND", "Exam not found.");
         JobQueue.JobAccepted accepted = scheduler.scheduleExam(ownerId, examId, predicted);
-        if (accepted == null) throw insufficient();
+        if (accepted == null) {
+            GenerationSnapshotService.Snapshot snapshot = snapshots.exam(ownerId, examId, predicted);
+            if (snapshot != null && !snapshot.ready()) throw notReady(snapshot);
+            throw insufficient();
+        }
         return accepted;
     }
 
@@ -130,6 +135,15 @@ final class GenerationService {
     private static ApiException insufficient() {
         return new ApiException(HttpStatus.CONFLICT, "INSUFFICIENT_SOURCE_DATA",
                 "All required current sources must be indexed before generation.");
+    }
+
+    private static ApiException notReady(GenerationSnapshotService.Snapshot snapshot) {
+        return switch (snapshot.readiness()) {
+            case READY -> throw new IllegalStateException("Ready generation snapshot was not scheduled.");
+            case INSUFFICIENT_SOURCE_DATA -> insufficient();
+            case EMBEDDING_NOT_READY -> new ApiException(HttpStatus.CONFLICT, "EMBEDDING_NOT_READY",
+                    "Source embeddings are still being prepared.");
+        };
     }
 
     record SessionGeneration(SummaryView summary, MindmapView mindmap) {}

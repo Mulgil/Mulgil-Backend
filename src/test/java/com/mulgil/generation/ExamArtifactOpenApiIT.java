@@ -65,7 +65,8 @@ class ExamArtifactOpenApiIT {
         assertThat(summary.path("responses").fieldNames()).toIterable().contains("200", "404", "409");
         assertThat(summary.at("/responses/404/description").asText())
                 .contains("EXAM_NOT_FOUND", "GENERATION_NOT_FOUND");
-        assertThat(summary.at("/responses/409/description").asText()).contains("INSUFFICIENT_SOURCE_DATA");
+        assertThat(summary.at("/responses/409/description").asText())
+                .contains("INSUFFICIENT_SOURCE_DATA", "EMBEDDING_NOT_READY");
         assertThat(document.at("/components/schemas/ExamGeneration/properties").fieldNames()).toIterable()
                 .contains("id", "type", "inputVersion", "items", "tables");
         assertThat(document.at("/components/schemas/ExamGeneration/properties/type/enum/0").asText())

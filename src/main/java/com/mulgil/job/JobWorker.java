@@ -32,7 +32,8 @@ class JobWorker {
 
     JobWorker(JobQueue queue, List<JobHandler> handlers, MulgilProperties properties) {
         this.queue = queue;
-        this.handlers = handlers.stream().collect(Collectors.toUnmodifiableMap(JobHandler::jobType, Function.identity()));
+        this.handlers = handlers.stream().filter(handler -> !handler.jobType().equals("chunk_embed"))
+                .collect(Collectors.toUnmodifiableMap(JobHandler::jobType, Function.identity()));
         this.heartbeatPeriodMillis = Math.max(1, Math.min(TimeUnit.SECONDS.toMillis(20),
                 TimeUnit.SECONDS.toMillis(properties.jobs().leaseSeconds()) / 3));
     }

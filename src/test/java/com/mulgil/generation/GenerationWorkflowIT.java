@@ -8,6 +8,8 @@ import com.mulgil.job.JobCompletionListener;
 import com.mulgil.job.JobQueue;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -159,6 +161,40 @@ class GenerationWorkflowIT {
         error(send("POST", "/api/v1/exams/" + exam + "/predicted-quiz/generate", Map.of()),
                 409, "INSUFFICIENT_SOURCE_DATA");
         System.out.println("GENERATION_WORKFLOW scenario=insufficient_sources observable=session_get_409_predicted_post_409 result=PASS");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"queued", "running", "failed"})
+    void returnsEmbeddingNotReady_whenCurrentChunksAreUnembedded(String embeddingJobStatus) throws Exception {
+        sources.addReviewNote("current unembedded session source", 0);
+        UUID exam = createExam();
+        sources.addPastExam(exam, "current unembedded exam source");
+        switch (embeddingJobStatus) {
+            case "queued" -> { }
+            case "running" -> jdbc.sql("""
+                    UPDATE ai_jobs SET status='running',claimed_by='embedding-readiness',
+                        last_heartbeat_at=CURRENT_TIMESTAMP,lease_expires_at=CURRENT_TIMESTAMP + INTERVAL '1 minute'
+                    WHERE job_type='chunk_embed'
+                    """).update();
+            case "failed" -> jdbc.sql("""
+                    UPDATE ai_jobs SET status='failed',attempt_count=max_attempts,finished_at=CURRENT_TIMESTAMP,
+                        error_code='PROVIDER_UNAVAILABLE',error_message='Provider unavailable.'
+                    WHERE job_type='chunk_embed'
+                    """).update();
+            default -> throw new IllegalArgumentException("Unexpected embedding job status.");
+        }
+
+        error(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null),
+                409, "EMBEDDING_NOT_READY");
+        error(send("POST", "/api/v1/exams/" + exam + "/summary/generate", Map.of()),
+                409, "EMBEDDING_NOT_READY");
+        error(send("POST", "/api/v1/exams/" + exam + "/predicted-quiz/generate", Map.of()),
+                409, "EMBEDDING_NOT_READY");
+
+        runCompletionReplay();
+        assertThat(jobCount("review_generate")).isZero();
+        System.out.println("GENERATION_WORKFLOW scenario=unembedded_current_chunks status=" + embeddingJobStatus
+                + " observable=session_exam_409_and_no_practice_generation result=PASS");
     }
 
     @Test

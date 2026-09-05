@@ -11,6 +11,7 @@ import com.google.protobuf.Value;
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.indexing.ChunkEmbeddingPort;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -78,7 +79,7 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
         List<Value> instances = texts.stream().map(VertexChunkEmbeddingAdapter::instance).toList();
         try {
             return calls.call(startIndex, texts,
-                    () -> embeddings(client.predict(endpoint, instances, parameters), texts.size(), model));
+                    () -> embeddings(observePredict(client, endpoint, instances, parameters, model), texts.size(), model));
         } catch (InvalidArgumentException exception) {
             if (texts.size() == 1) throw EmbeddingProviderException.from(exception);
             metrics.counter("mulgil.embedding.batch.fallback", "reason", FALLBACK_REASON).increment();
@@ -90,7 +91,8 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
                 Value instance = instances.get(index);
                 try {
                     fallback.addAll(calls.call(startIndex + index, List.of(texts.get(index)),
-                            () -> embeddings(client.predict(endpoint, List.of(instance), parameters), 1, model)));
+                            () -> embeddings(observePredict(
+                                    client, endpoint, List.of(instance), parameters, model), 1, model)));
                 } catch (ApiException fallbackFailure) {
                     throw EmbeddingProviderException.from(fallbackFailure);
                 }
@@ -98,6 +100,23 @@ final class VertexChunkEmbeddingAdapter implements ChunkEmbeddingPort {
             return List.copyOf(fallback);
         } catch (ApiException exception) {
             throw EmbeddingProviderException.from(exception);
+        }
+    }
+
+    private PredictResponse observePredict(PredictionServiceClient client, String endpoint, List<Value> instances,
+                                            Value parameters, String model) {
+        Timer.Sample sample = Timer.start(metrics);
+        String code = "OK";
+        try {
+            return client.predict(endpoint, instances, parameters);
+        } catch (ApiException exception) {
+            code = exception.getStatusCode() == null
+                    ? "PROVIDER_FAILED" : EmbeddingProviderException.from(exception).code();
+            throw exception;
+        } finally {
+            sample.stop(metrics.timer("mulgil.embedding.provider.request",
+                    "provider", "vertex", "model", model,
+                    "batchSize", Integer.toString(instances.size()), "code", code));
         }
     }
 

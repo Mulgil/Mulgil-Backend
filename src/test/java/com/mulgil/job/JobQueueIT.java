@@ -1,10 +1,12 @@
 package com.mulgil.job;
 
 import com.mulgil.indexing.ContentIndexingService;
+import com.mulgil.indexing.ChunkEmbedJobHandler;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.common.error.ApiException;
+import jakarta.validation.Validator;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -23,6 +25,7 @@ import java.time.Instant;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.util.UUID;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -44,6 +47,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class JobQueueIT {
     private static final String HASH = "a".repeat(64);
     private static final LinkedBlockingQueue<JobQueue.CompletionEvent> COMPLETIONS = new LinkedBlockingQueue<>();
+    private static final LinkedBlockingQueue<Integer> ACTIVE_CHUNKS_AT_COMPLETION = new LinkedBlockingQueue<>();
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("pgvector/pgvector:pg16")
@@ -72,6 +76,9 @@ class JobQueueIT {
     MulgilProperties properties;
 
     @Autowired
+    Validator validator;
+
+    @Autowired
     AiProviderUsageLedger usage;
 
     @Autowired
@@ -88,6 +95,7 @@ class JobQueueIT {
         jdbc.sql("DELETE FROM ai_provider_usage").update();
         jdbc.sql("DELETE FROM users").update();
         COMPLETIONS.clear();
+        ACTIVE_CHUNKS_AT_COMPLETION.clear();
         ownerId = UUID.randomUUID();
         courseId = UUID.randomUUID();
         sessionId = UUID.randomUUID();
@@ -302,6 +310,102 @@ class JobQueueIT {
     }
 
     @Test
+    void claimsOldestChunkEmbeddingsFromOneSeedScope_inFifoOrder() {
+        UUID otherSession = insertSession(2);
+        List<JobQueue.AiJob> expected = enqueueChunks(sessionId, 3, 0);
+        enqueueChunks(otherSession, 2, 10);
+
+        List<JobQueue.ClaimedJob> claimed = queue.claimChunkEmbeddings("batch-worker", 2);
+
+        assertThat(claimed).extracting(JobQueue.ClaimedJob::id)
+                .containsExactly(expected.get(0).id(), expected.get(1).id());
+        assertThat(claimed).allSatisfy(job -> {
+            assertThat(job.ownerId()).isEqualTo(ownerId);
+            assertThat(job.courseId()).isEqualTo(courseId);
+            assertThat(job.sessionId()).isEqualTo(sessionId);
+            assertThat(job.attemptCount()).isOne();
+            assertThat(job.claimedBy()).isEqualTo("batch-worker");
+        });
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE status='running'")
+                .query(Integer.class).single()).isEqualTo(2);
+    }
+
+    @Test
+    void claimsDisjointSameScopeChunkEmbeddingBatches_whenWorkersRace() throws Exception {
+        List<JobQueue.AiJob> expected = enqueueChunks(sessionId, 6, 0);
+        UUID otherSession = insertSession(2);
+        enqueueChunks(otherSession, 2, 10);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try (var workers = Executors.newFixedThreadPool(2)) {
+            var first = workers.submit(() -> claimChunkBatchWhenReleased("batch-worker-1", ready, start));
+            var second = workers.submit(() -> claimChunkBatchWhenReleased("batch-worker-2", ready, start));
+            assertThat(ready.await(2, TimeUnit.SECONDS)).isTrue();
+            start.countDown();
+
+            List<JobQueue.ClaimedJob> claimed = new ArrayList<>(first.get(5, TimeUnit.SECONDS));
+            claimed.addAll(second.get(5, TimeUnit.SECONDS));
+            assertThat(claimed).extracting(JobQueue.ClaimedJob::id)
+                    .containsExactlyInAnyOrderElementsOf(expected.stream().map(JobQueue.AiJob::id).toList());
+            assertThat(claimed).extracting(JobQueue.ClaimedJob::id).doesNotHaveDuplicates();
+            assertThat(claimed).allSatisfy(job -> {
+                assertThat(job.ownerId()).isEqualTo(ownerId);
+                assertThat(job.courseId()).isEqualTo(courseId);
+                assertThat(job.sessionId()).isEqualTo(sessionId);
+                assertThat(job.attemptCount()).isOne();
+            });
+        } finally {
+            start.countDown();
+        }
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE status='queued' AND session_id=:session")
+                .param("session", otherSession).query(Integer.class).single()).isEqualTo(2);
+    }
+
+    @Test
+    void reclaimsExpiredChunkEmbeddingLease_whenAttemptsRemain() {
+        JobQueue.AiJob job = enqueueChunks(sessionId, 1, 0).getFirst();
+        queue.claimChunkEmbeddings("crashed-batch-worker", 1);
+        jdbc.sql("""
+                UPDATE ai_jobs SET last_heartbeat_at=now()-interval '2 seconds',
+                    lease_expires_at=now()-interval '1 second' WHERE id=:id
+                """).param("id", job.id()).update();
+
+        List<JobQueue.ClaimedJob> reclaimed = queue.claimChunkEmbeddings("recovery-batch-worker", 1);
+
+        assertThat(reclaimed).singleElement().satisfies(claimed -> {
+            assertThat(claimed.id()).isEqualTo(job.id());
+            assertThat(claimed.attemptCount()).isEqualTo(2);
+            assertThat(claimed.claimedBy()).isEqualTo("recovery-batch-worker");
+        });
+    }
+
+    @Test
+    void archivesQueuedChunkEmbeddings_whenTheirCourseIsSoftDeleted() {
+        JobQueue.AiJob job = enqueueChunks(sessionId, 1, 0).getFirst();
+        jdbc.sql("UPDATE courses SET deleted_at=now() WHERE id=:id").param("id", courseId).update();
+
+        assertThat(queue.claimChunkEmbeddings("batch-worker", 1)).isEmpty();
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id").param("id", job.id())
+                .query(String.class).single()).isEqualTo("outdated");
+    }
+
+    @Test
+    void rejectsNonPositiveChunkEmbeddingBatchLimit() {
+        assertThatThrownBy(() -> queue.claimChunkEmbeddings("batch-worker", 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("maxJobs must be positive.");
+    }
+
+    @Test
+    void bindsBoundedChunkEmbedConcurrency_withDefaultFour() {
+        assertThat(properties.jobs().chunkEmbedConcurrency()).isEqualTo(4);
+        assertThat(validator.validate(new MulgilProperties.Jobs(2, 60, 60, 0))).isNotEmpty();
+        assertThat(validator.validate(new MulgilProperties.Jobs(2, 60, 60, 33))).isNotEmpty();
+        assertThat(validator.validate(new MulgilProperties.Jobs(2, 60, 60, 32))).isEmpty();
+    }
+
+    @Test
     void rejectsFourthRetry_whenProviderFailsThreeClaims() {
         JobQueue.AiJob job = queue.enqueue(request());
         for (int attempt = 1; attempt <= 3; attempt++) {
@@ -489,6 +593,55 @@ class JobQueueIT {
     }
 
     @Test
+    void blocksLeaseRecoveryUntilLockedPublicationCommits_andRejectsOldWorkerAfterReclaim() throws Exception {
+        JobQueue.AiJob job = enqueueChunks(sessionId, 1, 0).getFirst();
+        JobQueue.ClaimedJob oldClaim = queue.claimChunkEmbeddings("old-worker", 1).getFirst();
+        Instant lease = jdbc.sql("SELECT lease_expires_at FROM ai_jobs WHERE id=:id")
+                .param("id", job.id()).query(Instant.class).single();
+        CountDownLatch publicationEntered = new CountDownLatch(1);
+        CountDownLatch releasePublication = new CountDownLatch(1);
+        CountDownLatch recoveryStarted = new CountDownLatch(1);
+        AtomicBoolean rejectedPublication = new AtomicBoolean();
+
+        try (var workers = Executors.newScheduledThreadPool(2)) {
+            var publication = workers.submit(() -> queue.publishWhileRunning(oldClaim, () -> {
+                publicationEntered.countDown();
+                try {
+                    if (!releasePublication.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("Publication release timed out.");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("Publication interrupted.", exception);
+                }
+                jdbc.sql("UPDATE courses SET name='published' WHERE id=:id").param("id", courseId).update();
+            }));
+            assertThat(publicationEntered.await(2, TimeUnit.SECONDS)).isTrue();
+            long afterLease = Math.max(1, Duration.between(Instant.now(), lease).toMillis() + 100);
+            var recovery = workers.schedule(() -> {
+                recoveryStarted.countDown();
+                return queue.claimChunkEmbeddings("recovery-worker", 1).getFirst();
+            }, afterLease, TimeUnit.MILLISECONDS);
+
+            assertThat(recoveryStarted.await(3, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> recovery.get(300, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+            releasePublication.countDown();
+
+            assertThat(publication.get(3, TimeUnit.SECONDS)).isTrue();
+            JobQueue.ClaimedJob reclaimed = recovery.get(3, TimeUnit.SECONDS);
+            assertThat(reclaimed.claimedBy()).isEqualTo("recovery-worker");
+            assertThat(reclaimed.attemptCount()).isEqualTo(2);
+            assertThat(jdbc.sql("SELECT name FROM courses WHERE id=:id").param("id", courseId)
+                    .query(String.class).single()).isEqualTo("published");
+            assertThat(queue.publishWhileRunning(oldClaim, () -> rejectedPublication.set(true))).isFalse();
+            assertThat(rejectedPublication).isFalse();
+        } finally {
+            releasePublication.countDown();
+        }
+    }
+
+    @Test
     void keepsSingleClaimAndPublication_whenHandlerExceedsOneSecondLease() throws Exception {
         JobQueue.AiJob job = queue.enqueue(request());
         CountDownLatch handlerStarted = new CountDownLatch(1);
@@ -556,6 +709,92 @@ class JobQueueIT {
     }
 
     @Test
+    void finalizesEveryChunkEmbeddingButEmitsOneCompletionAfterCommit() {
+        List<JobQueue.AiJob> jobs = enqueueChunks(sessionId, 3, 0);
+        List<JobQueue.ClaimedJob> claimed = queue.claimChunkEmbeddings("batch-worker", 5);
+        AtomicInteger publications = new AtomicInteger();
+        List<ChunkEmbedJobHandler.BatchOutcome> outcomes = claimed.stream()
+                .map(job -> new ChunkEmbedJobHandler.BatchOutcome(job, publications::incrementAndGet, null))
+                .toList();
+
+        queue.finishChunkEmbeddings(outcomes);
+
+        assertThat(publications).hasValue(3);
+        assertThat(jobs).allSatisfy(job -> assertThat(queue.get(ownerId, job.id()).status()).isEqualTo("succeeded"));
+        assertThat(COMPLETIONS).singleElement().satisfies(event -> {
+            assertThat(event.type()).isEqualTo("chunk_embed");
+            assertThat(event.sessionId()).isEqualTo(sessionId);
+        });
+    }
+
+    @Test
+    void emitsOneCompletionAfter143ConcurrentChunkJobsBecomeTerminal() throws Exception {
+        List<JobQueue.AiJob> jobs = enqueueChunks(sessionId, 143, 0);
+        List<List<JobQueue.ClaimedJob>> batches = new ArrayList<>();
+        List<JobQueue.ClaimedJob> claimed;
+        while (!(claimed = queue.claimChunkEmbeddings("batch-worker", 5)).isEmpty()) {
+            batches.add(claimed);
+        }
+
+        assertThat(batches).hasSize(29);
+        assertThat(batches).allSatisfy(batch -> assertThat(batch).hasSizeLessThanOrEqualTo(5));
+        try (var finalizers = Executors.newFixedThreadPool(4)) {
+            List<java.util.concurrent.Future<?>> completions = new ArrayList<>();
+            for (List<JobQueue.ClaimedJob> batch : batches) {
+                completions.add(finalizers.submit(() -> queue.finishChunkEmbeddings(batch.stream()
+                        .map(job -> new ChunkEmbedJobHandler.BatchOutcome(job, () -> {}, null)).toList())));
+            }
+            for (java.util.concurrent.Future<?> completion : completions) {
+                completion.get(10, TimeUnit.SECONDS);
+            }
+        }
+
+        assertThat(jobs).allSatisfy(job -> assertThat(queue.get(ownerId, job.id()).status()).isEqualTo("succeeded"));
+        assertThat(COMPLETIONS).singleElement().satisfies(event -> assertThat(event.sessionId()).isEqualTo(sessionId));
+        assertThat(ACTIVE_CHUNKS_AT_COMPLETION).containsExactly(0);
+    }
+
+    @Test
+    void finalizesSuccessfulAndFailedChunkEmbeddingOutcomesIndividually() {
+        List<JobQueue.AiJob> jobs = enqueueChunks(sessionId, 2, 0);
+        List<JobQueue.ClaimedJob> claimed = queue.claimChunkEmbeddings("batch-worker", 5);
+        JobHandler.JobExecutionException providerFailure = new JobHandler.JobExecutionException(
+                "PROVIDER_UNAVAILABLE", "Embedding provider failed.", true);
+
+        queue.finishChunkEmbeddings(List.of(
+                new ChunkEmbedJobHandler.BatchOutcome(claimed.get(0), () -> {}, null),
+                new ChunkEmbedJobHandler.BatchOutcome(claimed.get(1), null, providerFailure)));
+
+        assertThat(queue.get(ownerId, jobs.get(0).id()).status()).isEqualTo("succeeded");
+        assertThat(queue.get(ownerId, jobs.get(1).id())).satisfies(job -> {
+            assertThat(job.status()).isEqualTo("failed");
+            assertThat(job.errorCode()).isEqualTo("PROVIDER_UNAVAILABLE");
+        });
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE status='running'")
+                .query(Integer.class).single()).isZero();
+        assertThat(COMPLETIONS).hasSize(1);
+    }
+
+    @Test
+    void failsTerminalStaleChunkOutcome_withoutCallingItsPublication() {
+        JobQueue.AiJob job = enqueueChunks(sessionId, 1, 0).getFirst();
+        JobQueue.ClaimedJob claimed = queue.claimChunkEmbeddings("batch-worker", 5).getFirst();
+        AtomicBoolean published = new AtomicBoolean();
+        JobHandler.JobExecutionException stale = new JobHandler.JobExecutionException(
+                "STALE_INPUT", "Chunk changed before embedding publication.", false);
+
+        queue.finishChunkEmbeddings(List.of(
+                new ChunkEmbedJobHandler.BatchOutcome(claimed, () -> published.set(true), stale)));
+
+        assertThat(published).isFalse();
+        assertThat(queue.get(ownerId, job.id())).satisfies(failed -> {
+            assertThat(failed.status()).isEqualTo("failed");
+            assertThat(failed.errorCode()).isEqualTo("STALE_INPUT");
+        });
+        assertThat(COMPLETIONS).isEmpty();
+    }
+
+    @Test
     void hidesJobs_whenOwnerDoesNotMatch() {
         JobQueue.AiJob job = queue.enqueue(request());
 
@@ -572,6 +811,39 @@ class JobQueueIT {
     private JobQueue.EnqueueRequest request() {
         return JobQueue.EnqueueRequest.material("pdf_extract", ownerId, courseId, sessionId,
                 materialId, 1, HASH, "pdfbox", "pdfbox-3", "none");
+    }
+
+    private UUID insertSession(int sessionNumber) {
+        UUID id = UUID.randomUUID();
+        jdbc.sql("""
+                INSERT INTO class_sessions
+                    (id, owner_id, course_id, session_number, title, session_date, created_at, updated_at)
+                VALUES (:id, :owner, :course, :number, 'Other session', DATE '2026-09-02', now(), now())
+                """).param("id", id).param("owner", ownerId).param("course", courseId)
+                .param("number", sessionNumber).update();
+        return id;
+    }
+
+    private List<JobQueue.AiJob> enqueueChunks(UUID session, int count, int minuteOffset) {
+        List<JobQueue.AiJob> jobs = new ArrayList<>();
+        for (int index = 0; index < count; index++) {
+            JobQueue.AiJob job = queue.enqueue(new JobQueue.EnqueueRequest("chunk_embed", ownerId, courseId,
+                    session, null, null, null, null, null, index + 1, "%064x".formatted(index + 1L + minuteOffset),
+                    "vertex", "embedding-v1", "none"));
+            jdbc.sql("UPDATE ai_jobs SET created_at=:created WHERE id=:id")
+                    .param("created", Timestamp.from(Instant.parse("2026-09-01T00:00:00Z")
+                            .plusSeconds((long) (minuteOffset + index) * 60)))
+                    .param("id", job.id()).update();
+            jobs.add(job);
+        }
+        return jobs;
+    }
+
+    private List<JobQueue.ClaimedJob> claimChunkBatchWhenReleased(
+            String workerId, CountDownLatch ready, CountDownLatch start) throws InterruptedException {
+        ready.countDown();
+        if (!start.await(2, TimeUnit.SECONDS)) throw new IllegalStateException("Batch claim start timed out.");
+        return queue.claimChunkEmbeddings(workerId, 3);
     }
 
     private JobQueue.EnqueueRequest billable(String type, int index) {
@@ -595,8 +867,16 @@ class JobQueueIT {
     @TestConfiguration
     static class ListenerConfiguration {
         @Bean
-        JobCompletionListener recordingCompletionListener() {
-            return COMPLETIONS::add;
+        JobCompletionListener recordingCompletionListener(JdbcClient jdbc) {
+            return event -> {
+                COMPLETIONS.add(event);
+                ACTIVE_CHUNKS_AT_COMPLETION.add(jdbc.sql("""
+                                SELECT count(*) FROM ai_jobs
+                                WHERE owner_id=:owner AND course_id=:course AND session_id=:session
+                                  AND job_type='chunk_embed' AND status IN ('queued','running')
+                                """).param("owner", event.ownerId()).param("course", event.courseId())
+                        .param("session", event.sessionId()).query(Integer.class).single());
+            };
         }
     }
 }
