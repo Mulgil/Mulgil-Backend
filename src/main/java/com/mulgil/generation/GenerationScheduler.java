@@ -61,7 +61,7 @@ final class GenerationScheduler implements JobCompletionListener {
                         SELECT session.id FROM class_sessions session
                         JOIN courses course ON course.id=session.course_id AND course.owner_id=session.owner_id
                         WHERE session.owner_id=:owner AND session.id=:session AND course.deleted_at IS NULL
-                        FOR UPDATE OF session, course
+                        FOR UPDATE OF session FOR SHARE OF course
                         """)
                 .param("owner", ownerId).param("session", sessionId).query(UUID.class).optional().isPresent();
     }

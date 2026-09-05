@@ -22,6 +22,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.time.Instant;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.util.UUID;
@@ -406,14 +407,49 @@ class JobQueueIT {
     }
 
     @Test
-    void rejectsFourthRetry_whenProviderFailsThreeClaims() {
+    void manualDeadlockRetryPreservesRowAndAttemptsUntilClaim_thenRejectsExhaustion() {
         JobQueue.AiJob job = queue.enqueue(request());
-        for (int attempt = 1; attempt <= 3; attempt++) {
+        JobHandler handler = new JobHandler() {
+            @Override
+            public String jobType() {
+                return "pdf_extract";
+            }
+
+            @Override
+            public JobPublication handle(JobQueue.ClaimedJob ignored) {
+                throw new RuntimeException("database operation failed",
+                        new SQLException("DELETE FROM sensitive_table", "40P01"));
+            }
+        };
+        JobWorker worker = new JobWorker(queue, List.of(handler), properties);
+        try {
+            worker.poll();
+        } finally {
+            worker.close();
+        }
+        assertThat(jdbc.sql("""
+                        SELECT status||':'||error_code||':'||error_message||':'||attempt_count
+                        FROM ai_jobs WHERE id=:id
+                        """).param("id", job.id()).query(String.class).single())
+                .isEqualTo("failed:DATABASE_DEADLOCK:Job handler failed.:1");
+
+        JobQueue.AiJob retried = queue.retry(ownerId, job.id());
+        assertThat(retried.id()).isEqualTo(job.id());
+        assertThat(jdbc.sql("""
+                        SELECT status||':'||attempt_count||':'||(error_code IS NULL)||':'||
+                               (error_message IS NULL)||':'||(finished_at IS NULL)
+                        FROM ai_jobs WHERE id=:id
+                        """).param("id", job.id()).query(String.class).single())
+                .isEqualTo("queued:1:true:true:true");
+
+        for (int attempt = 2; attempt <= 3; attempt++) {
             JobQueue.ClaimedJob claimed = queue.claim("worker-" + attempt, Set.of("pdf_extract"));
             assertThat(claimed.id()).isEqualTo(job.id());
             assertThat(claimed.attemptCount()).isEqualTo(attempt);
-            queue.fail(claimed, "PROVIDER_TIMEOUT", "Provider timed out.", true);
-            if (attempt < 3) assertThat(queue.retry(ownerId, job.id()).status()).isEqualTo("queued");
+            queue.fail(claimed, "DATABASE_DEADLOCK", "Job handler failed.", true);
+            if (attempt < 3) {
+                assertThat(queue.retry(ownerId, job.id()).id()).isEqualTo(job.id());
+            }
         }
 
         assertThat(queue.claim("worker-4", Set.of("pdf_extract"))).isNull();
@@ -426,15 +462,22 @@ class JobQueueIT {
     }
 
     @Test
-    void requeuesSameRow_whenRetryableFailedInputIsEnqueuedAgain() {
-        JobQueue.AiJob first = queue.enqueue(request());
+    void retryOnEnqueueRequeuesSameDeadlockedRowWithoutIncrementingAttempt() {
+        JobQueue.EnqueueRequest request = request();
+        JobQueue.AiJob first = queue.enqueue(request);
         JobQueue.ClaimedJob claimed = queue.claim("worker", Set.of("pdf_extract"));
-        queue.fail(claimed, "PROVIDER_TIMEOUT", "Provider timed out.", true);
+        queue.fail(claimed, "DATABASE_DEADLOCK", "Job handler failed.", true);
 
-        JobQueue.AiJob second = queue.enqueue(request());
+        JobQueue.AiJob second = queue.enqueue(request);
 
         assertThat(second.id()).isEqualTo(first.id());
         assertThat(second.status()).isEqualTo("queued");
+        assertThat(jdbc.sql("""
+                        SELECT status||':'||attempt_count||':'||(error_code IS NULL)||':'||
+                               (error_message IS NULL)||':'||(finished_at IS NULL)
+                        FROM ai_jobs WHERE id=:id
+                        """).param("id", first.id()).query(String.class).single())
+                .isEqualTo("queued:1:true:true:true");
         assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs").query(Integer.class).single()).isOne();
     }
 
@@ -728,6 +771,120 @@ class JobQueueIT {
     }
 
     @Test
+    void blocksChunkFinalizationBehindSharedSessionLock_beforePublication() throws Exception {
+        JobQueue.AiJob job = enqueueChunks(sessionId, 1, 0).getFirst();
+        JobQueue.ClaimedJob claimed = queue.claimChunkEmbeddings("session-gate-worker", 1).getFirst();
+        extendLease(job.id());
+        CountDownLatch holderReady = new CountDownLatch(1);
+        CountDownLatch releaseHolder = new CountDownLatch(1);
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        CountDownLatch workerCompleted = new CountDownLatch(1);
+        AtomicInteger holderPid = new AtomicInteger();
+        AtomicInteger workerPid = new AtomicInteger();
+        AtomicBoolean publicationEntered = new AtomicBoolean();
+        var workers = Executors.newFixedThreadPool(2);
+        java.util.concurrent.Future<?> holder = null;
+        java.util.concurrent.Future<?> finalizer = null;
+
+        try {
+            holder = workers.submit(() -> transactions.executeWithoutResult(ignored -> {
+                holderPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                jdbc.sql("SELECT id FROM class_sessions WHERE id=:id FOR SHARE")
+                        .param("id", sessionId).query(UUID.class).single();
+                holderReady.countDown();
+                await(releaseHolder, "Session lock release timed out.");
+            }));
+            assertThat(holderReady.await(5, TimeUnit.SECONDS)).isTrue();
+            finalizer = workers.submit(() -> {
+                try {
+                    transactions.executeWithoutResult(ignored -> {
+                        workerPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                        workerStarted.countDown();
+                        queue.finishChunkEmbeddings(List.of(new ChunkEmbedJobHandler.BatchOutcome(
+                                claimed, () -> publicationEntered.set(true), null)));
+                    });
+                } finally {
+                    workerCompleted.countDown();
+                }
+            });
+            assertThat(workerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            awaitBlockedBy(holderPid.get(), workerPid.get(), workerCompleted, publicationEntered);
+            assertThat(publicationEntered).isFalse();
+            releaseHolder.countDown();
+
+            holder.get(5, TimeUnit.SECONDS);
+            finalizer.get(5, TimeUnit.SECONDS);
+            assertThat(publicationEntered).isTrue();
+            assertThat(queue.get(ownerId, job.id()).status()).isEqualTo("succeeded");
+        } finally {
+            releaseHolder.countDown();
+            if (holder != null) holder.cancel(true);
+            if (finalizer != null) finalizer.cancel(true);
+            workers.shutdownNow();
+            workers.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void blocksChunkFinalizationBehindCourseArchive_thenFencesPublication() throws Exception {
+        JobQueue.AiJob job = enqueueChunks(sessionId, 1, 0).getFirst();
+        JobQueue.ClaimedJob claimed = queue.claimChunkEmbeddings("archive-gate-worker", 1).getFirst();
+        extendLease(job.id());
+        CountDownLatch archiveReady = new CountDownLatch(1);
+        CountDownLatch commitArchive = new CountDownLatch(1);
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        CountDownLatch workerCompleted = new CountDownLatch(1);
+        AtomicInteger archiverPid = new AtomicInteger();
+        AtomicInteger workerPid = new AtomicInteger();
+        AtomicBoolean publicationEntered = new AtomicBoolean();
+        var workers = Executors.newFixedThreadPool(2);
+        java.util.concurrent.Future<?> archiver = null;
+        java.util.concurrent.Future<?> finalizer = null;
+
+        try {
+            archiver = workers.submit(() -> transactions.executeWithoutResult(ignored -> {
+                archiverPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                jdbc.sql("UPDATE courses SET deleted_at=now() WHERE id=:id")
+                        .param("id", courseId).update();
+                archiveReady.countDown();
+                await(commitArchive, "Course archive commit timed out.");
+            }));
+            assertThat(archiveReady.await(5, TimeUnit.SECONDS)).isTrue();
+            finalizer = workers.submit(() -> {
+                try {
+                    transactions.executeWithoutResult(ignored -> {
+                        workerPid.set(jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+                        workerStarted.countDown();
+                        queue.finishChunkEmbeddings(List.of(new ChunkEmbedJobHandler.BatchOutcome(
+                                claimed, () -> publicationEntered.set(true), null)));
+                    });
+                } finally {
+                    workerCompleted.countDown();
+                }
+            });
+            assertThat(workerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            awaitBlockedBy(archiverPid.get(), workerPid.get(), workerCompleted, publicationEntered);
+            assertThat(publicationEntered).isFalse();
+            commitArchive.countDown();
+
+            archiver.get(5, TimeUnit.SECONDS);
+            finalizer.get(5, TimeUnit.SECONDS);
+            assertThat(publicationEntered).isFalse();
+            assertThat(jdbc.sql("SELECT status||':'||error_code FROM ai_jobs WHERE id=:id")
+                    .param("id", job.id()).query(String.class).single()).isEqualTo("outdated:STALE_INPUT");
+            assertThat(COMPLETIONS).isEmpty();
+        } finally {
+            commitArchive.countDown();
+            if (archiver != null) archiver.cancel(true);
+            if (finalizer != null) finalizer.cancel(true);
+            workers.shutdownNow();
+            workers.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void emitsOneCompletionAfter143ConcurrentChunkJobsBecomeTerminal() throws Exception {
         List<JobQueue.AiJob> jobs = enqueueChunks(sessionId, 143, 0);
         List<List<JobQueue.ClaimedJob>> batches = new ArrayList<>();
@@ -837,6 +994,37 @@ class JobQueueIT {
             jobs.add(job);
         }
         return jobs;
+    }
+
+    private void extendLease(UUID jobId) {
+        jdbc.sql("UPDATE ai_jobs SET lease_expires_at=now() + interval '1 minute' WHERE id=:id")
+                .param("id", jobId).update();
+    }
+
+    private void awaitBlockedBy(int blockerPid, int workerPid, CountDownLatch workerCompleted,
+                                AtomicBoolean publicationEntered) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (true) {
+            if (workerCompleted.getCount() == 0 || publicationEntered.get()) {
+                throw new AssertionError("Chunk finalizer reached publication before the expected lock block.");
+            }
+            boolean blocked = jdbc.sql("SELECT :blocker = ANY(pg_blocking_pids(:worker))")
+                    .param("blocker", blockerPid).param("worker", workerPid)
+                    .query(Boolean.class).single();
+            if (blocked) return;
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("Expected PostgreSQL blocking edge was not observed.");
+            }
+        }
+    }
+
+    private static void await(CountDownLatch latch, String timeoutMessage) {
+        try {
+            if (!latch.await(5, TimeUnit.SECONDS)) throw new AssertionError(timeoutMessage);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Lock holder interrupted.", exception);
+        }
     }
 
     private List<JobQueue.ClaimedJob> claimChunkBatchWhenReleased(
