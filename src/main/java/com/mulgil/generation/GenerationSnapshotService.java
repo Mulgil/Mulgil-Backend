@@ -105,18 +105,22 @@ public final class GenerationSnapshotService {
                 sources, state.expectedSources(), state.blocked());
         boolean indexedPastExam = sources.stream().anyMatch(source ->
                 source.type().equals("past_exam") && source.indexed());
-        return predicted && !indexedPastExam ? snapshot.withReady(false) : snapshot;
+        return predicted && !indexedPastExam && snapshot.readiness() == Readiness.READY
+                ? snapshot.withReadiness(Readiness.INSUFFICIENT_SOURCE_DATA) : snapshot;
     }
 
     private Snapshot snapshot(String phase, UUID owner, UUID course, UUID session, UUID exam,
                               List<Source> sources, int expected, boolean blocked) {
         int represented = sources.stream().map(Source::sourceId).distinct().toList().size();
-        boolean ready = expected > 0 && expected == represented && !blocked
-                && sources.stream().allMatch(Source::indexed);
+        boolean complete = expected > 0 && expected == represented;
+        boolean embeddingsPending = complete && sources.stream().anyMatch(source -> !source.indexed());
+        boolean ready = complete && !blocked && !embeddingsPending;
+        Readiness readiness = ready ? Readiness.READY : embeddingsPending
+                ? Readiness.EMBEDDING_NOT_READY : Readiness.INSUFFICIENT_SOURCE_DATA;
         String canonical = sources.stream().sorted(Comparator.comparing(Source::canonical))
                 .map(Source::canonical).reduce((left, right) -> left + "\u001e" + right).orElse("");
         return new Snapshot(phase, owner, course, session, exam, List.copyOf(sources), canonical,
-                ContentIndexingService.sha256(canonical), ready);
+                ContentIndexingService.sha256(canonical), ready, readiness);
     }
 
     private Source source(String type, UUID id, int version, String hash, String text,
@@ -129,12 +133,14 @@ public final class GenerationSnapshotService {
     }
 
     public record Snapshot(String phase, UUID ownerId, UUID courseId, UUID sessionId, UUID examId,
-                    List<Source> sources, String canonical, String snapshotHash, boolean ready) {
-        Snapshot withReady(boolean value) {
+                    List<Source> sources, String canonical, String snapshotHash, boolean ready, Readiness readiness) {
+        Snapshot withReadiness(Readiness value) {
             return new Snapshot(phase, ownerId, courseId, sessionId, examId,
-                    sources, canonical, snapshotHash, value);
+                    sources, canonical, snapshotHash, value == Readiness.READY, value);
         }
     }
+
+    enum Readiness { READY, INSUFFICIENT_SOURCE_DATA, EMBEDDING_NOT_READY }
 
     public record Source(String type, UUID sourceId, int inputVersion, String sourceHash, String text,
                   JsonNode sourceReference, boolean indexed) {
