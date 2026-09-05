@@ -240,10 +240,22 @@ public final class ChunkEmbedJobHandler implements JobHandler {
                         WHERE id=:id AND owner_id=:owner AND course_id=:course AND session_id=:session
                           AND text_content=:text AND source_hash=:hash
                           AND source_ref=CAST(:reference AS jsonb) AND embedding IS NULL
+                          AND EXISTS (
+                              SELECT 1 FROM ai_jobs job
+                              JOIN courses course
+                                ON course.id=job.course_id AND course.owner_id=job.owner_id
+                              WHERE job.id=:jobId AND job.job_type='chunk_embed'
+                                AND job.status='running' AND job.claimed_by=:worker
+                                AND job.lease_expires_at > clock_timestamp()
+                                AND job.owner_id=:owner AND job.course_id=:course
+                                AND job.session_id=:session AND job.source_hash=:hash
+                                AND course.deleted_at IS NULL
+                          )
                         """).param("embedding", result.embedding()).param("model", result.model())
                 .param("id", result.id()).param("owner", job.ownerId()).param("course", job.courseId())
                 .param("session", job.sessionId()).param("text", result.text())
-                .param("hash", result.sourceHash()).param("reference", result.sourceReference()).update()).sum();
+                .param("hash", result.sourceHash()).param("reference", result.sourceReference())
+                .param("jobId", job.id()).param("worker", job.claimedBy()).update()).sum();
     }
 
     private record PendingChunk(UUID id, String text, String sourceHash, String sourceReference) {}

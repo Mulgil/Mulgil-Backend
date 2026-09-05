@@ -37,6 +37,68 @@ import static org.mockito.Mockito.when;
 
 class ChunkEmbedJobHandlerTest {
     @Test
+    void doesNotPublishCheckpointAfterLeaseIsReclaimedByAnotherWorker() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("pgvector/pgvector:pg16")
+                .withDatabaseName("mulgil").withUsername("mulgil").withPassword("mulgil")) {
+            postgres.start();
+            PGSimpleDataSource dataSource = new PGSimpleDataSource();
+            dataSource.setURL(postgres.getJdbcUrl());
+            dataSource.setUser(postgres.getUsername());
+            dataSource.setPassword(postgres.getPassword());
+            JdbcClient jdbc = JdbcClient.create(dataSource);
+            jdbc.sql("CREATE EXTENSION vector").update();
+            createPublicationTables(jdbc);
+            UUID owner = UUID.randomUUID();
+            UUID course = UUID.randomUUID();
+            UUID session = UUID.randomUUID();
+            JobQueue.ClaimedJob expired = job(UUID.randomUUID(), owner, course, session, "a".repeat(64));
+            UUID chunk = UUID.randomUUID();
+            jdbc.sql("INSERT INTO courses (id,owner_id) VALUES (:id,:owner)")
+                    .param("id", course).param("owner", owner).update();
+            insertActiveJob(jdbc, expired);
+            insertChunk(jdbc, chunk, expired, "expired");
+            jdbc.sql("UPDATE ai_jobs SET lease_expires_at=now()-interval '1 second' WHERE id=:id")
+                    .param("id", expired.id()).update();
+            assertThat(jdbc.sql("""
+                    UPDATE ai_jobs SET claimed_by='recovery-worker', lease_expires_at=now()+interval '1 hour'
+                    WHERE id=:id AND lease_expires_at < now()
+                    """).param("id", expired.id()).update()).isOne();
+            @SuppressWarnings("unchecked")
+            ObjectProvider<ChunkEmbeddingPort> ports = mock(ObjectProvider.class);
+            when(ports.getIfAvailable()).thenReturn(new ChunkEmbeddingPort() {
+                @Override
+                public Embedding embed(String text) {
+                    throw new AssertionError("single embed must not be called");
+                }
+
+                @Override
+                public List<Embedding> embedAll(List<String> texts, ProviderCallObserver observer) {
+                    List<Embedding> completed = List.of(
+                            new Embedding(Collections.nCopies(768, 1f), "fake"));
+                    observer.checkpoint(0, completed);
+                    return completed;
+                }
+            });
+            MulgilProperties properties = mock(MulgilProperties.class);
+            when(properties.vertex()).thenReturn(
+                    new MulgilProperties.Vertex("generation", "embedding", "us-central1", 5));
+            AiProviderUsageLedger usage = mock(AiProviderUsageLedger.class);
+            when(usage.begin(any(), any(), anyString(), anyString(), anyString(), anyString(), anyLong()))
+                    .thenAnswer(ignored -> usageHandle());
+
+            List<ChunkEmbedJobHandler.BatchOutcome> outcomes =
+                    new ChunkEmbedJobHandler(jdbc, ports, properties, usage).handleBatch(List.of(expired));
+
+            assertThat(outcomes).singleElement().satisfies(outcome -> {
+                assertThat(outcome.succeeded()).isFalse();
+                assertThat(outcome.failure().code()).isEqualTo("STALE_INPUT");
+            });
+            assertThat(jdbc.sql("SELECT embedding IS NULL FROM chunks WHERE id=:id")
+                    .param("id", chunk).query(Boolean.class).single()).isTrue();
+        }
+    }
+
+    @Test
     void returnsStaleInputWhenTerminalPublicationFindsChangedRow_andPublishesSibling() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("pgvector/pgvector:pg16")
                 .withDatabaseName("mulgil").withUsername("mulgil").withPassword("mulgil")) {
@@ -47,18 +109,16 @@ class ChunkEmbedJobHandlerTest {
             dataSource.setPassword(postgres.getPassword());
             JdbcClient jdbc = JdbcClient.create(dataSource);
             jdbc.sql("CREATE EXTENSION vector").update();
-            jdbc.sql("""
-                    CREATE TABLE chunks (
-                        id uuid PRIMARY KEY, owner_id uuid NOT NULL, course_id uuid NOT NULL,
-                        session_id uuid NOT NULL, text_content text NOT NULL, source_hash text NOT NULL,
-                        source_ref jsonb NOT NULL, embedding vector(768), embedding_model text
-                    )
-                    """).update();
+            createPublicationTables(jdbc);
             UUID owner = UUID.randomUUID();
             UUID course = UUID.randomUUID();
             UUID session = UUID.randomUUID();
             JobQueue.ClaimedJob staleJob = job(new UUID(0, 1), owner, course, session, "a".repeat(64));
             JobQueue.ClaimedJob currentJob = job(new UUID(0, 2), owner, course, session, "b".repeat(64));
+            jdbc.sql("INSERT INTO courses (id,owner_id) VALUES (:id,:owner)")
+                    .param("id", course).param("owner", owner).update();
+            insertActiveJob(jdbc, staleJob);
+            insertActiveJob(jdbc, currentJob);
             UUID staleChunk = UUID.randomUUID();
             UUID currentChunk = UUID.randomUUID();
             insertChunk(jdbc, staleChunk, staleJob, "stale");
@@ -111,18 +171,16 @@ class ChunkEmbedJobHandlerTest {
             dataSource.setPassword(postgres.getPassword());
             JdbcClient jdbc = JdbcClient.create(dataSource);
             jdbc.sql("CREATE EXTENSION vector").update();
-            jdbc.sql("""
-                    CREATE TABLE chunks (
-                        id uuid PRIMARY KEY, owner_id uuid NOT NULL, course_id uuid NOT NULL,
-                        session_id uuid NOT NULL, text_content text NOT NULL, source_hash text NOT NULL,
-                        source_ref jsonb NOT NULL, embedding vector(768), embedding_model text
-                    )
-                    """).update();
+            createPublicationTables(jdbc);
             UUID owner = UUID.randomUUID();
             UUID course = UUID.randomUUID();
             UUID session = UUID.randomUUID();
             JobQueue.ClaimedJob staleJob = job(new UUID(0, 1), owner, course, session, "a".repeat(64));
             JobQueue.ClaimedJob currentJob = job(new UUID(0, 2), owner, course, session, "b".repeat(64));
+            jdbc.sql("INSERT INTO courses (id,owner_id) VALUES (:id,:owner)")
+                    .param("id", course).param("owner", owner).update();
+            insertActiveJob(jdbc, staleJob);
+            insertActiveJob(jdbc, currentJob);
             UUID staleChunk = UUID.randomUUID();
             UUID currentChunk = UUID.randomUUID();
             insertChunk(jdbc, staleChunk, staleJob, "stale");
@@ -436,6 +494,34 @@ class ChunkEmbedJobHandlerTest {
                 VALUES (:id,:owner,:course,:session,:text,:hash,'{}')
                 """).param("id", id).param("owner", job.ownerId()).param("course", job.courseId())
                 .param("session", job.sessionId()).param("text", text).param("hash", job.sourceHash()).update();
+    }
+
+    private static void createPublicationTables(JdbcClient jdbc) {
+        jdbc.sql("""
+                CREATE TABLE courses (
+                    id uuid PRIMARY KEY, owner_id uuid NOT NULL, deleted_at timestamptz
+                );
+                CREATE TABLE ai_jobs (
+                    id uuid PRIMARY KEY, owner_id uuid NOT NULL, course_id uuid NOT NULL,
+                    session_id uuid NOT NULL, job_type text NOT NULL, source_hash text NOT NULL,
+                    status text NOT NULL, claimed_by text, lease_expires_at timestamptz
+                );
+                CREATE TABLE chunks (
+                    id uuid PRIMARY KEY, owner_id uuid NOT NULL, course_id uuid NOT NULL,
+                    session_id uuid NOT NULL, text_content text NOT NULL, source_hash text NOT NULL,
+                    source_ref jsonb NOT NULL, embedding vector(768), embedding_model text
+                )
+                """).update();
+    }
+
+    private static void insertActiveJob(JdbcClient jdbc, JobQueue.ClaimedJob job) {
+        jdbc.sql("""
+                INSERT INTO ai_jobs
+                    (id,owner_id,course_id,session_id,job_type,source_hash,status,claimed_by,lease_expires_at)
+                VALUES (:id,:owner,:course,:session,'chunk_embed',:hash,'running',:worker,now()+interval '1 hour')
+                """).param("id", job.id()).param("owner", job.ownerId()).param("course", job.courseId())
+                .param("session", job.sessionId()).param("hash", job.sourceHash())
+                .param("worker", job.claimedBy()).update();
     }
 
     private static JdbcClient batchJdbc(List<String> published) throws Exception {
