@@ -19,14 +19,14 @@ import java.io.IOException;
 @Profile("!test & !smoke")
 final class VertexGenerationModelAdapter implements GenerationModelPort {
     private static final String GROUNDED_JSON_CONTRACT = """
-            Generate only from the supplied sources. Copy every sourceRef exactly from a supplied source.
+            Generate only from the supplied sources. Cite each claim with sourceIds copied exactly from supplied citationId values.
             Return one JSON object with:
-            - summary.items: non-empty array of {text, sourceRefs}; summary.tables is optional.
-            - mindmap.nodes: non-empty array of {id, label, sourceRefs}; mindmap.edges: array of {from, to}.
+            - summary.items: non-empty array of {text, sourceIds}; summary.tables is optional.
+            - mindmap.nodes: non-empty array of {id, label, sourceIds}; mindmap.edges: array of {from, to}.
             - quizQuestions: non-empty array whose items contain type (true_false or multiple_choice),
-              question {text, sourceRefs, and exactly four options for multiple_choice},
-              answer {value, sourceRefs}, and explanation {text, sourceRefs}.
-            Every sourceRefs array must be non-empty. Do not invent or alter references.
+              question {text, sourceIds, and exactly four options for multiple_choice},
+              answer {value, sourceIds}, and explanation {text, sourceIds}.
+            Every sourceIds array must be non-empty. Do not invent or alter citation IDs.
             """;
     private final MulgilProperties properties;
 
@@ -70,16 +70,16 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
     }
 
     static GenerationConfig generationConfig() {
-        Schema references = array(sourceReference()).toBuilder().setMinItems(1).build();
+        Schema sourceIds = array(scalar(Type.STRING)).toBuilder().setMinItems(1).build();
         Schema groundedText = object()
                 .putProperties("text", scalar(Type.STRING))
-                .putProperties("sourceRefs", references)
-                .addRequired("text").addRequired("sourceRefs").build();
+                .putProperties("sourceIds", sourceIds)
+                .addRequired("text").addRequired("sourceIds").build();
         Schema summary = object().putProperties("items", array(groundedText))
                 .addRequired("items").build();
         Schema node = object().putProperties("id", scalar(Type.STRING))
-                .putProperties("label", scalar(Type.STRING)).putProperties("sourceRefs", references)
-                .addRequired("id").addRequired("label").addRequired("sourceRefs").build();
+                .putProperties("label", scalar(Type.STRING)).putProperties("sourceIds", sourceIds)
+                .addRequired("id").addRequired("label").addRequired("sourceIds").build();
         Schema edge = object().putProperties("from", scalar(Type.STRING))
                 .putProperties("to", scalar(Type.STRING)).addRequired("from").addRequired("to").build();
         Schema mindmap = object().putProperties("nodes", array(node)).putProperties("edges", array(edge))
@@ -87,7 +87,7 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
         Schema prompt = groundedText.toBuilder().putProperties("options", array(scalar(Type.STRING))).build();
         Schema answer = object().putProperties("value", Schema.newBuilder()
                         .addAnyOf(scalar(Type.STRING)).addAnyOf(scalar(Type.BOOLEAN)).build())
-                .putProperties("sourceRefs", references).addRequired("value").addRequired("sourceRefs").build();
+                .putProperties("sourceIds", sourceIds).addRequired("value").addRequired("sourceIds").build();
         Schema question = object().putProperties("type", Schema.newBuilder().setType(Type.STRING)
                         .addEnum("true_false").addEnum("multiple_choice").build())
                 .putProperties("question", prompt).putProperties("answer", answer)
@@ -98,23 +98,6 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
                 .addRequired("mindmap").addRequired("quizQuestions").build();
         return GenerationConfig.newBuilder().setResponseMimeType("application/json")
                 .setResponseSchema(response).build();
-    }
-
-    private static Schema sourceReference() {
-        Schema.Builder reference = object().putProperties("sourceType", scalar(Type.STRING));
-        for (String field : new String[]{"materialId", "examResourceId", "contentBlockId", "noteId",
-                "handwritingBlockId", "recordingId", "transcriptSegmentId"}) {
-            reference.putProperties(field, scalar(Type.STRING));
-        }
-        for (String field : new String[]{"pageNumber", "paragraphOffset", "inputVersion", "startMs", "endMs"}) {
-            reference.putProperties(field, scalar(Type.INTEGER));
-        }
-        Schema bbox = object().putProperties("x", scalar(Type.NUMBER))
-                .putProperties("y", scalar(Type.NUMBER)).putProperties("width", scalar(Type.NUMBER))
-                .putProperties("height", scalar(Type.NUMBER)).addRequired("x").addRequired("y")
-                .addRequired("width").addRequired("height").build();
-        return reference.putProperties("bboxNorm", bbox)
-                .addRequired("sourceType").build();
     }
 
     private static Schema.Builder object() {

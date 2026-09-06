@@ -3,11 +3,15 @@ package com.mulgil.generation;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.mulgil.job.JobHandler;
 import org.springframework.stereotype.Component;
 
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 @Component
@@ -23,71 +27,88 @@ final class GenerationOutputValidator {
         try {
             JsonNode root = json.readTree(raw);
             require(root != null && root.isObject());
-            Set<JsonNode> allowed = new HashSet<>(snapshot.sources().stream()
-                    .map(GenerationSnapshotService.Source::sourceReference).toList());
+            Map<String, JsonNode> citations = citations(snapshot);
             JsonNode summary = root.path("summary");
-            if (!quiz) validateSummary(summary, allowed);
+            if (!quiz) validateSummary(summary, citations);
             JsonNode mindmap = root.path("mindmap");
-            if (session) validateMindmap(mindmap, allowed);
+            if (session) validateMindmap(mindmap, citations);
             JsonNode questions = root.path("quizQuestions");
-            if (session || quiz) validateQuestions(questions, allowed);
+            if (session || quiz) validateQuestions(questions, citations);
             return new Output(summary, mindmap.path("nodes"), mindmap.path("edges"), questions,
-                    List.copyOf(allowed));
+                    List.copyOf(citations.values()));
         } catch (JsonProcessingException | IllegalArgumentException exception) {
             throw invalid();
         }
     }
 
-    private static void validateSummary(JsonNode summary, Set<JsonNode> allowed) {
+    private static Map<String, JsonNode> citations(GenerationSnapshotService.Snapshot snapshot) {
+        Map<String, JsonNode> citations = new LinkedHashMap<>();
+        for (int index = 0; index < snapshot.sources().size(); index++) {
+            citations.put(GenerationCitations.sourceId(index), snapshot.sources().get(index).sourceReference());
+        }
+        return citations;
+    }
+
+    private static void validateSummary(JsonNode summary, Map<String, JsonNode> citations) {
         JsonNode items = summary.path("items");
         require(items.isArray() && !items.isEmpty());
         items.forEach(item -> {
             require(nonblank(item, "text"));
-            validateRefs(item.path("sourceRefs"), allowed);
+            resolveRefs(item, citations);
         });
         JsonNode tables = summary.path("tables");
         if (tables.isArray()) tables.forEach(table -> table.path("rows").forEach(row ->
                 row.path("cells").forEach(cell -> {
                     require(nonblank(cell, "text") || nonblank(cell, "value"));
-                    validateRefs(cell.path("sourceRefs"), allowed);
+                    resolveRefs(cell, citations);
                 })));
     }
 
-    private static void validateMindmap(JsonNode mindmap, Set<JsonNode> allowed) {
+    private static void validateMindmap(JsonNode mindmap, Map<String, JsonNode> citations) {
         JsonNode nodes = mindmap.path("nodes");
         JsonNode edges = mindmap.path("edges");
         require(nodes.isArray() && !nodes.isEmpty() && edges.isArray());
         Set<String> ids = new HashSet<>();
         nodes.forEach(node -> {
             require(nonblank(node, "id") && nonblank(node, "label"));
-            validateRefs(node.path("sourceRefs"), allowed);
+            resolveRefs(node, citations);
             ids.add(node.path("id").asText());
         });
         edges.forEach(edge -> require(ids.contains(edge.path("from").asText())
                 && ids.contains(edge.path("to").asText())));
     }
 
-    private static void validateQuestions(JsonNode questions, Set<JsonNode> allowed) {
+    private static void validateQuestions(JsonNode questions, Map<String, JsonNode> citations) {
         require(questions.isArray() && !questions.isEmpty());
         questions.forEach(question -> {
             String type = question.path("type").asText();
             require(type.equals("true_false") || type.equals("multiple_choice"));
             JsonNode prompt = question.path("question");
             require(nonblank(prompt, "text"));
-            validateRefs(prompt.path("sourceRefs"), allowed);
+            resolveRefs(prompt, citations);
             JsonNode answer = question.path("answer");
             require(answer.hasNonNull("value"));
-            validateRefs(answer.path("sourceRefs"), allowed);
+            resolveRefs(answer, citations);
             JsonNode explanation = question.path("explanation");
             require(nonblank(explanation, "text"));
-            validateRefs(explanation.path("sourceRefs"), allowed);
+            resolveRefs(explanation, citations);
             if (type.equals("multiple_choice")) require(prompt.path("options").size() == 4);
         });
     }
 
-    private static void validateRefs(JsonNode refs, Set<JsonNode> allowed) {
-        require(refs.isArray() && !refs.isEmpty());
-        refs.forEach(reference -> require(allowed.contains(reference)));
+    private static void resolveRefs(JsonNode node, Map<String, JsonNode> citations) {
+        require(node.isObject());
+        ObjectNode grounded = (ObjectNode) node;
+        JsonNode sourceIds = grounded.path("sourceIds");
+        require(sourceIds.isArray() && !sourceIds.isEmpty());
+        ArrayNode sourceRefs = grounded.putArray("sourceRefs");
+        sourceIds.forEach(sourceId -> {
+            require(sourceId.isTextual());
+            JsonNode sourceReference = citations.get(sourceId.asText());
+            require(sourceReference != null);
+            sourceRefs.add(sourceReference.deepCopy());
+        });
+        grounded.remove("sourceIds");
     }
 
     private static boolean nonblank(JsonNode node, String field) {

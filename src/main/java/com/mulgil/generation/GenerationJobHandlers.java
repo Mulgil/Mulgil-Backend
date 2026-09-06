@@ -89,8 +89,10 @@ abstract class GenerationJobHandler implements JobHandler {
     private String prompt(GenerationSnapshotService.Snapshot snapshot) {
         ObjectNode root = json.createObjectNode().put("phase", snapshot.phase());
         ArrayNode values = root.putArray("sources");
-        snapshot.sources().forEach(source -> values.addObject().put("text", source.text())
-                .set("sourceRef", source.sourceReference()));
+        for (int index = 0; index < snapshot.sources().size(); index++) {
+            GenerationSnapshotService.Source source = snapshot.sources().get(index);
+            values.addObject().put("citationId", GenerationCitations.sourceId(index)).put("text", source.text());
+        }
         try {
             return json.writeValueAsString(root);
         } catch (JsonProcessingException exception) {

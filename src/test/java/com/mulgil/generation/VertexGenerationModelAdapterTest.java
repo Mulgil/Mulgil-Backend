@@ -1,6 +1,7 @@
 package com.mulgil.generation;
 
 import com.google.cloud.vertexai.api.GenerationConfig;
+import com.google.cloud.vertexai.api.Schema;
 import com.google.cloud.vertexai.api.Type;
 import org.junit.jupiter.api.Test;
 
@@ -22,5 +23,9 @@ class VertexGenerationModelAdapterTest {
         assertThat(config.getResponseSchema().getType()).isEqualTo(Type.OBJECT);
         assertThat(config.getResponseSchema().getRequiredList())
                 .containsExactlyInAnyOrder("summary", "mindmap", "quizQuestions");
+        Schema summaryItem = config.getResponseSchema().getPropertiesOrThrow("summary")
+                .getPropertiesOrThrow("items").getItems();
+        assertThat(summaryItem.getRequiredList()).contains("sourceIds");
+        assertThat(summaryItem.getPropertiesMap()).containsKey("sourceIds").doesNotContainKey("sourceRefs");
     }
 }

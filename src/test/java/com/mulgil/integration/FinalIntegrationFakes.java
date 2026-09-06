@@ -106,19 +106,19 @@ public class FinalIntegrationFakes {
             if (mode == Mode.TIMEOUT) throw new IllegalStateException("provider timeout sentinel-secret");
             if (mode == Mode.MALFORMED) return "{malformed sentinel-secret raw-user-content";
             try {
-                JsonNode ref = json.readTree(prompt).path("sources").get(0).path("sourceRef");
-                JsonNode refs = mode == Mode.INVALID_REF ? json.createArrayNode()
-                        : json.createArrayNode().add(ref);
+                String citationId = json.readTree(prompt).path("sources").get(0).path("citationId").asText();
+                JsonNode sourceIds = mode == Mode.INVALID_REF ? json.createArrayNode()
+                        : json.createArrayNode().add(citationId);
                 var root = json.createObjectNode();
                 root.putObject("summary").putArray("items").addObject().put("text", "Grounded summary")
-                        .set("sourceRefs", refs.deepCopy());
+                        .set("sourceIds", sourceIds.deepCopy());
                 root.putObject("mindmap").putArray("nodes").addObject().put("id", "n1")
-                        .put("label", "Grounded node").set("sourceRefs", refs.deepCopy());
+                        .put("label", "Grounded node").set("sourceIds", sourceIds.deepCopy());
                 root.withObject("mindmap").putArray("edges");
                 var question = root.putArray("quizQuestions").addObject().put("type", "true_false");
-                question.putObject("question").put("text", "Grounded question").set("sourceRefs", refs.deepCopy());
-                question.putObject("answer").put("value", true).set("sourceRefs", refs.deepCopy());
-                question.putObject("explanation").put("text", "Grounded explanation").set("sourceRefs", refs);
+                question.putObject("question").put("text", "Grounded question").set("sourceIds", sourceIds.deepCopy());
+                question.putObject("answer").put("value", true).set("sourceIds", sourceIds.deepCopy());
+                question.putObject("explanation").put("text", "Grounded explanation").set("sourceIds", sourceIds);
                 return json.writeValueAsString(root);
             } catch (Exception exception) { throw new IllegalStateException(exception); }
         }
