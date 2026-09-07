@@ -1,6 +1,7 @@
 package com.mulgil.job;
 
 import com.mulgil.common.config.MulgilProperties;
+import com.mulgil.generation.GenerationModelPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -51,6 +52,46 @@ public final class AiProviderUsageLedger {
                          String unitType, Long unitCount, Supplier<T> providerCall) {
         return observe(null, ownerId, operation, provider, model, unitType, unitCount,
                 ignored -> unitCount, ignored -> "PROVIDER_FAILED", providerCall);
+    }
+
+    public GenerationModelPort.GenerationResult observeGeneration(
+            JobQueue.ClaimedJob job, String model, long promptUnitCount,
+            Supplier<GenerationModelPort.GenerationResult> providerCall) {
+        return observeGeneration(job.id(), job.ownerId(), model, promptUnitCount, providerCall);
+    }
+
+    public GenerationModelPort.GenerationResult observeGeneration(
+            UUID ownerId, String model, long promptUnitCount,
+            Supplier<GenerationModelPort.GenerationResult> providerCall) {
+        return observeGeneration(null, ownerId, model, promptUnitCount, providerCall);
+    }
+
+    private GenerationModelPort.GenerationResult observeGeneration(
+            UUID jobId, UUID ownerId, String model, long promptUnitCount,
+            Supplier<GenerationModelPort.GenerationResult> providerCall) {
+        UsageHandle usage = begin(jobId, ownerId, "vertex.generate", "vertex", model,
+                "unicode_code_point", promptUnitCount);
+        try {
+            GenerationModelPort.GenerationResult result = providerCall.get();
+            finishGeneration(usage, "succeeded", null, result, promptUnitCount);
+            return result;
+        } catch (GenerationModelPort.GenerationModelException exception) {
+            finishGeneration(usage, "failed", exception.code(), exception.result(), promptUnitCount);
+            throw exception;
+        } catch (RuntimeException exception) {
+            fail(usage, "PROVIDER_FAILED");
+            throw exception;
+        }
+    }
+
+    public GenerationModelPort.TokenCount observeGenerationTokenCount(
+            JobQueue.ClaimedJob job, String model,
+            Supplier<GenerationModelPort.TokenCount> providerCall) {
+        return observe(job, "vertex.count_tokens", "vertex", model, "token", null,
+                GenerationModelPort.TokenCount::inputTokens,
+                exception -> exception instanceof GenerationModelPort.GenerationModelException failure
+                        ? failure.code() : "PROVIDER_FAILED",
+                providerCall);
     }
 
     private <T> T observe(UUID jobId, UUID ownerId, String operation, String provider, String model,
@@ -119,6 +160,38 @@ public final class AiProviderUsageLedger {
         log(jobId, operation, provider, model, status, latency, unitCount, cost);
     }
 
+    private void finishGeneration(UsageHandle handle, String status, String errorCode,
+                                  GenerationModelPort.GenerationResult result, long promptUnitCount) {
+        Long unitCount = result == null ? promptUnitCount
+                : promptUnitCount + (long) result.rawJson().codePointCount(0, result.rawJson().length());
+        GenerationModelPort.GenerationUsage metadata = result == null ? null : result.usage();
+        Instant now = clock.instant();
+        Long cost = estimatedCost(handle.operation(), unitCount);
+        Long latency = transactions.execute(tx -> jdbc.sql("""
+                UPDATE ai_provider_usage SET status=:status,error_code=:error,
+                    unit_count=:units,estimated_cost_microusd=:cost,
+                    prompt_token_count=:promptTokens,candidate_token_count=:candidateTokens,
+                    total_token_count=:totalTokens,cached_content_token_count=:cachedTokens,
+                    context_cache_status=:cacheStatus,context_cache_token_count=:cacheTokenCount,
+                    first_response_latency_ms=:firstResponse,
+                    latency_ms=GREATEST(0,CAST(EXTRACT(EPOCH FROM (:now-started_at))*1000 AS bigint)),
+                    finished_at=:now
+                WHERE id=:id AND status='started'
+                RETURNING latency_ms
+                """).param("status", status).param("error", safeErrorCodeOrNull(errorCode))
+                .param("units", unitCount).param("cost", cost)
+                .param("promptTokens", metadata == null ? null : metadata.promptTokenCount())
+                .param("candidateTokens", metadata == null ? null : metadata.candidateTokenCount())
+                .param("totalTokens", metadata == null ? null : metadata.totalTokenCount())
+                .param("cachedTokens", metadata == null ? null : metadata.cachedContentTokenCount())
+                .param("cacheStatus", result == null ? null : result.contextCacheStatus())
+                .param("cacheTokenCount", result == null ? null : result.contextCacheTokenCount())
+                .param("firstResponse", result == null ? null : result.firstResponseLatencyMs())
+                .param("now", Timestamp.from(now)).param("id", handle.id())
+                .query(Long.class).optional().orElse(null));
+        log(handle.jobId(), handle.operation(), handle.provider(), handle.model(), status, latency, unitCount, cost);
+    }
+
     private Long estimatedCost(String operation, Long unitCount) {
         long rate = switch (operation) {
             case "vision.ocr" -> properties.aiRates().visionImageMicrousd();
@@ -148,6 +221,10 @@ public final class AiProviderUsageLedger {
     private static String safeErrorCode(String value) {
         if (value == null || !value.matches("[A-Z0-9_]{1,100}")) return "PROVIDER_FAILED";
         return value;
+    }
+
+    private static String safeErrorCodeOrNull(String value) {
+        return value == null ? null : safeErrorCode(value);
     }
 
     public record UsageHandle(UUID id, UUID jobId, String operation, String provider, String model,

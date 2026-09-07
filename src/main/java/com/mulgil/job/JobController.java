@@ -40,9 +40,11 @@ final class JobController {
 
     private static JobView view(JobQueue.AiJob job) {
         return new JobView(job.id(), job.type(), job.status(), job.materialId(), job.inputVersion(),
-                job.attemptCount(), job.maxAttempts(), job.errorCode(), job.createdAt(), job.finishedAt());
+                job.attemptCount(), job.maxAttempts(), job.errorCode(), job.createdAt(), job.finishedAt(),
+                job.progressStage(), job.progressUpdatedAt());
     }
 
     record JobView(UUID id, String type, String status, UUID materialId, int inputVersion, int attemptCount,
-                   int maxAttempts, String errorCode, Instant createdAt, Instant finishedAt) {}
+                   int maxAttempts, String errorCode, Instant createdAt, Instant finishedAt,
+                   String progressStage, Instant progressUpdatedAt) {}
 }

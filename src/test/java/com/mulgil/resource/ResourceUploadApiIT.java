@@ -534,6 +534,8 @@ class ResourceUploadApiIT {
 
         UUID chunkJob = UUID.randomUUID();
         UUID generationJob = UUID.randomUUID();
+        UUID mindmapJob = UUID.randomUUID();
+        UUID quizJob = UUID.randomUUID();
         String generationHash = ContentIndexingService.sha256(
                 "pdf_text\u001f" + materialId + "\u001f1\u001f" + chunkHash);
         jdbc.sql("""
@@ -551,6 +553,22 @@ class ResourceUploadApiIT {
                                 CURRENT_TIMESTAMP)
                         """).param("id", generationJob).param("owner", ownerId).param("course", courseId)
                 .param("session", sessionId).param("key", "g".repeat(64)).param("hash", generationHash).update();
+        jdbc.sql("""
+                        INSERT INTO ai_jobs
+                            (id,owner_id,course_id,session_id,job_type,status,input_version,idempotency_key,
+                             attempt_count,max_attempts,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:type,'queued',1,:key,0,3,:hash,CURRENT_TIMESTAMP)
+                        """).param("id", mindmapJob).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("type", "preview_mindmap_generate")
+                .param("key", "m".repeat(64)).param("hash", generationHash).update();
+        jdbc.sql("""
+                        INSERT INTO ai_jobs
+                            (id,owner_id,course_id,session_id,job_type,status,input_version,idempotency_key,
+                             attempt_count,max_attempts,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:type,'queued',1,:key,0,3,:hash,CURRENT_TIMESTAMP)
+                        """).param("id", quizJob).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("type", "preview_quiz_generate")
+                .param("key", "q".repeat(64)).param("hash", generationHash).update();
         String refs = "[{\"materialId\":\"" + materialId + "\"}]";
         String unrelatedRefs = "[{\"materialId\":\"" + UUID.randomUUID() + "\"}]";
         UUID matchingSummary = UUID.randomUUID();
@@ -622,6 +640,10 @@ class ResourceUploadApiIT {
                 .param("id", chunkJob).query(String.class).single()).isEqualTo("outdated");
         assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
                 .param("id", generationJob).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
+                .param("id", mindmapJob).query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE id=:id")
+                .param("id", quizJob).query(String.class).single()).isEqualTo("outdated");
         assertThat(jdbc.sql("SELECT status FROM summaries WHERE id=:id")
                 .param("id", matchingSummary).query(String.class).single()).isEqualTo("outdated");
         assertThat(jdbc.sql("SELECT status FROM mindmaps WHERE id=:id")

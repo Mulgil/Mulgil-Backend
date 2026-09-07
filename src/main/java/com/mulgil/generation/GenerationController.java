@@ -18,6 +18,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -29,10 +30,13 @@ import java.util.UUID;
 final class GenerationController {
     private final GenerationService service;
     private final QuizProgressService progress;
+    private final SelectedTopicGenerationService selectedTopics;
 
-    GenerationController(GenerationService service, QuizProgressService progress) {
+    GenerationController(GenerationService service, QuizProgressService progress,
+                         SelectedTopicGenerationService selectedTopics) {
         this.service = service;
         this.progress = progress;
+        this.selectedTopics = selectedTopics;
     }
 
     @GetMapping("/sessions/{sessionId}/summaries")
@@ -86,5 +90,18 @@ final class GenerationController {
     @ResponseStatus(HttpStatus.ACCEPTED)
     JobQueue.JobAccepted generatePredictedQuiz(@PathVariable UUID examId) {
         return service.generateExam(CurrentUser.id(), examId, true);
+    }
+
+    @PostMapping("/sessions/{sessionId}/target-generations")
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    JobQueue.JobAccepted generateSelectedTopic(
+            @PathVariable UUID sessionId,
+            @jakarta.validation.Valid @RequestBody SelectedTopicGenerationService.Request request) {
+        return selectedTopics.enqueue(CurrentUser.id(), sessionId, request);
+    }
+
+    @GetMapping("/target-generations/{jobId}")
+    SelectedTopicGenerationService.TargetView selectedTopicResult(@PathVariable UUID jobId) {
+        return selectedTopics.result(CurrentUser.id(), jobId);
     }
 }

@@ -16,6 +16,7 @@ import java.util.concurrent.TimeUnit;
 @Component
 @Profile("!test & !smoke")
 final class GcsCloudStorageAdapter implements CloudStoragePort {
+    private static final String PRIVATE_TARGET_PREFIX = "temporary/target-generations/";
     private final Storage storage = StorageOptions.getDefaultInstance().getService();
     private final String bucket;
 
@@ -25,6 +26,7 @@ final class GcsCloudStorageAdapter implements CloudStoragePort {
 
     @Override
     public URI createUploadUrl(String objectKey, String contentType, long contentLength, Instant expiresAt) {
+        rejectPrivateTargetKey(objectKey);
         long seconds = Math.max(1, expiresAt.getEpochSecond() - Instant.now().getEpochSecond());
         BlobInfo blob = BlobInfo.newBuilder(bucket, objectKey).setContentType(contentType).build();
         return URI.create(storage.signUrl(blob, seconds, TimeUnit.SECONDS,
@@ -37,6 +39,7 @@ final class GcsCloudStorageAdapter implements CloudStoragePort {
 
     @Override
     public URI createDownloadUrl(String objectKey, Instant expiresAt) {
+        rejectPrivateTargetKey(objectKey);
         long seconds = Math.max(1, expiresAt.getEpochSecond() - Instant.now().getEpochSecond());
         return URI.create(storage.signUrl(BlobInfo.newBuilder(bucket, objectKey).build(), seconds, TimeUnit.SECONDS,
                 Storage.SignUrlOption.httpMethod(com.google.cloud.storage.HttpMethod.GET),
@@ -52,6 +55,13 @@ final class GcsCloudStorageAdapter implements CloudStoragePort {
     }
 
     @Override
+    public void putPrivate(String objectKey, byte[] content, String contentType, String checksum) {
+        BlobInfo object = BlobInfo.newBuilder(bucket, objectKey).setContentType(contentType)
+                .setMetadata(Map.of("sha256", checksum)).build();
+        storage.create(object, content, Storage.BlobTargetOption.doesNotExist());
+    }
+
+    @Override
     public void delete(String objectKey) {
         storage.delete(bucket, objectKey);
     }
@@ -60,5 +70,11 @@ final class GcsCloudStorageAdapter implements CloudStoragePort {
     public byte[] read(String objectKey) {
         Blob blob = storage.get(bucket, objectKey);
         return blob == null ? null : blob.getContent();
+    }
+
+    private static void rejectPrivateTargetKey(String objectKey) {
+        if (objectKey.startsWith(PRIVATE_TARGET_PREFIX)) {
+            throw new IllegalArgumentException("Private target payloads cannot have signed URLs.");
+        }
     }
 }

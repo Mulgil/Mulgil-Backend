@@ -15,7 +15,7 @@ import java.time.Instant;
 import java.util.List;
 
 @Component
-final class ResourceObjectDeletionScheduler {
+public final class ResourceObjectDeletionScheduler {
     private static final Logger log = LoggerFactory.getLogger(ResourceObjectDeletionScheduler.class);
     private static final int MAX_ATTEMPTS = 3;
     private static final Duration RETRY_DELAY = Duration.ofMinutes(1);
@@ -31,7 +31,7 @@ final class ResourceObjectDeletionScheduler {
     }
 
     @Scheduled(fixedDelayString = "${RESOURCE_OBJECT_DELETION_POLL_INTERVAL_MILLIS:60000}")
-    void cleanupDue() {
+    public void cleanupDue() {
         CloudStoragePort objects = storage.getIfAvailable();
         if (objects == null) return;
         Instant now = clock.instant();

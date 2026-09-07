@@ -144,6 +144,10 @@ class FinalIntegrationQaTest {
         JsonNode generated = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review",
                 ownerToken, null), 200);
         assertThat(generated.path("summary").path("items").get(0).path("sourceRefs")).isNotEmpty();
+        assertThat(generated.path("mindmap").isNull()).isTrue();
+        runAll("review_mindmap_generate"); runAll("review_quiz_generate");
+        assertThat(ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review",
+                ownerToken, null), 200).path("mindmap").path("nodes")).isNotEmpty();
         JsonNode quiz = ok(send("GET", "/api/v1/sessions/" + session + "/quiz", ownerToken, null), 200);
         UUID question = UUID.fromString(quiz.get(0).path("id").asText());
         JsonNode attempt = ok(send("POST", "/api/v1/quiz/questions/" + question + "/attempts", ownerToken,

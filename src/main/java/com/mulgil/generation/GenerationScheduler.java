@@ -12,7 +12,7 @@ import java.util.UUID;
 
 @Component
 final class GenerationScheduler implements JobCompletionListener {
-    static final String PROMPT_VERSION = "source-grounded-v1";
+    static final String PROMPT_VERSION = "source-grounded-v2";
     private final JdbcClient jdbc;
     private final GenerationSnapshotService snapshots;
     private final MulgilProperties properties;
@@ -30,9 +30,14 @@ final class GenerationScheduler implements JobCompletionListener {
 
     @Override
     public void onCompleted(JobQueue.CompletionEvent event) {
-        if (!event.type().equals("chunk_embed")) return;
-        scheduleSession(event, "preview");
-        scheduleSession(event, "review");
+        if (event.type().equals("chunk_embed")) {
+            scheduleSession(event, "preview");
+            scheduleSession(event, "review");
+            return;
+        }
+        if (event.type().equals("preview_generate") || event.type().equals("review_generate")) {
+            scheduleChildren(event);
+        }
     }
 
     JobQueue.JobAccepted scheduleExam(UUID ownerId, UUID examId, boolean predicted) {
@@ -56,6 +61,18 @@ final class GenerationScheduler implements JobCompletionListener {
         });
     }
 
+    private void scheduleChildren(JobQueue.CompletionEvent event) {
+        transactions.executeWithoutResult(status -> {
+            if (!lockSession(event.ownerId(), event.sessionId())) return;
+            String phase = event.type().startsWith("preview_") ? "preview" : "review";
+            GenerationSnapshotService.Snapshot snapshot = snapshots.session(
+                    event.ownerId(), event.courseId(), event.sessionId(), phase);
+            if (!snapshot.ready() || !snapshot.snapshotHash().equals(event.sourceHash())) return;
+            enqueue(snapshot, phase + "_mindmap_generate", event.inputVersion());
+            enqueue(snapshot, phase + "_quiz_generate", event.inputVersion());
+        });
+    }
+
     private boolean lockSession(UUID ownerId, UUID sessionId) {
         return jdbc.sql("""
                         SELECT session.id FROM class_sessions session
@@ -67,17 +84,22 @@ final class GenerationScheduler implements JobCompletionListener {
     }
 
     private JobQueue.JobAccepted enqueue(GenerationSnapshotService.Snapshot snapshot, String type) {
-        String model = properties.vertex().generationModel();
-        String scope = type + ":" + (snapshot.examId() == null ? snapshot.sessionId() : snapshot.examId());
         int version = jdbc.sql("""
                         SELECT COALESCE(max(input_version),0)+1 FROM ai_jobs
                         WHERE owner_id=:owner AND job_type IN (:types)
                           AND ((CAST(:exam AS uuid) IS NULL AND session_id=:session) OR exam_id=CAST(:exam AS uuid))
                 """).param("owner", snapshot.ownerId()).param("types", snapshot.examId() == null
-                        ? java.util.List.of("preview_generate", "review_generate")
+                        ? java.util.List.of("preview_generate", "review_generate",
+                                "preview_mindmap_generate", "review_mindmap_generate",
+                                "preview_quiz_generate", "review_quiz_generate")
                         : java.util.List.of("exam_summary_generate", "exam_quiz_generate"))
                 .param("exam", snapshot.examId()).param("session", snapshot.sessionId())
                 .query(Integer.class).single();
+        return enqueue(snapshot, type, version);
+    }
+
+    private JobQueue.JobAccepted enqueue(GenerationSnapshotService.Snapshot snapshot, String type, int version) {
+        String model = properties.vertex().generationModel();
         JobQueue.AiJob job = jobs.getObject().enqueue(new JobQueue.EnqueueRequest(type, snapshot.ownerId(),
                 snapshot.courseId(), snapshot.sessionId(), null, null, null, null, snapshot.examId(), version,
                 snapshot.snapshotHash(), "vertex", model, PROMPT_VERSION));

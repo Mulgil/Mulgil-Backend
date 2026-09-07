@@ -38,6 +38,25 @@ mulgil:
     embedding-model: ${VERTEX_EMBEDDING_MODEL:text-multilingual-embedding-002}
     embedding-location: ${VERTEX_EMBEDDING_LOCATION:us-central1}
     embedding-batch-size: ${VERTEX_EMBEDDING_BATCH_SIZE:5}
+  generation:
+    temperature: ${VERTEX_GENERATION_TEMPERATURE:0.1}
+    candidate-count: ${VERTEX_GENERATION_CANDIDATE_COUNT:1}
+    summary-max-output-tokens: ${VERTEX_GENERATION_SUMMARY_MAX_OUTPUT_TOKENS:8192}
+    mindmap-max-output-tokens: ${VERTEX_GENERATION_MINDMAP_MAX_OUTPUT_TOKENS:8192}
+    quiz-max-output-tokens: ${VERTEX_GENERATION_QUIZ_MAX_OUTPUT_TOKENS:8192}
+    total-timeout-seconds: ${VERTEX_GENERATION_TOTAL_TIMEOUT_SECONDS:180}
+    input-soft-token-limit: ${VERTEX_GENERATION_INPUT_SOFT_TOKEN_LIMIT:100000}
+    context-cache-enabled: ${VERTEX_GENERATION_CONTEXT_CACHE_ENABLED:false}
+    context-cache-ttl-seconds: ${VERTEX_GENERATION_CONTEXT_CACHE_TTL_SECONDS:3600}
+  model-benchmark:
+    enabled: ${VERTEX_MODEL_BENCHMARK_ENABLED:false}
+    candidate-models: ${VERTEX_MODEL_BENCHMARK_CANDIDATES:}
+    retention-days: ${VERTEX_MODEL_BENCHMARK_RETENTION_DAYS:30}
+  retrieval:
+    selected-topic-enabled: ${SELECTED_TOPIC_GENERATION_ENABLED:false}
+    max-top-k: ${SELECTED_TOPIC_MAX_TOP_K:20}
+    candidate-multiplier: ${SELECTED_TOPIC_CANDIDATE_MULTIPLIER:8}
+    retention-days: ${SELECTED_TOPIC_METRIC_RETENTION_DAYS:30}
   fcm:
     enabled: ${FCM_ENABLED:true}
   ocr:

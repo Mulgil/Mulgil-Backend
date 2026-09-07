@@ -8,6 +8,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
@@ -33,7 +34,13 @@ public class JobQueue {
     private static final String PDF_MODEL = "pdfbox-3";
     private static final String NO_PROMPT = "none";
     private static final Set<String> GENERATION_TYPES = Set.of(
-            "preview_generate", "review_generate", "exam_summary_generate", "exam_quiz_generate");
+            "preview_generate", "review_generate",
+            "preview_mindmap_generate", "review_mindmap_generate",
+            "preview_quiz_generate", "review_quiz_generate",
+            "exam_summary_generate", "exam_quiz_generate", "target_generate");
+    private static final Set<String> REPLAY_SAFE_TERMINAL_TYPES = Set.of(
+            "preview_mindmap_generate", "review_mindmap_generate",
+            "preview_quiz_generate", "review_quiz_generate");
 
     private final JdbcClient jdbc;
     private final MulgilProperties properties;
@@ -103,7 +110,8 @@ public class JobQueue {
         String fingerprint = idempotencyKey(request);
         admission.lockOwner(request.ownerId());
         boolean reuseSucceeded = properties.demo().cacheEnabled() || !admission.isBillable(request.type());
-        AiJob existing = reusable(request.ownerId(), fingerprint, reuseSucceeded);
+        AiJob existing = reusable(request.ownerId(), fingerprint, reuseSucceeded,
+                REPLAY_SAFE_TERMINAL_TYPES.contains(request.type()));
         if (existing != null) return existing;
         AiJob retryable = retryable(request.ownerId(), fingerprint);
         if (retryable != null) return retryOnEnqueue(retryable);
@@ -132,11 +140,12 @@ public class JobQueue {
                 .query((row, ignored) -> job(row)).single();
     }
 
-    private AiJob reusable(UUID ownerId, String fingerprint, boolean reuseSucceeded) {
+    private AiJob reusable(UUID ownerId, String fingerprint, boolean reuseSucceeded, boolean reuseTerminal) {
         return jdbc.sql("""
                         SELECT * FROM ai_jobs
                         WHERE owner_id=:owner AND cache_fingerprint=:fingerprint
-                          AND (status IN ('queued','running') OR (:reuseSucceeded AND status='succeeded'))
+                          AND (status IN ('queued','running') OR (:reuseSucceeded AND status='succeeded')
+                               OR (:reuseTerminal AND status IN ('succeeded','failed')))
                         ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1
                                              ELSE 2 END,
                                  created_at DESC
@@ -144,6 +153,7 @@ public class JobQueue {
                         FOR UPDATE
                         """).param("owner", ownerId).param("fingerprint", fingerprint)
                 .param("reuseSucceeded", reuseSucceeded)
+                .param("reuseTerminal", reuseTerminal)
                 .query((row, ignored) -> job(row)).optional().orElse(null);
     }
 
@@ -161,7 +171,8 @@ public class JobQueue {
         if (!existing.status().equals("failed") || existing.attemptCount() >= existing.maxAttempts()
                 || !RETRYABLE_ERRORS.contains(existing.errorCode())) return existing;
         return jdbc.sql("""
-                        UPDATE ai_jobs SET status='queued',error_code=NULL,error_message=NULL,finished_at=NULL
+                        UPDATE ai_jobs SET status='queued',error_code=NULL,error_message=NULL,finished_at=NULL,
+                            progress_stage=NULL,progress_updated_at=NULL
                         WHERE id=:id RETURNING *
                         """).param("id", existing.id()).query((row, ignored) -> job(row)).single();
     }
@@ -184,7 +195,19 @@ public class JobQueue {
                         UPDATE ai_jobs job SET status = 'running', attempt_count = attempt_count + 1,
                             claimed_by = :workerId, last_heartbeat_at = :now,
                             lease_expires_at = :lease, started_at = COALESCE(started_at, :now),
-                            error_code = NULL, error_message = NULL, finished_at = NULL
+                            error_code = NULL, error_message = NULL, finished_at = NULL,
+                            progress_stage = CASE WHEN job.job_type IN
+                                ('preview_generate','review_generate',
+                                 'preview_mindmap_generate','review_mindmap_generate',
+                                 'preview_quiz_generate','review_quiz_generate',
+                                 'exam_summary_generate','exam_quiz_generate','target_generate')
+                                THEN 'preparing' ELSE NULL END,
+                            progress_updated_at = CASE WHEN job.job_type IN
+                                ('preview_generate','review_generate',
+                                 'preview_mindmap_generate','review_mindmap_generate',
+                                 'preview_quiz_generate','review_quiz_generate',
+                                 'exam_summary_generate','exam_quiz_generate','target_generate')
+                                THEN CAST(:now AS timestamptz) ELSE NULL END
                         FROM selected WHERE job.id = selected.id
                         RETURNING job.*
                         """)
@@ -242,6 +265,21 @@ public class JobQueue {
                 .param("now", Timestamp.from(now))
                 .param("lease", Timestamp.from(now.plusSeconds(properties.jobs().leaseSeconds())))
                 .param("id", jobId).param("workerId", workerId).update() == 1;
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public boolean updateProgress(ClaimedJob job, String stage) {
+        return updateProgress(job.id(), job.claimedBy(), stage);
+    }
+
+    private boolean updateProgress(UUID jobId, String workerId, String stage) {
+        Instant now = clock.instant();
+        return jdbc.sql("""
+                        UPDATE ai_jobs SET progress_stage=:stage,progress_updated_at=:now
+                        WHERE id=:id AND status='running' AND claimed_by=:worker
+                          AND lease_expires_at > :now
+                        """).param("stage", stage).param("now", Timestamp.from(now))
+                .param("id", jobId).param("worker", workerId).update() == 1;
     }
 
     @Transactional(noRollbackFor = JobHandler.JobExecutionException.class)
@@ -310,6 +348,10 @@ public class JobQueue {
     }
 
     public void fail(ClaimedJob claimed, String code, String message, boolean retryable) {
+        if ("STALE_INPUT".equals(code) && GENERATION_TYPES.contains(claimed.type())) {
+            markOutdated(claimed.id(), claimed.claimedBy());
+            return;
+        }
         String publicCode = retryable ? normalizeRetryableCode(code) : code;
         jdbc.sql("""
                         UPDATE ai_jobs SET status = 'failed', claimed_by = NULL, last_heartbeat_at = NULL,
@@ -324,7 +366,7 @@ public class JobQueue {
     public AiJob retry(UUID ownerId, UUID jobId) {
         AiJob result = jdbc.sql("""
                         UPDATE ai_jobs job SET status = 'queued', error_code = NULL, error_message = NULL,
-                            finished_at = NULL
+                            finished_at = NULL, progress_stage = NULL, progress_updated_at = NULL
                         FROM courses course
                         WHERE job.owner_id = :ownerId AND job.id = :id AND job.status = 'failed'
                           AND job.attempt_count < job.max_attempts AND job.error_code IN (:errors)
@@ -364,7 +406,7 @@ public class JobQueue {
         jdbc.sql("""
                 UPDATE ai_jobs SET status = 'queued', claimed_by = NULL, last_heartbeat_at = NULL,
                     lease_expires_at = NULL, error_code = 'LEASE_EXPIRED',
-                    error_message = 'Worker lease expired.'
+                    error_message = 'Worker lease expired.', progress_stage = NULL, progress_updated_at = NULL
                 WHERE status = 'running' AND lease_expires_at <= :now AND attempt_count < max_attempts
                 """).param("now", Timestamp.from(now)).update();
         jdbc.sql("""
@@ -427,13 +469,64 @@ public class JobQueue {
     private boolean generationSourceIsCurrent(AiJob job) {
         if (!lockActiveSession(job.ownerId(), job.courseId(), job.sessionId())) return false;
         GenerationSnapshotService.Snapshot snapshot = switch (job.type()) {
-            case "preview_generate" -> snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "preview");
-            case "review_generate" -> snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "review");
+            case "preview_generate", "preview_mindmap_generate", "preview_quiz_generate" ->
+                    snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "preview");
+            case "review_generate", "review_mindmap_generate", "review_quiz_generate" ->
+                    snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "review");
             case "exam_summary_generate" -> snapshots.exam(job.ownerId(), job.examId(), false);
             case "exam_quiz_generate" -> snapshots.exam(job.ownerId(), job.examId(), true);
+            case "target_generate" -> null;
             default -> throw new IllegalStateException("Unsupported generation job type.");
         };
-        return snapshot != null && snapshot.snapshotHash().equals(job.sourceHash());
+        if (job.type().equals("target_generate")) return selectedTopicSourcesAreCurrent(job);
+        if (snapshot == null || !snapshot.snapshotHash().equals(job.sourceHash())) return false;
+        if (!REPLAY_SAFE_TERMINAL_TYPES.contains(job.type())) return true;
+        return jdbc.sql("""
+                SELECT EXISTS(
+                    SELECT 1 FROM summaries
+                    WHERE owner_id=:owner AND course_id=:course AND session_id=:session
+                      AND summary_type=:type AND input_version=:version AND status='succeeded'
+                )
+                """).param("owner", job.ownerId()).param("course", job.courseId())
+                .param("session", job.sessionId()).param("type", job.type().startsWith("preview_")
+                        ? "preview" : "review").param("version", job.inputVersion())
+                .query(Boolean.class).single();
+    }
+
+    private boolean selectedTopicSourcesAreCurrent(AiJob job) {
+        return jdbc.sql("""
+                SELECT EXISTS(
+                    SELECT 1 FROM selected_topic_generations target
+                    WHERE target.job_id=:job AND target.owner_id=:owner
+                      AND target.course_id=:course AND target.session_id=:session
+                      AND target.payload_hash=:hash AND target.selected_chunk_ids IS NOT NULL
+                      AND cardinality(target.selected_chunk_ids) > 0
+                      AND cardinality(target.selected_chunk_ids) = (
+                          SELECT count(*) FROM chunks chunk
+                          LEFT JOIN content_blocks block ON block.id=chunk.content_block_id
+                              AND block.owner_id=chunk.owner_id AND block.course_id=chunk.course_id
+                              AND block.session_id=chunk.session_id
+                          LEFT JOIN materials material ON material.id=block.material_id
+                              AND material.owner_id=chunk.owner_id
+                          LEFT JOIN notes note ON note.id=block.note_id AND note.owner_id=chunk.owner_id
+                          LEFT JOIN handwriting_blocks handwriting ON handwriting.id=block.handwriting_block_id
+                              AND handwriting.owner_id=chunk.owner_id
+                          LEFT JOIN transcript_segments segment ON segment.id=chunk.transcript_segment_id
+                              AND segment.owner_id=chunk.owner_id AND segment.course_id=chunk.course_id
+                              AND segment.session_id=chunk.session_id
+                          LEFT JOIN audio_recordings recording ON recording.id=segment.recording_id
+                              AND recording.owner_id=chunk.owner_id
+                          WHERE chunk.id=ANY(target.selected_chunk_ids) AND chunk.owner_id=target.owner_id
+                            AND chunk.course_id=target.course_id AND chunk.session_id=target.session_id
+                            AND ((material.id IS NOT NULL AND material.status NOT IN ('cancelled','outdated'))
+                              OR (note.id IS NOT NULL AND note.last_left_version=note.version)
+                              OR handwriting.status='confirmed'
+                              OR (recording.id IS NOT NULL AND recording.status NOT IN ('cancelled','outdated')))
+                      )
+                )
+                """).param("job", job.id()).param("owner", job.ownerId()).param("course", job.courseId())
+                .param("session", job.sessionId()).param("hash", job.sourceHash())
+                .query(Boolean.class).single();
     }
 
     private void markOutdated(UUID id, String workerId) {
@@ -531,7 +624,9 @@ public class JobQueue {
                 : request.examId() != null ? request.examId().toString()
                 : request.sessionId() + ":" + request.sourceHash();
         String canonical = String.join("\u001f", request.type(), resource, request.sessionId().toString(),
-                GENERATION_TYPES.contains(request.type()) ? "generated" : Integer.toString(request.inputVersion()),
+                REPLAY_SAFE_TERMINAL_TYPES.contains(request.type()) ? Integer.toString(request.inputVersion())
+                        : GENERATION_TYPES.contains(request.type()) ? "generated"
+                        : Integer.toString(request.inputVersion()),
                 request.sourceHash(), request.provider(), request.model(), request.promptVersion());
         return idempotencyKey(canonical);
     }
@@ -566,7 +661,8 @@ public class JobQueue {
                 row.getObject("recording_id", UUID.class), row.getObject("exam_id", UUID.class),
                 row.getInt("input_version"), row.getString("source_hash"), row.getInt("attempt_count"),
                 row.getInt("max_attempts"), row.getString("error_code"), instant(row, "created_at"),
-                nullableInstant(row, "finished_at"));
+                nullableInstant(row, "finished_at"), row.getString("progress_stage"),
+                nullableInstant(row, "progress_updated_at"));
     }
 
     private static ClaimedJob claimed(ResultSet row) throws SQLException {
@@ -590,7 +686,8 @@ public class JobQueue {
     public record AiJob(UUID id, String type, String status, UUID ownerId, UUID courseId, UUID sessionId,
                         UUID materialId, UUID examResourceId, UUID noteId, UUID recordingId, UUID examId,
                         int inputVersion, String sourceHash, int attemptCount, int maxAttempts,
-                        String errorCode, Instant createdAt, Instant finishedAt) {}
+                        String errorCode, Instant createdAt, Instant finishedAt, String progressStage,
+                        Instant progressUpdatedAt) {}
     public record ClaimedJob(UUID id, String type, UUID ownerId, UUID courseId, UUID sessionId,
                              UUID materialId, UUID examResourceId, UUID noteId, UUID recordingId, UUID examId,
                              int inputVersion, String sourceHash, int attemptCount, int maxAttempts,

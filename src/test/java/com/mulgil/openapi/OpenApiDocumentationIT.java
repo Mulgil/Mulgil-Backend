@@ -54,7 +54,7 @@ class OpenApiDocumentationIT {
         JsonNode document = objectMapper.readTree(response.body());
         assertThat(document.at("/info/title").asText()).isEqualTo("Mulgil MVP Backend API");
         assertThat(document.at("/components/securitySchemes/bearerAuth/type").asText()).isEqualTo("http");
-        assertThat(documentedMvpOperationCount(document)).isEqualTo(51);
+        assertThat(documentedMvpOperationCount(document)).isEqualTo(53);
         assertThat(document.at("/paths/~1api~1v1~1courses~1{courseId}/patch/summary").asText())
                 .isEqualTo("과목 수정");
         assertThat(document.at("/paths/~1api~1v1~1courses~1{courseId}/delete/summary").asText())
@@ -67,6 +67,10 @@ class OpenApiDocumentationIT {
                 .isEqualTo("PDF 필기 조회");
         assertThat(document.at("/paths/~1api~1v1~1exams~1{examId}~1resources/get/summary").asText())
                 .isEqualTo("기출 자료 조회");
+        assertThat(document.at("/paths/~1api~1v1~1sessions~1{sessionId}~1target-generations/post/summary").asText())
+                .isEqualTo("선택 주제 생성 작업 요청");
+        assertThat(document.at("/paths/~1api~1v1~1target-generations~1{jobId}/get/summary").asText())
+                .isEqualTo("선택 주제 생성 결과 조회");
         assertThat(document.at("/paths/~1api~1v1~1exam-resources~1{examResourceId}~1download-url/get/summary").asText())
                 .isEqualTo("기출 PDF 다운로드 URL 발급");
         assertThat(document.at("/paths/~1api~1v1~1materials~1{materialId}/delete/summary").asText())

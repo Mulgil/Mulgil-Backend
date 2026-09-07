@@ -14,6 +14,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class GenerationOutputValidatorTest {
     private final ObjectMapper json = new ObjectMapper();
     private final GenerationOutputValidator validator = new GenerationOutputValidator(json);
+    private final GenerationInputCompiler compiler = new GenerationInputCompiler();
 
     @Test
     void restoresFullSourceReference_whenOutputUsesKnownCitationId() throws Exception {
@@ -27,7 +28,8 @@ class GenerationOutputValidatorTest {
                 {"summary":{"items":[{"text":"Grounded summary","sourceIds":["s1"]}]}}
                 """;
 
-        GenerationOutputValidator.Output output = validator.parse(raw, snapshot, false, false);
+        GenerationOutputValidator.Output output = validator.parse(
+                raw, compiler.compile(snapshot), GenerationModelPort.Artifact.SUMMARY);
 
         JsonNode item = output.summary().path("items").get(0);
         assertThat(item.has("sourceIds")).isFalse();
@@ -41,7 +43,9 @@ class GenerationOutputValidatorTest {
                 {"summary":{"items":[{"text":"Ungrounded summary","sourceIds":["s99"]}]}}
                 """;
 
-        assertThatThrownBy(() -> validator.parse(raw, snapshot(json.readTree("{\"sourceType\":\"pdf\"}")), false, false))
+        assertThatThrownBy(() -> validator.parse(raw,
+                compiler.compile(snapshot(json.readTree("{\"sourceType\":\"pdf\"}"))),
+                GenerationModelPort.Artifact.SUMMARY))
                 .isInstanceOf(JobHandler.JobExecutionException.class)
                 .extracting("code").isEqualTo("INVALID_SOURCE_REFERENCES");
     }
