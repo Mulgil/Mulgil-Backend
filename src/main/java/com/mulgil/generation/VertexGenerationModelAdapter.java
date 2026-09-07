@@ -222,18 +222,27 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
     static GenerationConfig generationConfig(double temperature, int candidateCount, int maxOutputTokens,
                                              Artifact artifact) {
         Schema sourceIds = array(scalar(Type.STRING)).toBuilder().setMinItems(1).build();
+        Schema mindmapSourceIds = sourceIds.toBuilder()
+                .setMaxItems(GenerationOutputValidator.MAX_MINDMAP_SOURCE_IDS).build();
         Schema groundedText = object()
                 .putProperties("text", scalar(Type.STRING))
                 .putProperties("sourceIds", sourceIds)
                 .addRequired("text").addRequired("sourceIds").build();
         Schema summary = object().putProperties("items", array(groundedText))
                 .addRequired("items").build();
-        Schema node = object().putProperties("id", scalar(Type.STRING))
-                .putProperties("label", scalar(Type.STRING)).putProperties("sourceIds", sourceIds)
+        Schema mindmapId = scalar(Type.STRING).toBuilder()
+                .setMaxLength(GenerationOutputValidator.MAX_MINDMAP_ID_CODE_POINTS).build();
+        Schema mindmapLabel = scalar(Type.STRING).toBuilder()
+                .setMaxLength(GenerationOutputValidator.MAX_MINDMAP_LABEL_CODE_POINTS).build();
+        Schema node = object().putProperties("id", mindmapId)
+                .putProperties("label", mindmapLabel).putProperties("sourceIds", mindmapSourceIds)
                 .addRequired("id").addRequired("label").addRequired("sourceIds").build();
-        Schema edge = object().putProperties("from", scalar(Type.STRING))
-                .putProperties("to", scalar(Type.STRING)).addRequired("from").addRequired("to").build();
-        Schema mindmap = object().putProperties("nodes", array(node)).putProperties("edges", array(edge))
+        Schema edge = object().putProperties("from", mindmapId)
+                .putProperties("to", mindmapId).addRequired("from").addRequired("to").build();
+        Schema mindmap = object().putProperties("nodes", array(node).toBuilder()
+                        .setMaxItems(GenerationOutputValidator.MAX_MINDMAP_NODES).build())
+                .putProperties("edges", array(edge).toBuilder()
+                        .setMaxItems(GenerationOutputValidator.MAX_MINDMAP_EDGES).build())
                 .addRequired("nodes").addRequired("edges").build();
         Schema prompt = groundedText.toBuilder().putProperties("options", array(scalar(Type.STRING))).build();
         Schema answer = object().putProperties("value", Schema.newBuilder()

@@ -100,6 +100,30 @@ class VertexGenerationModelAdapterTest {
     }
 
     @Test
+    void boundsMindmapProviderSchema_withValidatorLimits() {
+        GenerationConfig config = VertexGenerationModelAdapter.generationConfig(
+                0.1, 1, 2048, GenerationModelPort.Artifact.MINDMAP);
+
+        Schema mindmap = config.getResponseSchema().getPropertiesOrThrow("mindmap");
+        Schema nodes = mindmap.getPropertiesOrThrow("nodes");
+        Schema edges = mindmap.getPropertiesOrThrow("edges");
+        Schema node = nodes.getItems();
+        Schema edge = edges.getItems();
+        assertThat(nodes.getMaxItems()).isEqualTo(GenerationOutputValidator.MAX_MINDMAP_NODES);
+        assertThat(edges.getMaxItems()).isEqualTo(GenerationOutputValidator.MAX_MINDMAP_EDGES);
+        assertThat(node.getPropertiesOrThrow("label").getMaxLength())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_LABEL_CODE_POINTS);
+        assertThat(node.getPropertiesOrThrow("id").getMaxLength())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_ID_CODE_POINTS);
+        assertThat(node.getPropertiesOrThrow("sourceIds").getMaxItems())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_SOURCE_IDS);
+        assertThat(edge.getPropertiesOrThrow("from").getMaxLength())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_ID_CODE_POINTS);
+        assertThat(edge.getPropertiesOrThrow("to").getMaxLength())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_ID_CODE_POINTS);
+    }
+
+    @Test
     void assemblesOrderedChunksAndKeepsOnlyFinalUsage_whenStreamCompletes() {
         AtomicInteger firstResponses = new AtomicInteger();
         GenerateContentResponse blank = response("  ", Candidate.FinishReason.FINISH_REASON_UNSPECIFIED, null);
