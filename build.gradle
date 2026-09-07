@@ -19,7 +19,7 @@ repositories {
 
 ext {
     set('testcontainers.version', '1.21.3')
-    set('googleCloudLibrariesVersion', '26.67.0')
+    set('googleCloudLibrariesVersion', '26.79.0')
 }
 
 dependencyManagement {
