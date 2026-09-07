@@ -55,11 +55,11 @@ final class GenerationService {
                 .param("version", summary.inputVersion())
                 .query((row, ignored) -> new StoredMindmap(row.getObject("id", UUID.class),
                         parse(row.getString("nodes_json")), parse(row.getString("edges_json"))))
-                .optional().orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "GENERATION_NOT_FOUND",
-                        "Generated session content is incomplete."));
+                .optional().orElse(null);
         return new SessionGeneration(new SummaryView(summary.id(), type, summary.inputVersion(),
                 summary.content().path("items"), summary.content().path("tables")),
-                new MindmapView(mindmap.id(), summary.inputVersion(), mindmap.nodes(), mindmap.edges()));
+                mindmap == null ? null : new MindmapView(
+                        mindmap.id(), summary.inputVersion(), mindmap.nodes(), mindmap.edges()));
     }
 
     ExamGeneration examSummary(UUID ownerId, UUID examId) {
@@ -146,7 +146,8 @@ final class GenerationService {
         };
     }
 
-    record SessionGeneration(SummaryView summary, MindmapView mindmap) {}
+    record SessionGeneration(SummaryView summary,
+                             @Schema(nullable = true, implementation = MindmapView.class) MindmapView mindmap) {}
     record SummaryView(UUID id, String type, int inputVersion, JsonNode items, JsonNode tables) {}
     @Schema(description = "Generated exam summary artifact")
     record ExamGeneration(UUID id,

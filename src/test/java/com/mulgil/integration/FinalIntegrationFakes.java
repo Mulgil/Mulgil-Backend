@@ -31,7 +31,18 @@ public class FinalIntegrationFakes {
     @Bean @Primary public FakeVision vision() { return new FakeVision(); }
     @Bean public VertexState vertex(ObjectMapper json) { return new VertexState(json); }
     @Bean @Primary public ChunkEmbeddingPort embeddings(VertexState vertex) { return vertex::embed; }
-    @Bean @Primary public GenerationModelPort generation(VertexState vertex) { return vertex::generateJson; }
+    @Bean @Primary public GenerationModelPort generation(VertexState vertex) {
+        return new GenerationModelPort() {
+            @Override public GenerationResult generate(GenerationRequest request) {
+                request.onFirstResponse().run();
+                return new GenerationResult(vertex.generateJson(request.input().citations().get(0).id()),
+                        null, null, "STOP");
+            }
+            @Override public TokenCount countTokens(GenerationRequest request) {
+                return new TokenCount(1, 1_048_576);
+            }
+        };
+    }
     @Bean @Primary public FakeFcm fcm() { return new FakeFcm(); }
 
     public static final class FakeGcs implements CloudStoragePort {
@@ -101,12 +112,11 @@ public class FinalIntegrationFakes {
             if (mode == Mode.TIMEOUT) throw new IllegalStateException("provider timeout sentinel-secret");
             return new ChunkEmbeddingPort.Embedding(new ArrayList<>(Collections.nCopies(768, 0.2f)), "fake-embedding");
         }
-        String generateJson(String prompt, String schema) {
+        String generateJson(String citationId) {
             generationCalls.incrementAndGet();
             if (mode == Mode.TIMEOUT) throw new IllegalStateException("provider timeout sentinel-secret");
             if (mode == Mode.MALFORMED) return "{malformed sentinel-secret raw-user-content";
             try {
-                String citationId = json.readTree(prompt).path("sources").get(0).path("citationId").asText();
                 JsonNode sourceIds = mode == Mode.INVALID_REF ? json.createArrayNode()
                         : json.createArrayNode().add(citationId);
                 var root = json.createObjectNode();

@@ -2,12 +2,11 @@ package com.mulgil.generation;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
 import com.mulgil.job.AiProviderUsageLedger;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
@@ -23,22 +22,30 @@ abstract class GenerationJobHandler implements JobHandler {
     private static final Logger log = LoggerFactory.getLogger(GenerationJobHandler.class);
     private final JdbcClient jdbc;
     private final GenerationSnapshotService snapshots;
+    private final GenerationInputCompiler compiler;
     private final GenerationOutputValidator validator;
     private final ObjectProvider<GenerationModelPort> models;
     private final MulgilProperties properties;
     private final ObjectMapper json;
     private final Clock clock;
     private final AiProviderUsageLedger usage;
+    private final JobQueue queue;
+    private final MeterRegistry metrics;
 
-    GenerationJobHandler(JdbcClient jdbc, GenerationSnapshotService snapshots, GenerationOutputValidator validator,
+    GenerationJobHandler(JdbcClient jdbc, GenerationSnapshotService snapshots, GenerationInputCompiler compiler,
+                         GenerationOutputValidator validator,
                          ObjectProvider<GenerationModelPort> models, MulgilProperties properties,
-                         AiProviderUsageLedger usage, ObjectMapper json, Clock clock) {
+                         AiProviderUsageLedger usage, JobQueue queue, MeterRegistry metrics,
+                         ObjectMapper json, Clock clock) {
         this.jdbc = jdbc;
         this.snapshots = snapshots;
+        this.compiler = compiler;
         this.validator = validator;
         this.models = models;
         this.properties = properties;
         this.usage = usage;
+        this.queue = queue;
+        this.metrics = metrics;
         this.json = json;
         this.clock = clock;
     }
@@ -52,56 +59,75 @@ abstract class GenerationJobHandler implements JobHandler {
         GenerationModelPort model = models.getIfAvailable();
         if (model == null) throw new JobExecutionException(
                 "PROVIDER_UNAVAILABLE", "Generation provider unavailable.", true);
-        String raw;
-        String prompt = prompt(snapshot);
+        GenerationModelPort.GenerationResult result;
+        GenerationInputCompiler.CompiledInput input = compiler.compile(snapshot);
+        GenerationModelPort.GenerationRequest request = new GenerationModelPort.GenerationRequest(
+                input, schema(), artifact(job), () -> queue.updateProgress(job, "generating"),
+                job.ownerId(), snapshot.snapshotHash());
         try {
-            raw = usage.observe(job, "vertex.generate", "vertex", properties.vertex().generationModel(),
-                    "unicode_code_point", prompt.codePoints().count(),
-                    value -> prompt.codePoints().count() + value.codePoints().count(),
-                    ignored -> "PROVIDER_FAILED", () -> model.generateJson(prompt, schema()));
+            if (input.text().codePoints().count() > properties.generation().inputSoftTokenLimit()) {
+                GenerationModelPort.TokenCount tokens = usage.observeGenerationTokenCount(job,
+                        properties.vertex().generationModel(), () -> model.countTokens(request));
+                if (tokens.inputTokens() > tokens.contextTokenLimit()) {
+                    throw new JobExecutionException("GENERATION_INPUT_TOO_LARGE",
+                            "Generation input exceeds the supported context.", false);
+                }
+            }
+            result = usage.observeGeneration(job, properties.vertex().generationModel(),
+                    input.text().codePoints().count(), () -> model.generate(request));
+        } catch (GenerationModelPort.GenerationModelException exception) {
+            throw new JobExecutionException(exception.code(), "Generation provider failed.", exception.retryable());
         } catch (RuntimeException exception) {
             throw new JobExecutionException("PROVIDER_UNAVAILABLE", "Generation provider failed.", true);
         }
-        boolean session = job.examId() == null;
-        boolean quiz = job.type().equals("exam_quiz_generate");
+        queue.updateProgress(job, "validating");
         GenerationOutputValidator.Output output;
         try {
-            output = validator.parse(raw, snapshot, session, quiz);
+            output = validator.parse(result.rawJson(), input, artifact(job));
         } catch (JobExecutionException exception) {
+            metrics.counter("mulgil.generation.validation.failures",
+                    "model", properties.vertex().generationModel(), "artifact", artifact(job).metricValue(),
+                    "result", "rejected", "cache", Boolean.toString(cacheHit(result))).increment();
             log.atWarn().addKeyValue("event", "generation.output.rejected")
                     .addKeyValue("jobId", job.id()).addKeyValue("operation", job.type())
                     .addKeyValue("status", "rejected").log("generation output rejected");
             throw exception;
         }
+        queue.updateProgress(job, "publishing");
         return () -> publish(job, output);
+    }
+
+    private static GenerationModelPort.Artifact artifact(JobQueue.ClaimedJob job) {
+        return switch (job.type()) {
+            case "preview_generate", "review_generate", "exam_summary_generate" ->
+                    GenerationModelPort.Artifact.SUMMARY;
+            case "preview_mindmap_generate", "review_mindmap_generate" ->
+                    GenerationModelPort.Artifact.MINDMAP;
+            case "preview_quiz_generate", "review_quiz_generate", "exam_quiz_generate" ->
+                    GenerationModelPort.Artifact.QUIZ;
+            default -> throw new IllegalArgumentException("Unsupported generation job type.");
+        };
+    }
+
+    private static boolean cacheHit(GenerationModelPort.GenerationResult result) {
+        return result.usage() != null && result.usage().cachedContentTokenCount() != null
+                && result.usage().cachedContentTokenCount() > 0;
     }
 
     private GenerationSnapshotService.Snapshot load(JobQueue.ClaimedJob job) {
         return switch (job.type()) {
-            case "preview_generate" -> snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "preview");
-            case "review_generate" -> snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "review");
+            case "preview_generate", "preview_mindmap_generate", "preview_quiz_generate" ->
+                    snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "preview");
+            case "review_generate", "review_mindmap_generate", "review_quiz_generate" ->
+                    snapshots.session(job.ownerId(), job.courseId(), job.sessionId(), "review");
             case "exam_summary_generate" -> snapshots.exam(job.ownerId(), job.examId(), false);
             case "exam_quiz_generate" -> snapshots.exam(job.ownerId(), job.examId(), true);
             default -> throw new IllegalArgumentException("Unsupported generation job type.");
         };
     }
 
-    private String prompt(GenerationSnapshotService.Snapshot snapshot) {
-        ObjectNode root = json.createObjectNode().put("phase", snapshot.phase());
-        ArrayNode values = root.putArray("sources");
-        for (int index = 0; index < snapshot.sources().size(); index++) {
-            GenerationSnapshotService.Source source = snapshot.sources().get(index);
-            values.addObject().put("citationId", GenerationCitations.sourceId(index)).put("text", source.text());
-        }
-        try {
-            return json.writeValueAsString(root);
-        } catch (JsonProcessingException exception) {
-            throw new IllegalStateException(exception);
-        }
-    }
-
     private String schema() {
-        return "source-grounded-generation-v1";
+        return "source-grounded-v2";
     }
 
     private void publish(JobQueue.ClaimedJob job, GenerationOutputValidator.Output output) {
@@ -112,12 +138,16 @@ abstract class GenerationJobHandler implements JobHandler {
         Timestamp now = Timestamp.from(clock.instant());
         String model = properties.vertex().generationModel();
         String refs = json(output.sourceReferences());
-        if (job.type().equals("exam_quiz_generate")) {
-            replaceQuestions(job, output, "past_exam_based", model, now);
+        GenerationModelPort.Artifact artifact = artifact(job);
+        if (artifact == GenerationModelPort.Artifact.QUIZ) {
+            replaceQuestions(job, output, job.examId() == null ? "practice" : "past_exam_based", model, now);
             return;
         }
-        String summaryType = job.examId() == null
-                ? job.type().substring(0, job.type().indexOf('_')) : "exam";
+        if (artifact == GenerationModelPort.Artifact.MINDMAP) {
+            replaceMindmap(job, output, model, refs, now);
+            return;
+        }
+        String summaryType = job.examId() == null ? phase(job.type()) : "exam";
         jdbc.sql("""
                 UPDATE summaries SET status='outdated',updated_at=:now
                 WHERE owner_id=:owner AND status='succeeded' AND summary_type=:type
@@ -135,10 +165,10 @@ abstract class GenerationJobHandler implements JobHandler {
                 .param("type", summaryType).param("version", job.inputVersion())
                 .param("content", json(output.summary())).param("refs", refs).param("model", model)
                 .param("prompt", GenerationScheduler.PROMPT_VERSION).param("now", now).update();
-        if (job.examId() == null) {
-            replaceMindmap(job, output, model, refs, now);
-            replaceQuestions(job, output, "practice", model, now);
-        }
+    }
+
+    private static String phase(String type) {
+        return type.startsWith("preview_") ? "preview" : "review";
     }
 
     private void replaceMindmap(JobQueue.ClaimedJob job, GenerationOutputValidator.Output output,
@@ -198,40 +228,92 @@ abstract class GenerationJobHandler implements JobHandler {
 
 @Component
 final class PreviewGenerationJobHandler extends GenerationJobHandler {
-    PreviewGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationOutputValidator v,
+    PreviewGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationInputCompiler i,
+                                GenerationOutputValidator v,
                                 ObjectProvider<GenerationModelPort> m, MulgilProperties p,
-                                AiProviderUsageLedger u, ObjectMapper o, Clock c) {
-        super(j, s, v, m, p, u, o, c);
+                                AiProviderUsageLedger u, JobQueue q, MeterRegistry metrics,
+                                ObjectMapper o, Clock c) {
+        super(j, s, i, v, m, p, u, q, metrics, o, c);
     }
     public String jobType() { return "preview_generate"; }
 }
 
 @Component
 final class ReviewGenerationJobHandler extends GenerationJobHandler {
-    ReviewGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationOutputValidator v,
+    ReviewGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationInputCompiler i,
+                               GenerationOutputValidator v,
                                ObjectProvider<GenerationModelPort> m, MulgilProperties p,
-                               AiProviderUsageLedger u, ObjectMapper o, Clock c) {
-        super(j, s, v, m, p, u, o, c);
+                               AiProviderUsageLedger u, JobQueue q, MeterRegistry metrics,
+                               ObjectMapper o, Clock c) {
+        super(j, s, i, v, m, p, u, q, metrics, o, c);
     }
     public String jobType() { return "review_generate"; }
 }
 
 @Component
+final class PreviewMindmapGenerationJobHandler extends GenerationJobHandler {
+    PreviewMindmapGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationInputCompiler i,
+                                       GenerationOutputValidator v, ObjectProvider<GenerationModelPort> m,
+                                       MulgilProperties p, AiProviderUsageLedger u, JobQueue q,
+                                       MeterRegistry metrics, ObjectMapper o, Clock c) {
+        super(j, s, i, v, m, p, u, q, metrics, o, c);
+    }
+    public String jobType() { return "preview_mindmap_generate"; }
+}
+
+@Component
+final class ReviewMindmapGenerationJobHandler extends GenerationJobHandler {
+    ReviewMindmapGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationInputCompiler i,
+                                      GenerationOutputValidator v, ObjectProvider<GenerationModelPort> m,
+                                      MulgilProperties p, AiProviderUsageLedger u, JobQueue q,
+                                      MeterRegistry metrics, ObjectMapper o, Clock c) {
+        super(j, s, i, v, m, p, u, q, metrics, o, c);
+    }
+    public String jobType() { return "review_mindmap_generate"; }
+}
+
+@Component
+final class PreviewQuizGenerationJobHandler extends GenerationJobHandler {
+    PreviewQuizGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationInputCompiler i,
+                                    GenerationOutputValidator v, ObjectProvider<GenerationModelPort> m,
+                                    MulgilProperties p, AiProviderUsageLedger u, JobQueue q,
+                                    MeterRegistry metrics, ObjectMapper o, Clock c) {
+        super(j, s, i, v, m, p, u, q, metrics, o, c);
+    }
+    public String jobType() { return "preview_quiz_generate"; }
+}
+
+@Component
+final class ReviewQuizGenerationJobHandler extends GenerationJobHandler {
+    ReviewQuizGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationInputCompiler i,
+                                   GenerationOutputValidator v, ObjectProvider<GenerationModelPort> m,
+                                   MulgilProperties p, AiProviderUsageLedger u, JobQueue q,
+                                   MeterRegistry metrics, ObjectMapper o, Clock c) {
+        super(j, s, i, v, m, p, u, q, metrics, o, c);
+    }
+    public String jobType() { return "review_quiz_generate"; }
+}
+
+@Component
 final class ExamSummaryGenerationJobHandler extends GenerationJobHandler {
-    ExamSummaryGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationOutputValidator v,
+    ExamSummaryGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationInputCompiler i,
+                                    GenerationOutputValidator v,
                                     ObjectProvider<GenerationModelPort> m, MulgilProperties p,
-                                    AiProviderUsageLedger u, ObjectMapper o, Clock c) {
-        super(j, s, v, m, p, u, o, c);
+                                    AiProviderUsageLedger u, JobQueue q, MeterRegistry metrics,
+                                    ObjectMapper o, Clock c) {
+        super(j, s, i, v, m, p, u, q, metrics, o, c);
     }
     public String jobType() { return "exam_summary_generate"; }
 }
 
 @Component
 final class ExamQuizGenerationJobHandler extends GenerationJobHandler {
-    ExamQuizGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationOutputValidator v,
+    ExamQuizGenerationJobHandler(JdbcClient j, GenerationSnapshotService s, GenerationInputCompiler i,
+                                 GenerationOutputValidator v,
                                  ObjectProvider<GenerationModelPort> m, MulgilProperties p,
-                                 AiProviderUsageLedger u, ObjectMapper o, Clock c) {
-        super(j, s, v, m, p, u, o, c);
+                                 AiProviderUsageLedger u, JobQueue q, MeterRegistry metrics,
+                                 ObjectMapper o, Clock c) {
+        super(j, s, i, v, m, p, u, q, metrics, o, c);
     }
     public String jobType() { return "exam_quiz_generate"; }
 }

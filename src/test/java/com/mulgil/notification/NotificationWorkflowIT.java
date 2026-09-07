@@ -156,11 +156,21 @@ class NotificationWorkflowIT {
                 .param("now", Timestamp.from(NOW)).update();
         scheduler.onCompleted(new JobQueue.CompletionEvent(UUID.randomUUID(), "chunk_embed", owner, course, session,
                 null, null, null, null, null, 1, "sensitive chunk input"));
+        for (String type : List.of("preview_mindmap_generate", "review_mindmap_generate",
+                "preview_quiz_generate", "review_quiz_generate")) {
+            scheduler.onCompleted(new JobQueue.CompletionEvent(UUID.randomUUID(), type, owner, course, session,
+                    null, null, null, null, null, 1, "sensitive child input"));
+        }
         assertThat(jdbc.sql("SELECT count(*) FROM notifications WHERE notification_type='processing_complete'")
                 .query(Integer.class).single()).isZero();
         fcm.failNext("PROVIDER_TIMEOUT", true);
-        scheduler.onCompleted(new JobQueue.CompletionEvent(UUID.randomUUID(), "preview_generate", owner, course, session,
-                null, null, null, null, null, 1, "source text transcript signed URL token object key"));
+        JobQueue.CompletionEvent rootCompletion = new JobQueue.CompletionEvent(UUID.randomUUID(),
+                "preview_generate", owner, course, session, null, null, null, null, null, 1,
+                "source text transcript signed URL token object key");
+        scheduler.onCompleted(rootCompletion);
+        scheduler.onCompleted(rootCompletion);
+        assertThat(jdbc.sql("SELECT count(*) FROM notifications WHERE notification_type='processing_complete'")
+                .query(Integer.class).single()).isOne();
         JobQueue.ClaimedJob claimed = jobs.claim("notification-failure-test", Set.of("notification_send"));
 
         // When

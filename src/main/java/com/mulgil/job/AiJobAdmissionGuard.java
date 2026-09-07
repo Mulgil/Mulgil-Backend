@@ -16,10 +16,14 @@ public final class AiJobAdmissionGuard {
     private static final Logger log = LoggerFactory.getLogger(AiJobAdmissionGuard.class);
     private static final Set<String> BILLABLE_TYPES = Set.of(
             "pdf_ocr", "handwriting_ocr", "stt", "chunk_embed",
-            "preview_generate", "review_generate", "exam_summary_generate", "exam_quiz_generate");
+            "preview_generate", "review_generate",
+            "preview_mindmap_generate", "review_mindmap_generate",
+            "preview_quiz_generate", "review_quiz_generate",
+            "exam_summary_generate", "exam_quiz_generate", "target_generate");
     private static final Set<String> DAILY_LIMIT_TYPES = Set.of(
             "pdf_ocr", "handwriting_ocr", "stt",
-            "preview_generate", "review_generate", "exam_summary_generate", "exam_quiz_generate");
+            "preview_generate", "review_generate", "exam_summary_generate", "exam_quiz_generate",
+            "target_generate");
 
     private final JdbcClient jdbc;
     private final MulgilProperties properties;

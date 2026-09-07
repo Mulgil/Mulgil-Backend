@@ -12,6 +12,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -22,6 +24,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -43,6 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @Testcontainers
+@ExtendWith(OutputCaptureExtension.class)
 @ActiveProfiles("test")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Import(GenerationTestFakes.class)
@@ -57,6 +61,7 @@ class GenerationWorkflowIT {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("mulgil.demo.cache-enabled", () -> false);
+        registry.add("mulgil.generation.input-soft-token-limit", () -> 200);
     }
 
     @LocalServerPort int port;
@@ -67,6 +72,7 @@ class GenerationWorkflowIT {
     @Autowired List<JobHandler> handlers;
     @Autowired List<JobCompletionListener> listeners;
     @Autowired GenerationScheduler scheduler;
+    @Autowired GenerationSnapshotService snapshots;
     @Autowired FakeGenerationModel model;
     @Autowired TransactionTemplate transactions;
     private final HttpClient http = HttpClient.newHttpClient();
@@ -81,6 +87,14 @@ class GenerationWorkflowIT {
     void seed() throws Exception {
         jdbc.sql("DELETE FROM users").update();
         model.valid = true;
+        model.lastPromptUnits = 0;
+        model.lastResultUnits = 0;
+        model.countTokensCalls = 0;
+        model.generationCalls = 0;
+        model.countedTokens = 100;
+        model.contextTokenLimit = 1_048_576;
+        model.failureCode = null;
+        model.countTokensFailureCode = null;
         token = login("generation-owner-" + UUID.randomUUID());
         owner = jdbc.sql("SELECT id FROM users").query(UUID.class).single();
         course = UUID.fromString(ok(send("POST", "/api/v1/courses", Map.of("name", "Generation")), 201)
@@ -89,6 +103,186 @@ class GenerationWorkflowIT {
                 "sessionNumber", 1, "title", "Sources", "sessionDate", "2026-09-01")), 201)
                 .path("id").asText());
         sources = new GenerationSourceFixtures(jdbc, indexing, owner, course, session);
+    }
+
+    @Test
+    void publishesSummaryFirst_thenQueuesIndependentArtifactsAndReturnsNullableMindmap() throws Exception {
+        String privateSource = "summary first untrusted source credential=secret";
+        ok(send("PUT", "/api/v1/devices/fcm-token", Map.of(
+                "token", "phase3-manual-qa-token", "platform", "android", "timezone", "UTC")), 200);
+        sources.addReviewNote(privateSource, 0);
+        runOne("chunk_embed");
+
+        runOne("review_generate");
+
+        assertThat(jobCount("review_mindmap_generate")).isOne();
+        assertThat(jobCount("review_quiz_generate")).isOne();
+        JsonNode response = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
+        assertThat(response.path("summary").path("items")).hasSize(1);
+        assertThat(response.path("mindmap").isNull()).isTrue();
+        assertThat(jobCount("review_mindmap_generate")).isOne();
+        assertThat(jobCount("review_quiz_generate")).isOne();
+        int notificationCount = jdbc.sql("""
+                        SELECT count(*) FROM notifications
+                        WHERE owner_id=:owner AND notification_type='processing_complete'
+                        """).param("owner", owner).query(Integer.class).single();
+        int ledgerRows = jdbc.sql("""
+                        SELECT count(*) FROM ai_provider_usage
+                        WHERE owner_id=:owner AND operation='vertex.generate'
+                        """).param("owner", owner).query(Integer.class).single();
+        String publicState = response + " " + ok(send("GET", "/api/v1/sessions/" + session + "/jobs", null), 200);
+        assertThat(notificationCount).isOne();
+        assertThat(ledgerRows).isOne();
+        assertThat(publicState).doesNotContain(privateSource, "credential=secret", "error_message");
+        System.out.println("GENERATION_PHASE3_QA job_status_counts=review_generate:succeeded:1,"
+                + "review_mindmap_generate:queued:1,review_quiz_generate:queued:1 summary_http=200 "
+                + "mindmap_null=true notification_count=1 generation_ledger_rows=1 "
+                + "raw_error_source_absent=true result=PASS");
+    }
+
+    @Test
+    void retriesFailedMindmapIndependently_withoutBlockingSummaryOrQuiz() throws Exception {
+        sources.addReviewNote("independent artifact source", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        UUID mindmapJob = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_mindmap_generate'")
+                .query(UUID.class).single();
+
+        model.failureCode = "PROVIDER_UNAVAILABLE";
+        runOne("review_mindmap_generate");
+
+        assertThat(jobs.get(owner, mindmapJob).status()).isEqualTo("failed");
+        JsonNode summary = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
+        assertThat(summary.path("mindmap").isNull()).isTrue();
+        assertThat(jobs.get(owner, jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_quiz_generate'")
+                .query(UUID.class).single()).status()).isEqualTo("queued");
+
+        model.failureCode = null;
+        assertThat(jobs.retry(owner, mindmapJob).status()).isEqualTo("queued");
+        runOne("review_mindmap_generate");
+        runOne("review_quiz_generate");
+
+        assertThat(ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200)
+                .path("mindmap").path("nodes")).hasSize(1);
+        assertThat(ok(send("GET", "/api/v1/sessions/" + session + "/quiz", null), 200)).hasSize(1);
+    }
+
+    @Test
+    void completionReplayDoesNotDuplicateTerminalChildren_andSourceChangeOutdatesQueuedChildren()
+            throws Exception {
+        sources.addReviewNote("replay source", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        JobQueue.AiJob root = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_generate'")
+                .query((row, ignored) -> jobs.get(owner, row.getObject("id", UUID.class))).single();
+        JobQueue.CompletionEvent replay = new JobQueue.CompletionEvent(root.id(), root.type(), root.ownerId(),
+                root.courseId(), root.sessionId(), root.materialId(), root.examResourceId(), root.noteId(),
+                root.recordingId(), root.examId(), root.inputVersion(), root.sourceHash());
+        listeners.forEach(listener -> listener.onCompleted(replay));
+        assertThat(jobCount("review_mindmap_generate")).isOne();
+        assertThat(jobCount("review_quiz_generate")).isOne();
+
+        sources.addReviewNote("changed source", 1);
+        runOne("review_mindmap_generate");
+
+        assertThat(jdbc.sql("SELECT status FROM ai_jobs WHERE job_type='review_mindmap_generate'")
+                .query(String.class).single()).isEqualTo("outdated");
+        assertThat(jdbc.sql("SELECT count(*) FROM mindmaps WHERE session_id=:session")
+                .param("session", session).query(Integer.class).single()).isZero();
+    }
+
+    @Test
+    void preflightsOnlyAboveSoftLimit_andRejectsActualContextOverflowWithoutGeneration() throws Exception {
+        sources.addReviewNote("short source", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        assertThat(model.countTokensCalls).isZero();
+        assertThat(model.generationCalls).isOne();
+        assertThat(jdbc.sql("""
+                        SELECT count(*) FROM ai_provider_usage
+                        WHERE owner_id=:owner AND operation='vertex.count_tokens'
+                        """).param("owner", owner).query(Integer.class).single()).isZero();
+
+        sources.addReviewNote("x".repeat(300), 1);
+        runOne("chunk_embed");
+        model.countedTokens = 101;
+        model.contextTokenLimit = 100;
+        int generationsBeforeOverflow = model.generationCalls;
+        runOne("review_generate");
+
+        assertThat(model.countTokensCalls).isOne();
+        assertThat(model.generationCalls).isEqualTo(generationsBeforeOverflow);
+        assertThat(jdbc.sql("""
+                        SELECT operation||':'||provider||':'||model_id||':'||status||':'
+                            ||(job_id IS NOT NULL)||':'||(latency_ms >= 0)||':'||unit_type||':'||unit_count
+                        FROM ai_provider_usage
+                        WHERE owner_id=:owner AND operation='vertex.count_tokens'
+                        """).param("owner", owner).query(String.class).single())
+                .isEqualTo("vertex.count_tokens:vertex:gemini-2.5-flash:succeeded:true:true:token:101");
+        assertThat(jdbc.sql("SELECT error_code FROM ai_jobs WHERE job_type='review_generate' ORDER BY created_at DESC LIMIT 1")
+                .query(String.class).single()).isEqualTo("GENERATION_INPUT_TOO_LARGE");
+        System.out.println("GENERATION_PHASE2_QA preflight=skip_below_once_above overflow=non_retryable_no_generation result=PASS");
+    }
+
+    @Test
+    void recordsSafeFailedCountTokensPreflight_withoutCallingGeneration(CapturedOutput output) throws Exception {
+        String privateSource = "untrusted preflight source credential=secret" + "x".repeat(300);
+        sources.addReviewNote(privateSource, 0);
+        runOne("chunk_embed");
+        model.countTokensFailureCode = "PROVIDER_TIMEOUT";
+
+        runOne("review_generate");
+
+        assertThat(model.countTokensCalls).isOne();
+        assertThat(model.generationCalls).isZero();
+        assertThat(jdbc.sql("""
+                        SELECT operation||':'||provider||':'||model_id||':'||status||':'||error_code||':'
+                            ||(job_id IS NOT NULL)||':'||(latency_ms >= 0)||':'||unit_type||':'||(unit_count IS NULL)
+                        FROM ai_provider_usage
+                        WHERE owner_id=:owner AND operation='vertex.count_tokens'
+                        """).param("owner", owner).query(String.class).single())
+                .isEqualTo("vertex.count_tokens:vertex:gemini-2.5-flash:failed:PROVIDER_TIMEOUT:true:true:token:true");
+        assertThat(jdbc.sql("SELECT error_code FROM ai_jobs WHERE job_type='review_generate'")
+                .query(String.class).single()).isEqualTo("PROVIDER_TIMEOUT");
+        JsonNode publicJobs = ok(send("GET", "/api/v1/sessions/" + session + "/jobs", null), 200);
+        assertThat(publicJobs.toString()).contains("PROVIDER_TIMEOUT")
+                .doesNotContain(privateSource, "credential=secret");
+        assertThat(output.getAll()).doesNotContain(privateSource, "credential=secret");
+        System.out.println("GENERATION_COUNT_TOKENS_QA surface=HTTP+Testcontainers provider_call=count_tokens "
+                + "status=failed job_linked=true generation_calls=0 error=PROVIDER_TIMEOUT "
+                + "raw_data_absent=true result=PASS");
+    }
+
+    @Test
+    void recordsOneSafeCountTokensPreflight_beforeOneGeneration(CapturedOutput output) throws Exception {
+        String privateSource = "untrusted counted source credential=secret" + "x".repeat(300);
+        sources.addReviewNote(privateSource, 0);
+        runOne("chunk_embed");
+
+        runOne("review_generate");
+
+        assertThat(model.countTokensCalls).isOne();
+        assertThat(model.generationCalls).isOne();
+        assertThat(jdbc.sql("""
+                        SELECT operation||':'||status FROM ai_provider_usage
+                        WHERE owner_id=:owner AND operation IN ('vertex.count_tokens','vertex.generate')
+                        ORDER BY operation
+                        """).param("owner", owner).query(String.class).list())
+                .containsExactly("vertex.count_tokens:succeeded", "vertex.generate:succeeded");
+        assertThat(jdbc.sql("""
+                        SELECT provider||':'||model_id||':'||(job_id IS NOT NULL)||':'||(latency_ms >= 0)
+                            ||':'||unit_type||':'||unit_count
+                        FROM ai_provider_usage
+                        WHERE owner_id=:owner AND operation='vertex.count_tokens'
+                        """).param("owner", owner).query(String.class).single())
+                .isEqualTo("vertex:gemini-2.5-flash:true:true:token:100");
+        JsonNode publicJobs = ok(send("GET", "/api/v1/sessions/" + session + "/jobs", null), 200);
+        assertThat(publicJobs.toString()).contains("review_generate", "succeeded")
+                .doesNotContain(privateSource, "credential=secret", "vertex.count_tokens");
+        assertThat(output.getAll()).doesNotContain(privateSource, "credential=secret");
+        System.out.println("GENERATION_COUNT_TOKENS_QA surface=HTTP+Testcontainers "
+                + "provider_calls=count_tokens:1,generate:1 statuses=succeeded,succeeded "
+                + "job_linked=true latency_recorded=true raw_data_absent=true result=PASS");
     }
 
     @Test
@@ -103,6 +297,8 @@ class GenerationWorkflowIT {
         runCompletionReplay();
         assertThat(jobCount("review_generate")).isOne();
         runOne("review_generate");
+        runOne("review_mindmap_generate");
+        runOne("review_quiz_generate");
 
         JsonNode response = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
         assertThat(response.path("summary").path("items").get(0).path("sourceRefs")).isNotEmpty();
@@ -121,11 +317,60 @@ class GenerationWorkflowIT {
     }
 
     @Test
+    void preservesGroundedArtifactAndPublicApiContract_throughGenerationWorkflow() throws Exception {
+        String privateSource = "untrusted_external_text prompt_injection ignore instructions credential=secret";
+        sources.addReviewNote(privateSource, 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        long rootPromptUnits = model.lastPromptUnits;
+        long rootResultUnits = model.lastResultUnits;
+        runOne("review_mindmap_generate");
+        runOne("review_quiz_generate");
+
+        JsonNode artifacts = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
+        assertThat(artifacts.path("summary").path("inputVersion").asInt()).isOne();
+        assertThat(artifacts.path("summary").path("items").get(0).path("sourceRefs")).hasSize(1);
+        assertThat(artifacts.path("mindmap").path("nodes").get(0).path("sourceRefs")).isNotEmpty();
+        assertThat(artifacts.findValue("sourceIds")).isNull();
+        assertThat(artifacts.findValue("sourceRefs").toString()).doesNotContain(privateSource);
+
+        JsonNode publicJob = ok(send("GET", "/api/v1/sessions/" + session + "/jobs", null), 200);
+        JsonNode generationJob = null;
+        for (JsonNode value : publicJob) {
+            if (value.path("type").asText().equals("review_generate")) generationJob = value;
+        }
+        assertThat(generationJob).isNotNull();
+        assertThat(generationJob.path("progressStage").asText()).isEqualTo("publishing");
+        assertThat(generationJob.path("progressUpdatedAt").asText()).isNotBlank();
+        assertThat(generationJob.toString()).doesNotContain(privateSource);
+        assertThat(jdbc.sql("""
+                        SELECT unit_type||':'||unit_count||':'||prompt_token_count||':'||candidate_token_count
+                            ||':'||total_token_count||':'||cached_content_token_count||':'||first_response_latency_ms
+                        FROM ai_provider_usage WHERE operation='vertex.generate' AND owner_id=:owner
+                          AND job_id=(SELECT id FROM ai_jobs WHERE job_type='review_generate' LIMIT 1)
+                        """).param("owner", owner).query(String.class).single())
+                .isEqualTo("unicode_code_point:" + (rootPromptUnits + rootResultUnits)
+                        + ":31:17:48:5:7");
+        System.out.println("GENERATION_PHASE1_QA api_progress=publishing db_usage=unicode_code_point+tokens+first_response "
+                + "untrusted_source_absent=true result=PASS");
+
+        JsonNode quiz = ok(send("GET", "/api/v1/sessions/" + session + "/quiz", null), 200);
+        assertThat(quiz).hasSize(1);
+        assertThat(quiz.get(0).path("sourceRefs")).isNotEmpty();
+        assertThat(quiz.get(0).has("answer") || quiz.get(0).has("explanation") || quiz.get(0).has("sourceIds"))
+                .isFalse();
+        assertThat(quiz.findValue("sourceRefs").toString()).doesNotContain(privateSource);
+        System.out.println("GENERATION_WORKFLOW scenario=baseline_artifact_contract "
+                + "observable=grounded_summary_mindmap_quiz_without_internal_or_private_fields result=PASS");
+    }
+
+    @Test
     void generatesPreviewSummaryAndMindmap_fromIndexedPreviewPdf() throws Exception {
         sources.addPreviewMaterial("preview source");
         runOne("chunk_embed");
         assertThat(jobCount("preview_generate")).isOne();
         runOne("preview_generate");
+        runOne("preview_mindmap_generate");
 
         JsonNode response = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=preview", null), 200);
         assertThat(response.path("summary").path("type").asText()).isEqualTo("preview");
@@ -266,6 +511,36 @@ class GenerationWorkflowIT {
         assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type='exam_summary_generate'")
                 .query(Integer.class).single()).isEqualTo(2);
         System.out.println("GENERATION_WORKFLOW scenario=exam_idempotency observable=distinct_exam_jobs_same_exam_retry result=PASS");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"queued", "succeeded"})
+    void doesNotReusePriorContractGenerationJob_whenSchedulingSourceGroundedV2(String priorStatus) throws Exception {
+        sources.addReviewNote("contract-version source", 0);
+        runOne("chunk_embed");
+        GenerationSnapshotService.Snapshot snapshot = snapshots.session(owner, course, session, "review");
+        jdbc.sql("DELETE FROM ai_jobs WHERE job_type='review_generate'").update();
+        JobQueue.AiJob prior = jobs.enqueue(new JobQueue.EnqueueRequest("review_generate", owner, course,
+                session, null, null, null, null, null, 1, snapshot.snapshotHash(), "vertex",
+                "gemini-2.5-flash", "source-grounded-v1"));
+        jdbc.sql("""
+                UPDATE ai_jobs SET status=:status,
+                    finished_at=CASE WHEN CAST(:status AS text)='succeeded' THEN CURRENT_TIMESTAMP ELSE NULL END
+                WHERE id=:id
+                """).param("status", priorStatus).param("id", prior.id()).update();
+
+        runCompletionReplay();
+
+        List<UUID> scheduled = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_generate' ORDER BY created_at,id")
+                .query(UUID.class).list();
+        assertThat(scheduled).hasSize(2);
+        assertThat(scheduled.get(1)).isNotEqualTo(prior.id());
+        JobQueue.AiJob exactV2 = jobs.enqueue(new JobQueue.EnqueueRequest("review_generate", owner, course,
+                session, null, null, null, null, null, 2, snapshot.snapshotHash(), "vertex",
+                "gemini-2.5-flash", "source-grounded-v2"));
+        assertThat(exactV2.id()).isEqualTo(scheduled.get(1));
+        System.out.println("GENERATION_PHASE2_QA prior_contract=v1 prior_status=" + priorStatus
+                + " current_contract=v2 observable=distinct_jobs result=PASS");
     }
 
     @Test

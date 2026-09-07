@@ -134,9 +134,10 @@ final class ResourceDeletionInvalidationService {
         markOutdated(jdbc.sql("""
                         SELECT id FROM ai_jobs
                         WHERE owner_id=:owner AND session_id=:session AND exam_id IS NULL
-                          AND job_type=:type AND source_hash=:hash AND status IN ('queued','running')
+                          AND job_type IN (:types) AND source_hash=:hash AND status IN ('queued','running')
                         """)
-                .param("owner", ownerId).param("session", sessionId).param("type", phase + "_generate")
+                .param("owner", ownerId).param("session", sessionId).param("types", List.of(
+                        phase + "_generate", phase + "_mindmap_generate", phase + "_quiz_generate"))
                 .param("hash", sourceHash).query(UUID.class).list(), now);
     }
 

@@ -1,7 +1,11 @@
 package com.mulgil.job;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulgil.generation.GenerationSnapshotService;
 import com.mulgil.indexing.ContentIndexingService;
 import com.mulgil.indexing.ChunkEmbedJobHandler;
+import com.mulgil.generation.GenerationModelPort;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import com.mulgil.common.config.MulgilProperties;
@@ -12,6 +16,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.test.context.ActiveProfiles;
@@ -28,8 +33,10 @@ import java.time.Duration;
 import java.util.UUID;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -47,6 +54,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @Import(JobQueueIT.ListenerConfiguration.class)
 class JobQueueIT {
     private static final String HASH = "a".repeat(64);
+    private static final long GENERATION_BLOCK_SECONDS = 97;
     private static final LinkedBlockingQueue<JobQueue.CompletionEvent> COMPLETIONS = new LinkedBlockingQueue<>();
     private static final LinkedBlockingQueue<Integer> ACTIVE_CHUNKS_AT_COMPLETION = new LinkedBlockingQueue<>();
 
@@ -77,6 +85,9 @@ class JobQueueIT {
     MulgilProperties properties;
 
     @Autowired
+    AiJobAdmissionGuard admission;
+
+    @Autowired
     Validator validator;
 
     @Autowired
@@ -84,6 +95,15 @@ class JobQueueIT {
 
     @Autowired
     TransactionTemplate transactions;
+
+    @Autowired
+    GenerationSnapshotService snapshots;
+
+    @Autowired
+    List<JobHandler> handlers;
+
+    @Autowired
+    ControllableGenerationModel generationModel;
 
     UUID ownerId;
     UUID courseId;
@@ -97,6 +117,7 @@ class JobQueueIT {
         jdbc.sql("DELETE FROM users").update();
         COMPLETIONS.clear();
         ACTIVE_CHUNKS_AT_COMPLETION.clear();
+        generationModel.reset();
         ownerId = UUID.randomUUID();
         courseId = UUID.randomUUID();
         sessionId = UUID.randomUUID();
@@ -219,6 +240,79 @@ class JobQueueIT {
     }
 
     @Test
+    void recordsGenerationMetadataWithoutChangingCharacterUnits() {
+        JobQueue.AiJob job = queue.enqueue(request());
+        JobQueue.ClaimedJob claimed = queue.claim("usage-worker", Set.of("pdf_extract"));
+        GenerationModelPort.GenerationResult result = new GenerationModelPort.GenerationResult(
+                "{}", new GenerationModelPort.GenerationUsage(101L, 23L, 124L, 17L), 45L, "STOP");
+
+        usage.observeGeneration(claimed, "generation-v1", 7L, () -> result);
+
+        assertThat(jdbc.sql("""
+                        SELECT unit_type||':'||unit_count||':'||prompt_token_count||':'||candidate_token_count
+                            ||':'||total_token_count||':'||cached_content_token_count||':'||first_response_latency_ms
+                        FROM ai_provider_usage WHERE job_id=:job
+                        """).param("job", job.id()).query(String.class).single())
+                .isEqualTo("unicode_code_point:9:101:23:124:17:45");
+    }
+
+    @Test
+    void recordsFinalGenerationMetadataOnOutputLimitFailure() {
+        JobQueue.AiJob job = queue.enqueue(request());
+        JobQueue.ClaimedJob claimed = queue.claim("failed-usage-worker", Set.of("pdf_extract"));
+        GenerationModelPort.GenerationResult result = new GenerationModelPort.GenerationResult(
+                "{", new GenerationModelPort.GenerationUsage(20L, 8L, 28L, 0L), 12L, "MAX_TOKENS");
+
+        assertThatThrownBy(() -> usage.observeGeneration(claimed, "generation-v1", 1L,
+                () -> { throw new GenerationModelPort.GenerationModelException(
+                        "PROVIDER_OUTPUT_LIMIT", false, result); }))
+                .isInstanceOf(GenerationModelPort.GenerationModelException.class);
+
+        assertThat(jdbc.sql("""
+                        SELECT status||':'||error_code||':'||unit_count||':'||total_token_count
+                            ||':'||first_response_latency_ms
+                        FROM ai_provider_usage WHERE job_id=:job
+                        """).param("job", job.id()).query(String.class).single())
+                .isEqualTo("failed:PROVIDER_OUTPUT_LIMIT:2:28:12");
+    }
+
+    @Test
+    void leavesGenerationTokenColumnsNull_whenProviderOmitsMetadata() {
+        JobQueue.AiJob job = queue.enqueue(request());
+        JobQueue.ClaimedJob claimed = queue.claim("missing-metadata-worker", Set.of("pdf_extract"));
+
+        usage.observeGeneration(claimed, "generation-v1", 2L,
+                () -> new GenerationModelPort.GenerationResult("{}", null, null, "STOP"));
+
+        assertThat(jdbc.sql("""
+                        SELECT prompt_token_count IS NULL AND candidate_token_count IS NULL
+                            AND total_token_count IS NULL AND cached_content_token_count IS NULL
+                            AND first_response_latency_ms IS NULL
+                        FROM ai_provider_usage WHERE job_id=:job
+                        """).param("job", job.id()).query(Boolean.class).single()).isTrue();
+    }
+
+    @Test
+    void fencesGenerationProgressByStatusClaimantAndLiveLease() {
+        JobQueue.AiJob job = queue.enqueue(new JobQueue.EnqueueRequest("review_generate", ownerId, courseId,
+                sessionId, null, null, null, null, null, 1, HASH, "vertex", "generation-v1", "prompt-v1"));
+        JobQueue.ClaimedJob claimed = queue.claim("generation-worker", Set.of("review_generate"));
+
+        assertThat(queue.get(ownerId, job.id()).progressStage()).isEqualTo("preparing");
+        assertThat(queue.updateProgress(claimed, "generating")).isTrue();
+        jdbc.sql("UPDATE ai_jobs SET claimed_by='new-worker' WHERE id=:id").param("id", job.id()).update();
+        assertThat(queue.updateProgress(claimed, "validating")).isFalse();
+        jdbc.sql("""
+                        UPDATE ai_jobs SET claimed_by='generation-worker',
+                            last_heartbeat_at=now()-interval '2 seconds',
+                            lease_expires_at=now()-interval '1 second' WHERE id=:id
+                        """)
+                .param("id", job.id()).update();
+        assertThat(queue.updateProgress(claimed, "validating")).isFalse();
+        assertThat(queue.get(ownerId, job.id()).progressStage()).isEqualTo("generating");
+    }
+
+    @Test
     void leavesStartedUsageUnfinished_whenFinalLeaseExpiresWithoutHandlerReturn() {
         JobQueue.AiJob job = queue.enqueue(billable("chunk_embed", 0));
         JobQueue.ClaimedJob claimed = queue.claim("crashed-provider-worker", Set.of("chunk_embed"));
@@ -277,10 +371,19 @@ class JobQueueIT {
     }
 
     @Test
-    void acceptsChunkEmbedAfterDailyLimit_whenItIsAnInternalChildJob() {
+    void acceptsBillableInternalChildrenAfterDailyLimit_withoutConsumingDailyAdmissions() {
         for (int index = 0; index < 30; index++) queue.enqueue(billable("pdf_ocr", index));
 
         assertThat(queue.enqueue(billable("chunk_embed", 100)).status()).isEqualTo("queued");
+        int index = 101;
+        for (String type : List.of("preview_mindmap_generate", "review_mindmap_generate",
+                "preview_quiz_generate", "review_quiz_generate")) {
+            JobQueue.EnqueueRequest child = new JobQueue.EnqueueRequest(type, ownerId, courseId, sessionId,
+                    null, null, null, null, null, index, "%064x".formatted(index++),
+                    "vertex", "fake-v1", "source-grounded-v2");
+            assertThat(admission.isBillable(type)).isTrue();
+            assertThat(queue.enqueue(child).status()).isEqualTo("queued");
+        }
     }
 
     @Test
@@ -404,6 +507,19 @@ class JobQueueIT {
         assertThat(validator.validate(new MulgilProperties.Jobs(2, 60, 60, 0))).isNotEmpty();
         assertThat(validator.validate(new MulgilProperties.Jobs(2, 60, 60, 33))).isNotEmpty();
         assertThat(validator.validate(new MulgilProperties.Jobs(2, 60, 60, 32))).isEmpty();
+    }
+
+    @Test
+    void validatesBoundedGenerationConfiguration_withSafeDefaults() {
+        MulgilProperties.Generation defaults = properties.generation();
+
+        assertThat(defaults.temperature()).isEqualTo(0.1);
+        assertThat(defaults.candidateCount()).isOne();
+        assertThat(defaults.totalTimeoutSeconds()).isEqualTo(180);
+        assertThat(defaults.contextCacheEnabled()).isFalse();
+        assertThat(validator.validate(new MulgilProperties.Generation(
+                -0.1, 2, 0, 0, 0, 0, 0, false, 1))).isNotEmpty();
+        assertThat(validator.validate(defaults)).isEmpty();
     }
 
     @Test
@@ -741,6 +857,90 @@ class JobQueueIT {
     }
 
     @Test
+    void keepsGenerationLeasedAndUnpublishedDuringNinetySevenSecondStream_thenSucceedsBeforeDeadline()
+            throws Exception {
+        String privateSource = "untrusted_external_text prompt_injection long-stream-secret";
+        jdbc.sql("UPDATE audio_recordings SET status='cancelled' WHERE id=:id")
+                .param("id", recordingId).update();
+        String snapshotHash = addReadyReviewSource(privateSource);
+        JobQueue.AiJob job = queue.enqueue(new JobQueue.EnqueueRequest("review_generate", ownerId, courseId,
+                sessionId, null, null, null, null, null, 1, snapshotHash,
+                "vertex", properties.vertex().generationModel(), "source-grounded-v1"));
+        JobHandler handler = handlers.stream().filter(value -> value.jobType().equals("review_generate"))
+                .findFirst().orElseThrow();
+        generationModel.arm();
+        JobWorker worker = new JobWorker(queue, List.of(handler), properties);
+        var poller = Executors.newSingleThreadExecutor();
+        ScheduledExecutorService timeline = Executors.newScheduledThreadPool(2);
+
+        try {
+            Future<?> workerRun = poller.submit(worker::poll);
+            assertThat(generationModel.awaitFirstResponse(5, TimeUnit.SECONDS)).isTrue();
+            Instant initialHeartbeat = jdbc.sql("SELECT last_heartbeat_at FROM ai_jobs WHERE id=:id")
+                    .param("id", job.id()).query(Instant.class).single();
+            timeline.schedule(generationModel::releaseFinalResponse,
+                    GENERATION_BLOCK_SECONDS, TimeUnit.SECONDS);
+            Future<StreamProbe> probeFuture = timeline.schedule(() -> probeLongStream(job),
+                    2, TimeUnit.SECONDS);
+            Future<StreamProbe> lateProbeFuture = timeline.schedule(() -> probeLongStream(job),
+                    GENERATION_BLOCK_SECONDS - 1, TimeUnit.SECONDS);
+
+            StreamProbe probe = probeFuture.get(10, TimeUnit.SECONDS);
+            assertThat(probe.status()).isEqualTo("running");
+            assertThat(probe.progressStage()).isEqualTo("generating");
+            assertThat(probe.lastHeartbeat()).isAfter(initialHeartbeat);
+            assertThat(probe.liveLease()).isTrue();
+            assertThat(probe.duplicateRejected()).isTrue();
+            assertThat(probe.publicationRows()).isZero();
+            assertThat(workerRun.isDone()).isFalse();
+
+            StreamProbe lateProbe = lateProbeFuture.get(
+                    properties.generation().totalTimeoutSeconds(), TimeUnit.SECONDS);
+            assertThat(lateProbe.status()).isEqualTo("running");
+            assertThat(lateProbe.progressStage()).isEqualTo("generating");
+            assertThat(lateProbe.lastHeartbeat()).isAfter(probe.lastHeartbeat());
+            assertThat(lateProbe.liveLease()).isTrue();
+            assertThat(lateProbe.duplicateRejected()).isTrue();
+            assertThat(lateProbe.publicationRows()).isZero();
+            assertThat(workerRun.isDone()).isFalse();
+
+            workerRun.get(properties.generation().totalTimeoutSeconds() + 5, TimeUnit.SECONDS);
+            long providerBlockMillis = generationModel.providerBlockMillis();
+            assertThat(providerBlockMillis).isGreaterThanOrEqualTo(TimeUnit.SECONDS.toMillis(97));
+            assertThat(providerBlockMillis)
+                    .isLessThan(TimeUnit.SECONDS.toMillis(properties.generation().totalTimeoutSeconds()));
+            assertThat(queue.get(ownerId, job.id())).satisfies(completed -> {
+                assertThat(completed.status()).isEqualTo("succeeded");
+                assertThat(completed.attemptCount()).isOne();
+                assertThat(completed.progressStage()).isEqualTo("publishing");
+            });
+            assertThat(jdbc.sql("SELECT count(*) FROM summaries WHERE session_id=:session")
+                    .param("session", sessionId).query(Integer.class).single()).isOne();
+            assertThat(jdbc.sql("SELECT count(*) FROM mindmaps WHERE session_id=:session")
+                    .param("session", sessionId).query(Integer.class).single()).isZero();
+            assertThat(jdbc.sql("SELECT count(*) FROM quiz_questions WHERE session_id=:session")
+                    .param("session", sessionId).query(Integer.class).single()).isZero();
+            assertThat(jdbc.sql("""
+                            SELECT count(*) FROM ai_jobs WHERE session_id=:session
+                              AND job_type IN ('review_mindmap_generate','review_quiz_generate')
+                              AND status='queued'
+                            """).param("session", sessionId).query(Integer.class).single()).isEqualTo(2);
+            assertThat(jdbc.sql("SELECT count(*) FROM summaries WHERE session_id=:session AND content_json::text LIKE :raw")
+                    .param("session", sessionId).param("raw", "%" + privateSource + "%")
+                    .query(Integer.class).single()).isZero();
+            System.out.println("GENERATION_LONG_STREAM_QA provider_block_ms=" + providerBlockMillis
+                    + " heartbeat_advanced_twice=true lease_live_at_96s=true progress_during_block=generating"
+                    + " partial_publication_rows=0 terminal_status=succeeded deadline_seconds="
+                    + properties.generation().totalTimeoutSeconds() + " raw_source_absent=true result=PASS");
+        } finally {
+            generationModel.releaseFinalResponse();
+            poller.shutdownNow();
+            timeline.shutdownNow();
+            worker.close();
+        }
+    }
+
+    @Test
     void notifiesListenerAfterCommit_whenCurrentJobSucceeds() {
         JobQueue.AiJob job = queue.enqueue(request());
         JobQueue.ClaimedJob claimed = queue.claim("worker", Set.of("pdf_extract"));
@@ -970,6 +1170,60 @@ class JobQueueIT {
                 materialId, 1, HASH, "pdfbox", "pdfbox-3", "none");
     }
 
+    private String addReadyReviewSource(String text) {
+        UUID note = UUID.randomUUID();
+        UUID block = UUID.randomUUID();
+        UUID chunk = UUID.randomUUID();
+        String sourceHash = ContentIndexingService.sha256(block + ":" + text);
+        Timestamp now = Timestamp.from(Instant.now());
+        jdbc.sql("""
+                        INSERT INTO notes
+                            (id,owner_id,course_id,session_id,body_markdown,version,last_left_version,created_at,updated_at)
+                        VALUES (:id,:owner,:course,:session,:body,1,1,:now,:now)
+                        """).param("id", note).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("body", text).param("now", now).update();
+        jdbc.sql("""
+                        INSERT INTO content_blocks
+                            (id,owner_id,course_id,session_id,note_id,block_type,text_content,
+                             paragraph_offset,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:note,'text',:text,0,:hash,:now)
+                        """).param("id", block).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("note", note).param("text", text)
+                .param("hash", ContentIndexingService.sha256(text)).param("now", now).update();
+        jdbc.sql("""
+                        INSERT INTO chunks
+                            (id,owner_id,course_id,session_id,content_block_id,chunk_index,text_content,
+                             source_ref,embedding,embedding_model,source_hash,created_at)
+                        VALUES (:id,:owner,:course,:session,:block,0,:text,
+                                jsonb_build_object('sourceType','note','noteId',CAST(:note AS text),
+                                                   'contentBlockId',CAST(:block AS text),'paragraphOffset',0),
+                                CAST(:embedding AS vector),'embedding-v1',:hash,:now)
+                        """).param("id", chunk).param("owner", ownerId).param("course", courseId)
+                .param("session", sessionId).param("block", block).param("note", note).param("text", text)
+                .param("embedding", "[" + String.join(",", java.util.Collections.nCopies(768, "0")) + "]")
+                .param("hash", sourceHash).param("now", now).update();
+        GenerationSnapshotService.Snapshot snapshot = snapshots.session(ownerId, courseId, sessionId, "review");
+        assertThat(snapshot.ready()).isTrue();
+        return snapshot.snapshotHash();
+    }
+
+    private StreamProbe probeLongStream(JobQueue.AiJob job) {
+        JobQueue.ClaimedJob duplicate = queue.claim("long-stream-contender", Set.of("review_generate"));
+        return jdbc.sql("""
+                        SELECT status,progress_stage,last_heartbeat_at,
+                               lease_expires_at > CURRENT_TIMESTAMP AS live_lease,
+                               (SELECT count(*) FROM summaries WHERE session_id=:session)
+                                 + (SELECT count(*) FROM mindmaps WHERE session_id=:session)
+                                 + (SELECT count(*) FROM quiz_questions WHERE session_id=:session)
+                                 AS publication_rows
+                        FROM ai_jobs WHERE id=:id
+                        """).param("session", sessionId).param("id", job.id())
+                .query((row, ignored) -> new StreamProbe(row.getString("status"),
+                        row.getString("progress_stage"), row.getTimestamp("last_heartbeat_at").toInstant(),
+                        row.getBoolean("live_lease"), row.getInt("publication_rows"), duplicate == null))
+                .single();
+    }
+
     private UUID insertSession(int sessionNumber) {
         UUID id = UUID.randomUUID();
         jdbc.sql("""
@@ -1065,6 +1319,92 @@ class JobQueueIT {
                                 """).param("owner", event.ownerId()).param("course", event.courseId())
                         .param("session", event.sessionId()).query(Integer.class).single());
             };
+        }
+
+        @Bean
+        @Primary
+        ControllableGenerationModel controllableGenerationModel(ObjectMapper json) {
+            return new ControllableGenerationModel(json);
+        }
+    }
+
+    private record StreamProbe(String status, String progressStage, Instant lastHeartbeat,
+                               boolean liveLease, int publicationRows, boolean duplicateRejected) {}
+
+    static final class ControllableGenerationModel implements GenerationModelPort {
+        private final ObjectMapper json;
+        private volatile CountDownLatch firstResponse = new CountDownLatch(0);
+        private volatile CountDownLatch finalResponse = new CountDownLatch(0);
+        private volatile long startedNanos;
+        private volatile long finishedNanos;
+
+        ControllableGenerationModel(ObjectMapper json) {
+            this.json = json;
+        }
+
+        void reset() {
+            firstResponse = new CountDownLatch(0);
+            finalResponse = new CountDownLatch(0);
+            startedNanos = 0;
+            finishedNanos = 0;
+        }
+
+        void arm() {
+            firstResponse = new CountDownLatch(1);
+            finalResponse = new CountDownLatch(1);
+        }
+
+        boolean awaitFirstResponse(long timeout, TimeUnit unit) throws InterruptedException {
+            return firstResponse.await(timeout, unit);
+        }
+
+        void releaseFinalResponse() {
+            finalResponse.countDown();
+        }
+
+        long providerBlockMillis() {
+            return TimeUnit.NANOSECONDS.toMillis(finishedNanos - startedNanos);
+        }
+
+        @Override
+        public GenerationResult generate(GenerationRequest request) {
+            startedNanos = System.nanoTime();
+            request.onFirstResponse().run();
+            firstResponse.countDown();
+            try {
+                if (!finalResponse.await(175, TimeUnit.SECONDS)) {
+                    throw new GenerationModelException("PROVIDER_TIMEOUT", true, null);
+                }
+                String citationId = request.input().citations().get(0).id();
+                JsonNode sourceIds = json.createArrayNode().add(citationId);
+                var root = json.createObjectNode();
+                root.putObject("summary").putArray("items").addObject().put("text", "Final summary")
+                        .set("sourceIds", sourceIds.deepCopy());
+                root.putObject("mindmap").putArray("nodes").addObject().put("id", "n1")
+                        .put("label", "Final node").set("sourceIds", sourceIds.deepCopy());
+                root.withObject("mindmap").putArray("edges");
+                var question = root.putArray("quizQuestions").addObject();
+                question.put("type", "true_false");
+                question.putObject("question").put("text", "Final question")
+                        .set("sourceIds", sourceIds.deepCopy());
+                question.putObject("answer").put("value", true).set("sourceIds", sourceIds.deepCopy());
+                question.putObject("explanation").put("text", "Final explanation")
+                        .set("sourceIds", sourceIds.deepCopy());
+                String raw = json.writeValueAsString(root);
+                finishedNanos = System.nanoTime();
+                return new GenerationResult(raw, new GenerationUsage(10L, 10L, 20L, 0L),
+                        TimeUnit.NANOSECONDS.toMillis(finishedNanos - startedNanos), "STOP");
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new GenerationModelException("PROVIDER_TIMEOUT", true, null);
+            } catch (com.fasterxml.jackson.core.JsonProcessingException exception) {
+                throw new IllegalStateException(exception);
+            }
+        }
+
+        @Override
+        public TokenCount countTokens(GenerationRequest request) {
+            return new TokenCount(1, 1_048_576);
         }
     }
 }

@@ -22,18 +22,20 @@ final class GenerationOutputValidator {
         this.json = json;
     }
 
-    Output parse(String raw, GenerationSnapshotService.Snapshot snapshot, boolean session, boolean quiz)
+    Output parse(String raw, GenerationInputCompiler.CompiledInput input, GenerationModelPort.Artifact artifact)
             throws JobHandler.JobExecutionException {
         try {
             JsonNode root = json.readTree(raw);
             require(root != null && root.isObject());
-            Map<String, JsonNode> citations = citations(snapshot);
+            Map<String, JsonNode> citations = citations(input);
             JsonNode summary = root.path("summary");
-            if (!quiz) validateSummary(summary, citations);
             JsonNode mindmap = root.path("mindmap");
-            if (session) validateMindmap(mindmap, citations);
             JsonNode questions = root.path("quizQuestions");
-            if (session || quiz) validateQuestions(questions, citations);
+            switch (artifact) {
+                case SUMMARY -> validateSummary(summary, citations);
+                case MINDMAP -> validateMindmap(mindmap, citations);
+                case QUIZ -> validateQuestions(questions, citations);
+            }
             return new Output(summary, mindmap.path("nodes"), mindmap.path("edges"), questions,
                     List.copyOf(citations.values()));
         } catch (JsonProcessingException | IllegalArgumentException exception) {
@@ -41,11 +43,9 @@ final class GenerationOutputValidator {
         }
     }
 
-    private static Map<String, JsonNode> citations(GenerationSnapshotService.Snapshot snapshot) {
+    private static Map<String, JsonNode> citations(GenerationInputCompiler.CompiledInput input) {
         Map<String, JsonNode> citations = new LinkedHashMap<>();
-        for (int index = 0; index < snapshot.sources().size(); index++) {
-            citations.put(GenerationCitations.sourceId(index), snapshot.sources().get(index).sourceReference());
-        }
+        input.citations().forEach(citation -> citations.put(citation.id(), citation.sourceReference()));
         return citations;
     }
 

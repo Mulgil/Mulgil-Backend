@@ -91,5 +91,8 @@ class ExamArtifactOpenApiIT {
         assertThat(document.at("/components/schemas/QuizProgress/properties").has("examId")).isFalse();
         assertThat(document.at("/components/schemas/SessionGeneration/properties/summary/$ref").asText())
                 .doesNotEndWith("/ExamGeneration");
+        JsonNode mindmap = document.at("/components/schemas/SessionGeneration/properties/mindmap");
+        assertThat(mindmap.path("type").asText()).isEqualTo("null");
+        assertThat(mindmap.path("$ref").asText()).endsWith("/MindmapView");
     }
 }

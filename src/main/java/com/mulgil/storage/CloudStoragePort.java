@@ -10,6 +10,10 @@ public interface CloudStoragePort {
 
     StoredObjectMetadata metadata(String objectKey);
 
+    default void putPrivate(String objectKey, byte[] content, String contentType, String checksum) {
+        throw new UnsupportedOperationException("Private object writes are unavailable.");
+    }
+
     void delete(String objectKey);
 
     default byte[] read(String objectKey) {

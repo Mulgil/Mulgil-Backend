@@ -21,6 +21,9 @@ public record MulgilProperties(
         @Valid Vision vision,
         @Valid Speech speech,
         @Valid Vertex vertex,
+        @Valid Generation generation,
+        @Valid ModelBenchmark modelBenchmark,
+        @Valid Retrieval retrieval,
         @Valid Fcm fcm,
         @Valid Ocr ocr,
         @Valid Jobs jobs,
@@ -61,6 +64,32 @@ public record MulgilProperties(
             @NotBlank String embeddingLocation,
             @Min(1) @Max(20) int embeddingBatchSize
     ) {}
+
+    public record Generation(
+            @DecimalMin("0.0") @DecimalMax("2.0") double temperature,
+            @Min(1) @Max(1) int candidateCount,
+            @Min(1) @Max(65535) int summaryMaxOutputTokens,
+            @Min(1) @Max(65535) int mindmapMaxOutputTokens,
+            @Min(1) @Max(65535) int quizMaxOutputTokens,
+            @Min(1) @Max(600) long totalTimeoutSeconds,
+            @Min(1) int inputSoftTokenLimit,
+            boolean contextCacheEnabled,
+            @Min(60) long contextCacheTtlSeconds
+    ) {}
+
+    public record ModelBenchmark(
+            boolean enabled,
+            List<@NotBlank String> candidateModels,
+            @Min(1) int retentionDays
+    ) {
+        public ModelBenchmark {
+            candidateModels = List.copyOf(candidateModels);
+        }
+    }
+
+    public record Retrieval(boolean selectedTopicEnabled, @Min(1) @Max(20) int maxTopK,
+                            @Min(1) @Max(20) int candidateMultiplier,
+                            @Min(1) int retentionDays) {}
 
     public record Fcm(boolean enabled) {}
 

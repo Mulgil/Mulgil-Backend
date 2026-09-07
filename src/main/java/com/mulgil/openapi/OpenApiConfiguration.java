@@ -62,6 +62,8 @@ public class OpenApiConfiguration {
             doc("POST", "/api/v1/exams/{examId}/summary/generate", "생성물", "시험 범위 요약 생성", "선택 시험 범위의 현재 source를 근거로 exam summary 생성 작업을 요청합니다.", false),
             doc("GET", "/api/v1/exams/{examId}/predicted-quiz", "생성물", "기출 기반 예상문제 조회", "기출 기반 예상문제를 정답과 해설 없이 조회합니다.", false),
             doc("POST", "/api/v1/exams/{examId}/predicted-quiz/generate", "생성물", "기출 기반 예상문제 생성", "선택 시험 범위의 indexed past_exam 자료를 필수 근거로 예상문제 생성 작업을 요청합니다.", false),
+            doc("POST", "/api/v1/sessions/{sessionId}/target-generations", "생성물", "선택 주제 생성 작업 요청", "선택한 소유자 범위 source에 대한 비동기 target_generate 작업을 요청합니다.", false),
+            doc("GET", "/api/v1/target-generations/{jobId}", "생성물", "선택 주제 생성 결과 조회", "소유한 target_generate 작업 상태와 완료된 안전한 sourceRefs 결과를 조회합니다.", false),
             doc("GET", "/api/v1/sessions/{sessionId}/quiz", "퀴즈·진도", "퀴즈 조회", "연습문제와 기출 기반 문제를 반환하되 정답과 해설은 노출하지 않습니다.", false),
             doc("POST", "/api/v1/quiz/questions/{questionId}/attempts", "퀴즈·진도", "퀴즈 답안 제출", "O/X boolean 또는 4지선다 0..3 index를 채점하고 정답, 해설 sourceRefs, 진도를 반환합니다.", false),
             doc("PUT", "/api/v1/devices/fcm-token", "알림", "FCM 기기 토큰 등록", "Android 또는 iOS 기기 토큰과 timezone을 소유자 범위로 upsert합니다.", false),

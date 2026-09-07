@@ -1,5 +1,6 @@
 package com.mulgil.persistence;
 
+import com.mulgil.generation.GenerationContextCacheRepository;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.BeforeEach;
@@ -18,6 +19,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.UUID;
@@ -45,6 +48,9 @@ class FlywaySchemaIT {
     @Autowired
     JdbcClient jdbc;
 
+    @Autowired
+    GenerationContextCacheRepository contextCaches;
+
     SchemaFixture fixture;
 
     @BeforeEach
@@ -53,7 +59,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV016_whenDatabaseIsFresh() {
+    void appliesV001ThroughV021_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -63,7 +69,9 @@ class FlywaySchemaIT {
                             'document_pages', 'content_blocks', 'transcript_segments', 'chunks', 'summaries',
                             'mindmaps', 'quiz_questions', 'quiz_attempts', 'progress_status', 'ai_jobs',
                             'device_tokens', 'notifications', 'speech_input_cleanups', 'ai_provider_usage',
-                            'resource_object_deletions')
+                            'resource_object_deletions', 'generation_context_caches',
+                            'selected_topic_retrieval_metrics', 'generation_model_benchmarks',
+                            'generation_model_approvals', 'selected_topic_generations')
                         """).query(Integer.class).single();
         List<String> requiredIndexes = jdbc.sql("""
                         SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname IN (
@@ -73,7 +81,8 @@ class FlywaySchemaIT {
                             'speech_input_cleanups_due_idx', 'speech_input_cleanups_owner_idx',
                             'ai_jobs_active_cache_fingerprint_uidx', 'ai_provider_usage_job_idx',
                             'materials_pending_upload_expiry_idx', 'exam_resources_pending_upload_expiry_idx',
-                            'resource_object_deletions_due_idx') ORDER BY indexname
+                            'resource_object_deletions_due_idx', 'generation_context_caches_expiry_idx')
+                        ORDER BY indexname
                         """).query(String.class).list();
         Integer jobColumns = jdbc.sql("""
                         SELECT count(*) FROM information_schema.columns
@@ -120,9 +129,9 @@ class FlywaySchemaIT {
                             'ai_jobs_cache_fingerprint_default')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015", "016");
-        assertThat(requiredTables).isEqualTo(19);
-        assertThat(requiredIndexes).hasSize(13);
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015", "016", "017", "018", "019", "020", "021");
+        assertThat(requiredTables).isEqualTo(24);
+        assertThat(requiredIndexes).hasSize(14);
         assertThat(jobColumns).isEqualTo(7);
         assertThat(nullableSourceParents).isEqualTo(4);
         assertThat(examResourceUploadExpiryColumns).isOne();
@@ -131,6 +140,184 @@ class FlywaySchemaIT {
         System.out.printf("SCHEMA_DB migrations=%s tables=%d indexes=%d constraints=%d triggers=%d "
                         + "jobColumns=%d nullablePageBlockParents=%d result=PASS%n", versions, requiredTables,
                 requiredIndexes.size(), requiredConstraints, requiredTriggers, jobColumns, nullableSourceParents);
+    }
+
+    @Test
+    void addsNullableProviderTelemetryAndStrictGenerationProgress() {
+        Integer usageColumns = jdbc.sql("""
+                        SELECT count(*) FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='ai_provider_usage'
+                          AND column_name IN ('prompt_token_count','candidate_token_count','total_token_count',
+                                              'cached_content_token_count','first_response_latency_ms')
+                          AND is_nullable='YES'
+                        """).query(Integer.class).single();
+        UUID job = UUID.randomUUID();
+        fixture.insertJob(job, fixture.materialId(), null, "generation-progress-" + job);
+
+        assertThat(usageColumns).isEqualTo(5);
+        assertThatThrownBy(() -> jdbc.sql("""
+                        INSERT INTO ai_provider_usage
+                            (id,owner_id,operation,provider,model_id,status,unit_type,unit_count,
+                             prompt_token_count,started_at)
+                        VALUES (:id,:owner,'vertex.generate','vertex','model','started',
+                                'unicode_code_point',1,-1,now())
+                        """).param("id", UUID.randomUUID()).param("owner", fixture.ownerId()).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("""
+                        UPDATE ai_jobs SET progress_stage='preparing',progress_updated_at=now() WHERE id=:id
+                        """).param("id", job).update()).isInstanceOf(DataIntegrityViolationException.class);
+        jdbc.sql("UPDATE ai_jobs SET job_type='review_generate' WHERE id=:id").param("id", job).update();
+        jdbc.sql("UPDATE ai_jobs SET progress_stage='validating',progress_updated_at=now() WHERE id=:id")
+                .param("id", job).update();
+        assertThat(jdbc.sql("SELECT progress_stage FROM ai_jobs WHERE id=:id").param("id", job)
+                .query(String.class).single()).isEqualTo("validating");
+    }
+
+    @Test
+    void persistsOnlyBoundedContextCacheMetadataAndLedgerFields() {
+        List<String> columns = jdbc.sql("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='generation_context_caches'
+                ORDER BY ordinal_position
+                """).query(String.class).list();
+        List<String> ledgerColumns = jdbc.sql("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='ai_provider_usage'
+                  AND column_name IN ('context_cache_status','context_cache_token_count')
+                ORDER BY column_name
+                """).query(String.class).list();
+
+        assertThat(columns).containsExactly("id", "owner_id", "snapshot_hash", "provider", "model_id",
+                "location", "input_contract", "status", "token_count", "error_code", "generation",
+                "expires_at", "last_used_at", "created_at", "updated_at");
+        assertThat(columns).noneMatch(column -> column.contains("text") || column.contains("prompt")
+                || column.contains("citation") || column.contains("output") || column.contains("resource_name"));
+        assertThat(ledgerColumns).containsExactly("context_cache_status", "context_cache_token_count");
+    }
+
+    @Test
+    void reservesOneCreatorAndReusesLiveContextCacheMetadata_underConcurrency() throws Exception {
+        Instant now = Instant.parse("2026-09-07T00:00:00Z");
+        GenerationContextCacheRepository.Key key = new GenerationContextCacheRepository.Key(
+                fixture.ownerId(), "a".repeat(64), "vertex", "model-a", "us-central1", "source-grounded-v2");
+        Callable<GenerationContextCacheRepository.Reservation> reserve =
+                () -> contextCaches.reserve(key, now, now.plusSeconds(3600));
+
+        List<GenerationContextCacheRepository.Reservation> reservations;
+        try (var executor = Executors.newFixedThreadPool(6)) {
+            reservations = executor.invokeAll(java.util.Collections.nCopies(6, reserve)).stream()
+                    .map(future -> {
+                        try { return future.get(); }
+                        catch (Exception exception) { throw new IllegalStateException(exception); }
+                    }).toList();
+        }
+
+        assertThat(reservations).filteredOn(GenerationContextCacheRepository.Reservation::creator).hasSize(1);
+        assertThat(jdbc.sql("SELECT count(*) FROM generation_context_caches WHERE owner_id=:owner")
+                .param("owner", fixture.ownerId()).query(Integer.class).single()).isOne();
+        GenerationContextCacheRepository.Reservation creator = reservations.stream()
+                .filter(GenerationContextCacheRepository.Reservation::creator).findFirst().orElseThrow();
+        contextCaches.activate(creator.entry().id(), creator.entry().generation(),
+                42, now, now.plusSeconds(3600));
+        GenerationContextCacheRepository.Reservation reused = contextCaches.reserve(
+                key, now.plusSeconds(1), now.plusSeconds(3601));
+        assertThat(reused.creator()).isFalse();
+        assertThat(reused.entry().status()).isEqualTo("active");
+        assertThat(reused.entry().tokenCount()).isEqualTo(42);
+    }
+
+    @Test
+    void atomicallyReclaimsExpiredContextCacheMetadata() {
+        Instant now = Instant.parse("2026-09-07T00:00:00Z");
+        GenerationContextCacheRepository.Key key = new GenerationContextCacheRepository.Key(
+                fixture.ownerId(), "b".repeat(64), "vertex", "model-b", "us-central1", "source-grounded-v2");
+        GenerationContextCacheRepository.Reservation original = contextCaches.reserve(
+                key, now, now.plusSeconds(60));
+        contextCaches.activate(original.entry().id(), original.entry().generation(),
+                11, now, now.plusSeconds(60));
+
+        GenerationContextCacheRepository.Reservation replacement = contextCaches.reserve(
+                key, now.plusSeconds(61), now.plusSeconds(121));
+
+        assertThat(replacement.creator()).isTrue();
+        assertThat(replacement.replacesExpired()).isTrue();
+        assertThat(replacement.entry().id()).isEqualTo(original.entry().id());
+        assertThat(replacement.entry().generation()).isEqualTo(2);
+        assertThat(jdbc.sql("SELECT count(*) FROM generation_context_caches WHERE owner_id=:owner")
+                .param("owner", fixture.ownerId()).query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void rejectsStaleTerminalUpdatesAfterExpiredContextCacheIsReclaimedAndActivated() {
+        Instant now = Instant.parse("2026-09-07T00:00:00Z");
+        GenerationContextCacheRepository.Key key = new GenerationContextCacheRepository.Key(
+                fixture.ownerId(), "c".repeat(64), "vertex", "model-c", "us-central1", "source-grounded-v2");
+        GenerationContextCacheRepository.Reservation stale = contextCaches.reserve(
+                key, now, now.plusSeconds(60));
+        GenerationContextCacheRepository.Reservation current = contextCaches.reserve(
+                key, now.plusSeconds(61), now.plusSeconds(121));
+
+        assertThat(current.entry().id()).isEqualTo(stale.entry().id());
+        assertThat(current.entry().generation()).isEqualTo(stale.entry().generation() + 1);
+        assertThat(contextCaches.activate(current.entry().id(), current.entry().generation(),
+                22, now.plusSeconds(61), now.plusSeconds(121))).isTrue();
+        assertThat(contextCaches.activate(stale.entry().id(), stale.entry().generation(),
+                11, now.plusSeconds(62), now.plusSeconds(122))).isFalse();
+        assertThat(contextCaches.fail(stale.entry().id(), stale.entry().generation(),
+                "CACHE_CREATE_FAILED", now.plusSeconds(62))).isFalse();
+        assertThat(contextCaches.invalidate(stale.entry().id(), stale.entry().generation(),
+                "CACHE_REFERENCE_MISSING", now.plusSeconds(62))).isFalse();
+        assertThat(jdbc.sql("""
+                        SELECT count(*) FROM generation_context_caches
+                        WHERE id=:id AND status='active' AND generation=:generation AND token_count=:tokens
+                        """).param("id", current.entry().id()).param("generation", current.entry().generation())
+                .param("tokens", 22).query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void addsV019WithoutChangingExistingV018Data() {
+        String schema = "context_cache_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        String url = POSTGRES.getJdbcUrl() + "&currentSchema=" + schema + ",public";
+        Flyway throughV018 = Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).target(MigrationVersion.fromVersion("018")).load();
+        throughV018.migrate();
+        JdbcClient upgrade = JdbcClient.create(new DriverManagerDataSource(
+                url, POSTGRES.getUsername(), POSTGRES.getPassword()));
+        SchemaFixture oldFixture = new SchemaFixture(upgrade);
+
+        Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).load().migrate();
+
+        assertThat(upgrade.sql("SELECT count(*) FROM users WHERE id=:id")
+                .param("id", oldFixture.ownerId()).query(Integer.class).single()).isOne();
+        assertThat(upgrade.sql("SELECT count(*) FROM information_schema.tables "
+                + "WHERE table_schema=:schema AND table_name='generation_context_caches'")
+                .param("schema", schema).query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void addsV021WithoutChangingExistingV020Jobs() {
+        String schema = "target_generation_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        String url = POSTGRES.getJdbcUrl() + "&currentSchema=" + schema + ",public";
+        Flyway throughV020 = Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).target(MigrationVersion.fromVersion("020")).load();
+        throughV020.migrate();
+        JdbcClient upgrade = JdbcClient.create(new DriverManagerDataSource(
+                url, POSTGRES.getUsername(), POSTGRES.getPassword()));
+        SchemaFixture oldFixture = new SchemaFixture(upgrade);
+        UUID oldJob = UUID.randomUUID();
+        oldFixture.insertJob(oldJob, oldFixture.materialId(), null, "target-upgrade-existing-job");
+
+        Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).load().migrate();
+
+        assertThat(upgrade.sql("SELECT count(*) FROM ai_jobs WHERE id=:id")
+                .param("id", oldJob).query(Integer.class).single()).isOne();
+        upgrade.sql("UPDATE ai_jobs SET job_type='target_generate',material_id=NULL WHERE id=:id")
+                .param("id", oldJob).update();
+        assertThat(upgrade.sql("SELECT count(*) FROM information_schema.tables "
+                + "WHERE table_schema=:schema AND table_name='selected_topic_generations'")
+                .param("schema", schema).query(Integer.class).single()).isOne();
     }
 
     @Test
