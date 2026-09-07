@@ -115,6 +115,7 @@ final class FakeGenerationModel implements GenerationModelPort {
     volatile int benchmarkCalls;
     volatile String providerPayloadMarker;
     volatile String outputText;
+    volatile String outputFieldName;
 
     FakeGenerationModel(ObjectMapper json) {
         this.json = json;
@@ -137,9 +138,12 @@ final class FakeGenerationModel implements GenerationModelPort {
             JsonNode sourceIds = valid ? json.createArrayNode().add(citationId) : json.createArrayNode();
             var root = json.createObjectNode();
             switch (request.artifact()) {
-                case SUMMARY -> root.putObject("summary").putArray("items").addObject()
-                        .put("text", outputText == null ? "Grounded summary" : outputText)
-                        .set("sourceIds", sourceIds.deepCopy());
+                case SUMMARY -> {
+                    var item = root.putObject("summary").putArray("items").addObject()
+                            .put("text", outputText == null ? "Grounded summary" : outputText);
+                    item.set("sourceIds", sourceIds.deepCopy());
+                    if (outputFieldName != null) item.put(outputFieldName, "provider metadata");
+                }
                 case MINDMAP -> {
                     root.putObject("mindmap").putArray("nodes").addObject().put("id", "n1")
                             .put("label", "Grounded node").set("sourceIds", sourceIds.deepCopy());

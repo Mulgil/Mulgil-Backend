@@ -91,6 +91,7 @@ class SelectedTopicGenerationIT {
         model.benchmarkModel = null;
         model.providerPayloadMarker = null;
         model.outputText = null;
+        model.outputFieldName = null;
         embeddings.calls = 0;
         storage.reset();
         String ownerSubject = "selected-owner-" + UUID.randomUUID();
@@ -233,6 +234,24 @@ class SelectedTopicGenerationIT {
         assertThat(selectedTopics.result(owner, jobId).result()).isNull();
         assertThat(json.writeValueAsString(selectedTopics.result(owner, jobId))).doesNotContain(chunk);
         assertNoPersistedPayload(chunk);
+    }
+
+    @Test
+    void rejectsProviderEchoOfRawQueryInFieldName_beforePersistenceOrResponse() throws Exception {
+        String query = "private-query-field-sentinel";
+        model.outputFieldName = query;
+        UUID jobId = selectedTopics.enqueue(owner, session, request(query)).jobId();
+        JobQueue.ClaimedJob claimed = jobs.claim("selected-topic-field-echo-it", Set.of("target_generate"));
+
+        JobHandler.JobExecutionException failure = org.junit.jupiter.api.Assertions.assertThrows(
+                JobHandler.JobExecutionException.class, () -> jobs.run(claimed, targetHandler()));
+        jobs.fail(claimed, failure.code(), failure.getMessage(), failure.retryable());
+
+        assertThat(failure.code()).isEqualTo("SENSITIVE_GENERATION_OUTPUT");
+        assertThat(failure.getMessage()).doesNotContain(query);
+        assertThat(selectedTopics.result(owner, jobId).result()).isNull();
+        assertThat(json.writeValueAsString(selectedTopics.result(owner, jobId))).doesNotContain(query);
+        assertNoPersistedPayload(query);
     }
 
     @Test

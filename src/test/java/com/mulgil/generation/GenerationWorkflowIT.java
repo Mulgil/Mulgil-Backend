@@ -313,6 +313,20 @@ class GenerationWorkflowIT {
 
         runCompletionReplay();
         assertThat(jobCount("review_generate")).isEqualTo(2);
+        runOne("review_generate");
+        assertThat(jobCount("review_mindmap_generate")).isEqualTo(2);
+        assertThat(jobCount("review_quiz_generate")).isEqualTo(2);
+        runOne("review_mindmap_generate");
+        runOne("review_quiz_generate");
+
+        JsonNode regenerated = ok(send(
+                "GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
+        assertThat(regenerated.path("summary").path("inputVersion").asInt()).isEqualTo(2);
+        assertThat(regenerated.path("mindmap").path("inputVersion").asInt()).isEqualTo(2);
+        assertThat(jdbc.sql("""
+                        SELECT count(*) FROM quiz_questions
+                        WHERE session_id=:session AND status='succeeded' AND input_version=2
+                        """).param("session", session).query(Integer.class).single()).isOne();
         System.out.println("GENERATION_WORKFLOW scenario=staggered_sources observable=zero_then_one_job_valid_http_and_practice_rows result=PASS");
     }
 

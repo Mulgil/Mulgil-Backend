@@ -613,7 +613,9 @@ public class JobQueue {
                 : request.examId() != null ? request.examId().toString()
                 : request.sessionId() + ":" + request.sourceHash();
         String canonical = String.join("\u001f", request.type(), resource, request.sessionId().toString(),
-                GENERATION_TYPES.contains(request.type()) ? "generated" : Integer.toString(request.inputVersion()),
+                REPLAY_SAFE_TERMINAL_TYPES.contains(request.type()) ? Integer.toString(request.inputVersion())
+                        : GENERATION_TYPES.contains(request.type()) ? "generated"
+                        : Integer.toString(request.inputVersion()),
                 request.sourceHash(), request.provider(), request.model(), request.promptVersion());
         return idempotencyKey(canonical);
     }

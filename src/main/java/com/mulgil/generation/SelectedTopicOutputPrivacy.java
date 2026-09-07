@@ -6,6 +6,7 @@ import com.mulgil.job.JobHandler;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 final class SelectedTopicOutputPrivacy {
     private SelectedTopicOutputPrivacy() {}
@@ -29,6 +30,13 @@ final class SelectedTopicOutputPrivacy {
     private static boolean contains(JsonNode node, List<String> sensitive) {
         if (node == null || node.isMissingNode() || node.isNull()) return false;
         if (node.isTextual()) return sensitive.stream().anyMatch(node.textValue()::contains);
+        if (node.isObject()) {
+            for (Map.Entry<String, JsonNode> field : node.properties()) {
+                if (sensitive.stream().anyMatch(field.getKey()::contains)
+                        || contains(field.getValue(), sensitive)) return true;
+            }
+            return false;
+        }
         Iterator<JsonNode> children = node.elements();
         while (children.hasNext()) {
             if (contains(children.next(), sensitive)) return true;
