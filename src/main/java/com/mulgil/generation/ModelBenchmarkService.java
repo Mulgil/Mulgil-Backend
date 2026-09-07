@@ -12,7 +12,7 @@ import java.util.UUID;
 
 @Service
 final class ModelBenchmarkService {
-    private static final String CONTRACT = "source-grounded-v2";
+    private static final String CONTRACT = GenerationScheduler.PROMPT_VERSION;
     private final JdbcClient jdbc;
     private final ObjectProvider<GenerationModelPort> models;
     private final MulgilProperties properties;

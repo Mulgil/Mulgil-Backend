@@ -138,7 +138,7 @@ class SelectedTopicGenerationService {
                 "PROVIDER_UNAVAILABLE", "Generation provider unavailable.", true);
         GenerationModelPort.GenerationResult generated;
         try {
-            var generation = new GenerationModelPort.GenerationRequest(input, "source-grounded-v2",
+            var generation = new GenerationModelPort.GenerationRequest(input, GenerationScheduler.PROMPT_VERSION,
                     request.intent().artifact, () -> jobs.updateProgress(job, "generating"),
                     job.ownerId(), ContentIndexingService.sha256(input.text()));
             if (input.text().codePoints().count() > properties.generation().inputSoftTokenLimit()) {

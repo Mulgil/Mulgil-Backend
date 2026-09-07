@@ -12,7 +12,7 @@ import java.util.UUID;
 
 @Component
 final class GenerationScheduler implements JobCompletionListener {
-    static final String PROMPT_VERSION = "source-grounded-v2";
+    static final String PROMPT_VERSION = "source-grounded-v3";
     private final JdbcClient jdbc;
     private final GenerationSnapshotService snapshots;
     private final MulgilProperties properties;

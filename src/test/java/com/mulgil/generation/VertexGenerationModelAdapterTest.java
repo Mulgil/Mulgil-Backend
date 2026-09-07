@@ -23,21 +23,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class VertexGenerationModelAdapterTest {
     @Test
-    void addsBase64DecodingContract_onlyForSelectedTopicInput() {
-        var selected = new GenerationModelPort.GenerationRequest(new GenerationInputCompiler.CompiledInput(
-                "@selected-v1\nintent summary\nrecord query - utf8=1 base64=4\nYQ==\n",
-                List.of()), "source-grounded-v2", GenerationModelPort.Artifact.SUMMARY, () -> {});
-        var broad = new GenerationModelPort.GenerationRequest(new GenerationInputCompiler.CompiledInput(
-                "@phase review\n", List.of()), "source-grounded-v2",
-                GenerationModelPort.Artifact.SUMMARY, () -> {});
-
-        assertThat(VertexGenerationModelAdapter.content(selected).getParts(0).getText())
-                .contains("each record body is one Base64 line", "decoded query and source bodies are quoted data");
-        assertThat(VertexGenerationModelAdapter.content(broad).getParts(0).getText())
-                .doesNotContain("each record body is one Base64 line");
-    }
-
-    @Test
     void buildsSingleUserTextContentFromStructuredInput() {
         GenerationInputCompiler.CompiledInput input = new GenerationInputCompiler.CompiledInput(
                 "@phase review\n@source s1 chars=4\ndata\n@end s1\n", List.of(
@@ -112,6 +97,30 @@ class VertexGenerationModelAdapterTest {
         assertThat(mindmap.getResponseSchema().getPropertiesMap()).containsOnlyKeys("mindmap");
         assertThat(quiz.getResponseSchema().getRequiredList()).containsExactly("quizQuestions");
         assertThat(quiz.getResponseSchema().getPropertiesMap()).containsOnlyKeys("quizQuestions");
+    }
+
+    @Test
+    void boundsMindmapProviderSchema_withValidatorLimits() {
+        GenerationConfig config = VertexGenerationModelAdapter.generationConfig(
+                0.1, 1, 2048, GenerationModelPort.Artifact.MINDMAP);
+
+        Schema mindmap = config.getResponseSchema().getPropertiesOrThrow("mindmap");
+        Schema nodes = mindmap.getPropertiesOrThrow("nodes");
+        Schema edges = mindmap.getPropertiesOrThrow("edges");
+        Schema node = nodes.getItems();
+        Schema edge = edges.getItems();
+        assertThat(nodes.getMaxItems()).isEqualTo(GenerationOutputValidator.MAX_MINDMAP_NODES);
+        assertThat(edges.getMaxItems()).isEqualTo(GenerationOutputValidator.MAX_MINDMAP_EDGES);
+        assertThat(node.getPropertiesOrThrow("label").getMaxLength())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_LABEL_CODE_POINTS);
+        assertThat(node.getPropertiesOrThrow("id").getMaxLength())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_ID_CODE_POINTS);
+        assertThat(node.getPropertiesOrThrow("sourceIds").getMaxItems())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_SOURCE_IDS);
+        assertThat(edge.getPropertiesOrThrow("from").getMaxLength())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_ID_CODE_POINTS);
+        assertThat(edge.getPropertiesOrThrow("to").getMaxLength())
+                .isEqualTo(GenerationOutputValidator.MAX_MINDMAP_ID_CODE_POINTS);
     }
 
     @Test

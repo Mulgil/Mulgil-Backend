@@ -110,8 +110,11 @@ final class FakeGenerationModel implements GenerationModelPort {
     volatile long countedTokens = 100;
     volatile long contextTokenLimit = 1_048_576;
     volatile String failureCode;
+    volatile boolean failureRetryable = true;
+    volatile GenerationResult failureResult;
     volatile String countTokensFailureCode;
     volatile String benchmarkModel;
+    volatile String lastResponseSchema;
     volatile int benchmarkCalls;
     volatile String providerPayloadMarker;
     volatile String outputText;
@@ -130,8 +133,9 @@ final class FakeGenerationModel implements GenerationModelPort {
 
     private GenerationResult result(GenerationRequest request) {
         try {
+            lastResponseSchema = request.responseSchema();
             if (failureCode != null) {
-                throw new GenerationModelException(failureCode, true, null);
+                throw new GenerationModelException(failureCode, failureRetryable, failureResult);
             }
             String prompt = request.input().text();
             request.onFirstResponse().run();
@@ -148,7 +152,8 @@ final class FakeGenerationModel implements GenerationModelPort {
                 }
                 case MINDMAP -> {
                     root.putObject("mindmap").putArray("nodes").addObject().put("id", "n1")
-                            .put("label", "Grounded node").set("sourceIds", sourceIds.deepCopy());
+                            .put("label", outputText == null ? "Grounded node" : outputText)
+                            .set("sourceIds", sourceIds.deepCopy());
                     root.withObject("mindmap").putArray("edges");
                 }
                 case QUIZ -> {

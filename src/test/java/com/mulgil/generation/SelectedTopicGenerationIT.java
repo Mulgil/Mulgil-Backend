@@ -89,6 +89,7 @@ class SelectedTopicGenerationIT {
         model.generationCalls = 0;
         model.benchmarkCalls = 0;
         model.benchmarkModel = null;
+        model.lastResponseSchema = null;
         model.providerPayloadMarker = null;
         model.outputText = null;
         model.outputFieldName = null;
@@ -142,6 +143,7 @@ class SelectedTopicGenerationIT {
         assertThat(json.readTree(result.body()).path("result").path("selectedCount").asInt()).isEqualTo(2);
         assertThat(result.body()).doesNotContain(query, "chunk 1", "rawJson", "payload_object_key");
         assertThat(model.generationCalls).isOne();
+        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
         assertThat(embeddings.calls).isOne();
     }
 
@@ -523,8 +525,11 @@ class SelectedTopicGenerationIT {
         assertThat(model.benchmarkModel).isEqualTo("gemini-candidate");
         assertThat(model.benchmarkCalls).isOne();
         assertThat(model.generationCalls).isZero();
+        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
         assertThat(jdbc.sql("SELECT model_id||':'||valid_output FROM generation_model_benchmarks")
                 .query(String.class).single()).isEqualTo("gemini-candidate:true");
+        assertThat(jdbc.sql("SELECT prompt_version||':'||schema_version FROM generation_model_benchmarks")
+                .query(String.class).single()).isEqualTo("source-grounded-v3:source-grounded-v3");
         assertThat(jdbc.sql("SELECT count(*) FROM summaries").query(Integer.class).single()).isZero();
         assertThat(jdbc.sql("SELECT count(*) FROM mindmaps").query(Integer.class).single()).isZero();
         assertThat(jdbc.sql("SELECT count(*) FROM quiz_questions").query(Integer.class).single()).isZero();
