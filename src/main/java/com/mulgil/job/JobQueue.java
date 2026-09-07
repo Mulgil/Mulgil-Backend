@@ -169,7 +169,8 @@ public class JobQueue {
 
     private AiJob retryOnEnqueue(AiJob existing) {
         if (!existing.status().equals("failed") || existing.attemptCount() >= existing.maxAttempts()
-                || !RETRYABLE_ERRORS.contains(existing.errorCode())) return existing;
+                || !RETRYABLE_ERRORS.contains(existing.errorCode())
+                || "PROVIDER_OUTPUT_LIMIT".equals(existing.errorCode())) return existing;
         return jdbc.sql("""
                         UPDATE ai_jobs SET status='queued',error_code=NULL,error_message=NULL,finished_at=NULL,
                             progress_stage=NULL,progress_updated_at=NULL

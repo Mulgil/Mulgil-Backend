@@ -598,6 +598,23 @@ class JobQueueIT {
     }
 
     @Test
+    void keepsProviderOutputLimitFailureUntilExplicitRetryForNonterminalGeneration() {
+        JobQueue.EnqueueRequest request = new JobQueue.EnqueueRequest("preview_generate", ownerId, courseId,
+                sessionId, null, null, null, null, null, 1, HASH, "vertex", "generation-v1", "prompt-v1");
+        JobQueue.AiJob first = queue.enqueue(request);
+        JobQueue.ClaimedJob claimed = queue.claim("generation-worker", Set.of("preview_generate"));
+        queue.fail(claimed, "PROVIDER_OUTPUT_LIMIT", "Generation output reached its limit.", true);
+
+        JobQueue.AiJob reEnqueued = queue.enqueue(request);
+
+        assertThat(reEnqueued.id()).isEqualTo(first.id());
+        assertThat(reEnqueued.status()).isEqualTo("failed");
+        assertThat(reEnqueued.attemptCount()).isOne();
+        assertThat(reEnqueued.errorCode()).isEqualTo("PROVIDER_OUTPUT_LIMIT");
+        assertThat(queue.retry(ownerId, first.id()).status()).isEqualTo("queued");
+    }
+
+    @Test
     void reclaimsExpiredLease_whenAttemptsRemain() {
         JobQueue.AiJob job = queue.enqueue(request());
         JobQueue.ClaimedJob first = queue.claim("crashed-worker", Set.of("pdf_extract"));
