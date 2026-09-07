@@ -302,6 +302,46 @@ class GenerationWorkflowIT {
     }
 
     @Test
+    void keepsReviewMindmapCurrent_whenNewerPreviewMindmapSucceeds() throws Exception {
+        sources.addPreviewMaterial("preview source");
+        runOne("chunk_embed");
+        runOne("preview_generate");
+        runOne("preview_mindmap_generate");
+
+        JsonNode firstPreview = ok(send(
+                "GET", "/api/v1/sessions/" + session + "/summaries?type=preview", null), 200);
+        UUID firstPreviewMindmap = UUID.fromString(firstPreview.path("mindmap").path("id").asText());
+
+        sources.addReviewNote("review source", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        runOne("review_mindmap_generate");
+
+        JsonNode review = ok(send(
+                "GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
+        UUID reviewMindmap = UUID.fromString(review.path("mindmap").path("id").asText());
+        assertThat(ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=preview", null), 200)
+                .path("mindmap").path("id").asText()).isEqualTo(firstPreviewMindmap.toString());
+
+        runOne("preview_generate");
+        runOne("preview_mindmap_generate");
+
+        JsonNode newerPreview = ok(send(
+                "GET", "/api/v1/sessions/" + session + "/summaries?type=preview", null), 200);
+        JsonNode sameReview = ok(send(
+                "GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
+        assertThat(newerPreview.path("mindmap").path("id").asText())
+                .isNotEqualTo(firstPreviewMindmap.toString());
+        assertThat(sameReview.path("mindmap").path("id").asText()).isEqualTo(reviewMindmap.toString());
+        assertThat(jdbc.sql("SELECT id||':'||status FROM mindmaps WHERE session_id=:session ORDER BY input_version")
+                .param("session", session).query(String.class).list())
+                .containsExactly(firstPreviewMindmap + ":outdated", newerPreview.path("mindmap").path("id").asText()
+                        + ":succeeded", reviewMindmap + ":succeeded");
+        System.out.println("GENERATION_PHASE_INVALIDATION_QA preview_http=200 review_http=200 "
+                + "newer_preview_outdated_older_preview=true review_mindmap_preserved=true result=PASS");
+    }
+
+    @Test
     void preflightsOnlyAboveSoftLimit_andRejectsActualContextOverflowWithoutGeneration() throws Exception {
         sources.addReviewNote("short source", 0);
         runOne("chunk_embed");

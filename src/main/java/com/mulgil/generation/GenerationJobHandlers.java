@@ -178,9 +178,14 @@ abstract class GenerationJobHandler implements JobHandler {
 
     private void replaceMindmap(JobQueue.ClaimedJob job, GenerationOutputValidator.Output output,
                                 String model, String refs, Timestamp now) {
-        jdbc.sql("UPDATE mindmaps SET status='outdated',updated_at=:now WHERE owner_id=:owner "
-                        + "AND session_id=:session AND status='succeeded'")
-                .param("now", now).param("owner", job.ownerId()).param("session", job.sessionId()).update();
+        jdbc.sql("""
+                UPDATE mindmaps AS mindmap SET status='outdated',updated_at=:now
+                FROM summaries AS summary
+                WHERE mindmap.owner_id=:owner AND mindmap.session_id=:session AND mindmap.status='succeeded'
+                  AND summary.owner_id=mindmap.owner_id AND summary.session_id=mindmap.session_id
+                  AND summary.input_version=mindmap.input_version AND summary.summary_type=:type
+                """).param("now", now).param("owner", job.ownerId()).param("session", job.sessionId())
+                .param("type", phase(job.type())).update();
         jdbc.sql("""
                 INSERT INTO mindmaps
                     (id,owner_id,course_id,session_id,input_version,nodes_json,edges_json,source_refs,
