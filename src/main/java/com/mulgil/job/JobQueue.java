@@ -479,7 +479,18 @@ public class JobQueue {
             default -> throw new IllegalStateException("Unsupported generation job type.");
         };
         if (job.type().equals("target_generate")) return selectedTopicSourcesAreCurrent(job);
-        return snapshot != null && snapshot.snapshotHash().equals(job.sourceHash());
+        if (snapshot == null || !snapshot.snapshotHash().equals(job.sourceHash())) return false;
+        if (!REPLAY_SAFE_TERMINAL_TYPES.contains(job.type())) return true;
+        return jdbc.sql("""
+                SELECT EXISTS(
+                    SELECT 1 FROM summaries
+                    WHERE owner_id=:owner AND course_id=:course AND session_id=:session
+                      AND summary_type=:type AND input_version=:version AND status='succeeded'
+                )
+                """).param("owner", job.ownerId()).param("course", job.courseId())
+                .param("session", job.sessionId()).param("type", job.type().startsWith("preview_")
+                        ? "preview" : "review").param("version", job.inputVersion())
+                .query(Boolean.class).single();
     }
 
     private boolean selectedTopicSourcesAreCurrent(AiJob job) {

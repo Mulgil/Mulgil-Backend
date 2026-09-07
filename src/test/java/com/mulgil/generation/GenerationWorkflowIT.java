@@ -192,6 +192,45 @@ class GenerationWorkflowIT {
     }
 
     @Test
+    void outdatesHeldChildPublications_whenNewerSummarySucceedsWithSameSourceHash() throws Exception {
+        sources.addReviewNote("held child source", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+
+        JobHandler mindmapHandler = handlers.stream()
+                .filter(value -> value.jobType().equals("review_mindmap_generate")).findFirst().orElseThrow();
+        JobHandler quizHandler = handlers.stream()
+                .filter(value -> value.jobType().equals("review_quiz_generate")).findFirst().orElseThrow();
+        JobQueue.ClaimedJob heldMindmap = jobs.claim("held-mindmap", Set.of("review_mindmap_generate"));
+        JobQueue.ClaimedJob heldQuiz = jobs.claim("held-quiz", Set.of("review_quiz_generate"));
+        JobHandler.JobPublication heldMindmapPublication = mindmapHandler.handle(heldMindmap);
+        JobHandler.JobPublication heldQuizPublication = quizHandler.handle(heldQuiz);
+
+        runCompletionReplay();
+        runOne("review_generate");
+        runOne("review_mindmap_generate");
+        runOne("review_quiz_generate");
+
+        assertThat(jobs.complete(heldMindmap, heldMindmapPublication)).isFalse();
+        assertThat(jobs.complete(heldQuiz, heldQuizPublication)).isFalse();
+        assertThat(jdbc.sql("""
+                        SELECT DISTINCT source_hash FROM ai_jobs
+                        WHERE job_type IN ('review_mindmap_generate','review_quiz_generate')
+                        """).query(String.class).list()).containsExactly(heldMindmap.sourceHash());
+        assertThat(jdbc.sql("""
+                        SELECT job_type||':'||input_version||':'||status FROM ai_jobs
+                        WHERE job_type IN ('review_mindmap_generate','review_quiz_generate')
+                        ORDER BY job_type,input_version
+                        """).query(String.class).list())
+                .containsExactly("review_mindmap_generate:1:outdated", "review_mindmap_generate:2:succeeded",
+                        "review_quiz_generate:1:outdated", "review_quiz_generate:2:succeeded");
+        assertThat(jdbc.sql("SELECT input_version||':'||status FROM mindmaps WHERE session_id=:session")
+                .param("session", session).query(String.class).list()).containsExactly("2:succeeded");
+        assertThat(jdbc.sql("SELECT input_version||':'||status FROM quiz_questions WHERE session_id=:session")
+                .param("session", session).query(String.class).list()).containsExactly("2:succeeded");
+    }
+
+    @Test
     void preflightsOnlyAboveSoftLimit_andRejectsActualContextOverflowWithoutGeneration() throws Exception {
         sources.addReviewNote("short source", 0);
         runOne("chunk_embed");
