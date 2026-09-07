@@ -158,6 +158,85 @@ class GenerationOutputValidatorTest {
         assertInvalidGenerationOutput(raw);
     }
 
+    @Test
+    void acceptsTypedTrueFalseAndMultipleChoiceQuizAnswers() throws Exception {
+        ObjectNode root = json.createObjectNode();
+        ArrayNode questions = root.putArray("quizQuestions");
+        addQuizQuestion(questions, "true_false", true, null);
+        addQuizQuestion(questions, "multiple_choice", 2, List.of("A", "B", "C", "D"));
+
+        GenerationOutputValidator.Output output = validator.parse(root.toString(), compiledInput(),
+                GenerationModelPort.Artifact.QUIZ);
+
+        assertThat(output.questions()).hasSize(2);
+        assertThat(output.questions().get(0).path("answer").path("value").isBoolean()).isTrue();
+        assertThat(output.questions().get(1).path("answer").path("value").intValue()).isEqualTo(2);
+    }
+
+    @Test
+    void rejectsMalformedQuizShapes_withSafeFixedDiagnostics() throws Exception {
+        assertQuizRejected("{\"quizQuestions\":[]}", "QUESTIONS_COUNT", "quizQuestions", 1, 0);
+        assertQuizRejected(quiz("multiple_choice", 1, null),
+                "OPTIONS_COUNT", "quizQuestions[0].question.options", 4, 0);
+        assertQuizRejected(quiz("multiple_choice", 1, List.of("A", "B", "C")),
+                "OPTIONS_COUNT", "quizQuestions[0].question.options", 4, 3);
+        assertQuizRejected(quiz("multiple_choice", 1, List.of("A", "B", "C", "D", "E")),
+                "OPTIONS_COUNT", "quizQuestions[0].question.options", 4, 5);
+        assertQuizRejected(quiz("multiple_choice", 1, List.of("A", " ", "C", "D")),
+                "OPTION_NONBLANK", "quizQuestions[0].question.options[1]", null, null);
+        assertQuizRejected(quizWithQuestionText(" "),
+                "TEXT_NONBLANK", "quizQuestions[0].question.text", null, null);
+        assertQuizRejected(quizWithoutAnswer(),
+                "ANSWER_REQUIRED", "quizQuestions[0].answer", null, null);
+        assertQuizRejected(quizWithoutAnswerValue(),
+                "ANSWER_VALUE_REQUIRED", "quizQuestions[0].answer.value", null, null);
+        assertQuizRejected(quiz("true_false", "true", null),
+                "ANSWER_TYPE", "quizQuestions[0].answer.value", null, null);
+        assertQuizRejected(quiz("multiple_choice", true, List.of("A", "B", "C", "D")),
+                "ANSWER_TYPE", "quizQuestions[0].answer.value", null, null);
+        assertQuizRejected(quiz("multiple_choice", 4, List.of("A", "B", "C", "D")),
+                "ANSWER_RANGE", "quizQuestions[0].answer.value", 3, 4);
+    }
+
+    @Test
+    void keepsSourceReferenceFailuresDistinctAndSanitizesMalformedJson() throws Exception {
+        assertThatThrownBy(() -> validator.parse(quizWithSourceIds(json.createArrayNode().add(7)),
+                compiledInput(), GenerationModelPort.Artifact.QUIZ))
+                .isInstanceOf(JobHandler.JobExecutionException.class)
+                .satisfies(failure -> {
+                    JobHandler.JobExecutionException exception = (JobHandler.JobExecutionException) failure;
+                    assertThat(exception.code()).isEqualTo("INVALID_SOURCE_REFERENCES");
+                    assertThat(exception.validationDetails().rule()).isEqualTo("SOURCE_IDS_TEXT");
+                    assertThat(exception.validationDetails().path())
+                            .isEqualTo("quizQuestions[0].question.sourceIds[0]");
+                });
+
+        assertThatThrownBy(() -> validator.parse(quizWithSourceIds(json.createArrayNode().add("stale")),
+                compiledInput(), GenerationModelPort.Artifact.QUIZ))
+                .isInstanceOf(JobHandler.JobExecutionException.class)
+                .satisfies(failure -> {
+                    JobHandler.JobExecutionException exception = (JobHandler.JobExecutionException) failure;
+                    assertThat(exception.code()).isEqualTo("INVALID_SOURCE_REFERENCES");
+                    assertThat(exception.validationDetails().rule()).isEqualTo("SOURCE_ID_UNKNOWN");
+                    assertThat(exception.validationDetails().path())
+                            .isEqualTo("quizQuestions[0].question.sourceIds[0]");
+                });
+
+        String privateFragment = "private-answer-sentinel";
+        assertThatThrownBy(() -> validator.parse("{\"" + privateFragment + "\":",
+                compiledInput(), GenerationModelPort.Artifact.QUIZ))
+                .isInstanceOf(JobHandler.JobExecutionException.class)
+                .satisfies(failure -> {
+                    JobHandler.JobExecutionException exception = (JobHandler.JobExecutionException) failure;
+                    assertThat(exception.code()).isEqualTo("INVALID_GENERATION_OUTPUT");
+                    assertThat(exception.getMessage()).isEqualTo("Generated content was invalid.");
+                    assertThat(exception.getMessage()).doesNotContain(privateFragment);
+                    assertThat(exception.getCause()).isNull();
+                    assertThat(exception.validationDetails().rule()).isEqualTo("JSON_SYNTAX");
+                    assertThat(exception.validationDetails().path()).isEqualTo("$");
+                });
+    }
+
     private void assertInvalidGenerationOutput(JsonNode raw) throws Exception {
         assertInvalidGenerationOutput(raw.toString());
     }
@@ -180,6 +259,69 @@ class GenerationOutputValidatorTest {
                 .isInstanceOf(JobHandler.JobExecutionException.class)
                 .satisfies(failure -> assertThat(((JobHandler.JobExecutionException) failure).code())
                         .isEqualTo("INVALID_SOURCE_REFERENCES"));
+    }
+
+    private void assertQuizRejected(String raw, String rule, String path,
+                                    Integer expectedCount, Integer actualCount) throws Exception {
+        assertThatThrownBy(() -> validator.parse(raw, compiledInput(), GenerationModelPort.Artifact.QUIZ))
+                .isInstanceOf(JobHandler.JobExecutionException.class)
+                .satisfies(failure -> {
+                    JobHandler.JobExecutionException exception = (JobHandler.JobExecutionException) failure;
+                    assertThat(exception.code()).isEqualTo("INVALID_GENERATION_OUTPUT");
+                    assertThat(exception.getMessage()).isEqualTo("Generated content was invalid.");
+                    assertThat(exception.validationDetails().rule()).isEqualTo(rule);
+                    assertThat(exception.validationDetails().path()).isEqualTo(path);
+                    assertThat(exception.validationDetails().expectedCount()).isEqualTo(expectedCount);
+                    assertThat(exception.validationDetails().actualCount()).isEqualTo(actualCount);
+                });
+    }
+
+    private String quiz(String type, Object answer, List<String> options) throws Exception {
+        ObjectNode root = json.createObjectNode();
+        addQuizQuestion(root.putArray("quizQuestions"), type, answer, options);
+        return json.writeValueAsString(root);
+    }
+
+    private String quizWithQuestionText(String text) throws Exception {
+        ObjectNode root = json.createObjectNode();
+        addQuizQuestion(root.putArray("quizQuestions"), "true_false", true, null)
+                .withObject("question").put("text", text);
+        return json.writeValueAsString(root);
+    }
+
+    private String quizWithoutAnswer() throws Exception {
+        ObjectNode root = json.createObjectNode();
+        addQuizQuestion(root.putArray("quizQuestions"), "true_false", true, null).remove("answer");
+        return json.writeValueAsString(root);
+    }
+
+    private String quizWithoutAnswerValue() throws Exception {
+        ObjectNode root = json.createObjectNode();
+        addQuizQuestion(root.putArray("quizQuestions"), "true_false", true, null)
+                .withObject("answer").remove("value");
+        return json.writeValueAsString(root);
+    }
+
+    private String quizWithSourceIds(JsonNode sourceIds) throws Exception {
+        ObjectNode root = json.createObjectNode();
+        addQuizQuestion(root.putArray("quizQuestions"), "true_false", true, null)
+                .withObject("question").set("sourceIds", sourceIds);
+        return json.writeValueAsString(root);
+    }
+
+    private ObjectNode addQuizQuestion(ArrayNode questions, String type, Object answer, List<String> options) {
+        ObjectNode item = questions.addObject().put("type", type);
+        ObjectNode question = item.putObject("question").put("text", "질문");
+        question.putArray("sourceIds").add("s1");
+        if (options != null) question.set("options", json.valueToTree(options));
+        item.putObject("answer").set("value", json.valueToTree(answer));
+        item.withObject("answer").putArray("sourceIds").add("s1");
+        item.putObject("explanation").put("text", "설명").putArray("sourceIds").add("s1");
+        return item;
+    }
+
+    private GenerationInputCompiler.CompiledInput compiledInput() {
+        return compiler.compile(snapshot(json.createObjectNode().put("sourceType", "pdf")));
     }
 
     private ObjectNode mindmapAtLimits() {

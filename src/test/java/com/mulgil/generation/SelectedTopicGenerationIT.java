@@ -7,6 +7,8 @@ import com.mulgil.common.config.MulgilProperties;
 import com.mulgil.job.JobHandler;
 import com.mulgil.job.JobQueue;
 import com.mulgil.resource.ResourceObjectDeletionScheduler;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,6 +22,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.slf4j.LoggerFactory;
 
 import java.sql.Timestamp;
 import java.net.URI;
@@ -143,7 +146,7 @@ class SelectedTopicGenerationIT {
         assertThat(json.readTree(result.body()).path("result").path("selectedCount").asInt()).isEqualTo(2);
         assertThat(result.body()).doesNotContain(query, "chunk 1", "rawJson", "payload_object_key");
         assertThat(model.generationCalls).isOne();
-        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
+        assertThat(model.lastResponseSchema).isEqualTo(GenerationScheduler.PROMPT_VERSION);
         assertThat(embeddings.calls).isOne();
     }
 
@@ -219,6 +222,42 @@ class SelectedTopicGenerationIT {
         assertThat(json.writeValueAsString(selectedTopics.result(owner, jobId)))
                 .doesNotContain(query, chunk);
         assertNoPersistedPayload(query, chunk);
+    }
+
+    @Test
+    void logsSelectedTopicValidationDiagnosticsOnce_withoutGeneratedContent() {
+        model.valid = false;
+        UUID jobId = selectedTopics.enqueue(owner, session, request("private selected-topic query")).jobId();
+        JobQueue.ClaimedJob claimed = jobs.claim("selected-topic-validation-log-it", Set.of("target_generate"));
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                LoggerFactory.getLogger(GenerationJobHandler.class);
+        ListAppender<ILoggingEvent> events = new ListAppender<>();
+        events.start();
+        logger.addAppender(events);
+        try {
+            assertThatThrownBy(() -> jobs.run(claimed, targetHandler()))
+                    .isInstanceOf(JobHandler.JobExecutionException.class)
+                    .satisfies(failure -> {
+                        JobHandler.JobExecutionException rejection = (JobHandler.JobExecutionException) failure;
+                        assertThat(rejection.code()).isEqualTo("INVALID_SOURCE_REFERENCES");
+                        assertThat(rejection.validationDetails().rule()).isEqualTo("SOURCE_IDS_REQUIRED");
+                        assertThat(rejection.validationDetails().path()).isEqualTo("$.sourceIds");
+                    });
+        } finally {
+            logger.detachAppender(events);
+            events.stop();
+        }
+
+        assertThat(events.list).hasSize(1);
+        ILoggingEvent event = events.list.getFirst();
+        assertThat(event.getKeyValuePairs()).extracting(pair -> pair.key).containsExactly(
+                "event", "jobId", "operation", "artifact", "errorCode", "rule", "path");
+        assertThat(event.getKeyValuePairs()).extracting(pair -> String.valueOf(pair.value)).containsExactly(
+                "generation.output.rejected", jobId.toString(), "target_generate", "summary",
+                "INVALID_SOURCE_REFERENCES", "SOURCE_IDS_REQUIRED", "$.sourceIds");
+        assertThat(event.getThrowableProxy()).isNull();
+        assertThat(event.getFormattedMessage() + event.getKeyValuePairs())
+                .doesNotContain("private selected-topic query", "chunk 1");
     }
 
     @Test
@@ -525,11 +564,11 @@ class SelectedTopicGenerationIT {
         assertThat(model.benchmarkModel).isEqualTo("gemini-candidate");
         assertThat(model.benchmarkCalls).isOne();
         assertThat(model.generationCalls).isZero();
-        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
+        assertThat(model.lastResponseSchema).isEqualTo(GenerationScheduler.PROMPT_VERSION);
         assertThat(jdbc.sql("SELECT model_id||':'||valid_output FROM generation_model_benchmarks")
                 .query(String.class).single()).isEqualTo("gemini-candidate:true");
         assertThat(jdbc.sql("SELECT prompt_version||':'||schema_version FROM generation_model_benchmarks")
-                .query(String.class).single()).isEqualTo("source-grounded-v3:source-grounded-v3");
+                .query(String.class).single()).isEqualTo("source-grounded-v4:source-grounded-v4");
         assertThat(jdbc.sql("SELECT count(*) FROM summaries").query(Integer.class).single()).isZero();
         assertThat(jdbc.sql("SELECT count(*) FROM mindmaps").query(Integer.class).single()).isZero();
         assertThat(jdbc.sql("SELECT count(*) FROM quiz_questions").query(Integer.class).single()).isZero();

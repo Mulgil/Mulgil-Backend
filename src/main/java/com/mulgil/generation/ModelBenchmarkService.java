@@ -92,10 +92,12 @@ final class ModelBenchmarkService {
                 INSERT INTO generation_model_benchmarks
                     (id,owner_id,model_id,artifact,prompt_version,schema_version,source_hash,
                      prompt_token_count,candidate_token_count,total_token_count,cached_content_token_count,
-                     first_response_latency_ms,provider_latency_ms,valid_output,failure_code,
+                     thoughts_token_count,finish_reason,first_response_latency_ms,
+                     provider_latency_ms,valid_output,failure_code,
                      retention_expires_at,created_at)
                 VALUES (:id,:owner,:model,:artifact,:prompt,:schema,:hash,:promptTokens,:candidateTokens,
-                        :totalTokens,:cachedTokens,:firstResponse,:latency,:valid,:failure,:expires,:now)
+                        :totalTokens,:cachedTokens,:thoughtsTokens,:finishReason,:firstResponse,
+                        :latency,:valid,:failure,:expires,:now)
                 """).param("id", UUID.randomUUID()).param("owner", snapshot.ownerId()).param("model", model)
                 .param("artifact", artifact.metricValue()).param("prompt", GenerationScheduler.PROMPT_VERSION)
                 .param("schema", CONTRACT).param("hash", snapshot.snapshotHash())
@@ -103,6 +105,8 @@ final class ModelBenchmarkService {
                 .param("candidateTokens", usage == null ? null : usage.candidateTokenCount())
                 .param("totalTokens", usage == null ? null : usage.totalTokenCount())
                 .param("cachedTokens", usage == null ? null : usage.cachedContentTokenCount())
+                .param("thoughtsTokens", usage == null ? null : usage.thoughtsTokenCount())
+                .param("finishReason", result == null ? null : result.finishReason())
                 .param("firstResponse", result == null ? null : result.firstResponseLatencyMs())
                 .param("latency", latency).param("valid", valid).param("failure", failure)
                 .param("expires", Timestamp.from(now.plusSeconds(

@@ -64,7 +64,7 @@ class ModelBenchmarkServiceTest {
                 GenerationSnapshotService.Readiness.READY);
         when(model.benchmark(any(), contains("candidate"))).thenReturn(new GenerationModelPort.GenerationResult(
                 "{\"summary\":{\"items\":[{\"text\":\"ok\",\"sourceIds\":[\"s1\"]}]}}",
-                new GenerationModelPort.GenerationUsage(2L, 3L, 5L, 0L), 1L, "STOP"));
+                new GenerationModelPort.GenerationUsage(2L, 3L, 5L, 0L, 1L), 1L, "STOP"));
         @SuppressWarnings("unchecked") ObjectProvider<GenerationModelPort> models = mock(ObjectProvider.class);
         when(models.getIfAvailable()).thenReturn(model);
         var service = new ModelBenchmarkService(jdbc, models, properties,
@@ -80,7 +80,7 @@ class ModelBenchmarkServiceTest {
         ArgumentCaptor<GenerationModelPort.GenerationRequest> requests = ArgumentCaptor.forClass(
                 GenerationModelPort.GenerationRequest.class);
         verify(model).benchmark(requests.capture(), eq("gemini-candidate"));
-        assertThat(requests.getValue().responseSchema()).isEqualTo("source-grounded-v3");
+        assertThat(requests.getValue().responseSchema()).isEqualTo(GenerationScheduler.PROMPT_VERSION);
         verify(jdbc).sql(org.mockito.ArgumentMatchers.argThat(sql ->
                 sql.contains("generation_model_approvals") && sql.contains("generation_model_benchmarks")
                         && sql.contains("valid_output")));
@@ -88,5 +88,7 @@ class ModelBenchmarkServiceTest {
         verify(jdbc, atLeast(2)).sql(statements.capture());
         assertThat(statements.getAllValues()).noneMatch(sql -> sql.matches(
                 "(?s).*\\b(INSERT|UPDATE|DELETE)\\s+(INTO\\s+)?(summaries|mindmaps|quiz_questions|generation_model_approvals)\\b.*"));
+        assertThat(statements.getAllValues()).anyMatch(sql -> sql.contains("thoughts_token_count")
+                && sql.contains("finish_reason"));
     }
 }

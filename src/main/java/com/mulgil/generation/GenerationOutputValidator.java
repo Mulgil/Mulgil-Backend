@@ -30,8 +30,13 @@ final class GenerationOutputValidator {
 
     Output parse(String raw, GenerationInputCompiler.CompiledInput input, GenerationModelPort.Artifact artifact)
             throws JobHandler.JobExecutionException {
+        JsonNode root;
         try {
-            JsonNode root = json.readTree(raw);
+            root = json.readTree(raw);
+        } catch (JsonProcessingException exception) {
+            throw invalidGenerationOutput(details("JSON_SYNTAX", "$"));
+        }
+        try {
             require(root != null && root.isObject());
             Map<String, JsonNode> citations = citations(input);
             JsonNode summary = root.path("summary");
@@ -45,9 +50,11 @@ final class GenerationOutputValidator {
             return new Output(summary, mindmap.path("nodes"), mindmap.path("edges"), questions,
                     List.copyOf(citations.values()));
         } catch (InvalidSourceReferenceException exception) {
-            throw invalidSourceReferences();
-        } catch (JsonProcessingException | IllegalArgumentException exception) {
-            throw invalidGenerationOutput();
+            throw invalidSourceReferences(exception.details);
+        } catch (ValidationException exception) {
+            throw invalidGenerationOutput(exception.details);
+        } catch (IllegalArgumentException exception) {
+            throw invalidGenerationOutput(details("STRUCTURE", "$"));
         }
     }
 
@@ -92,21 +99,46 @@ final class GenerationOutputValidator {
     }
 
     private static void validateQuestions(JsonNode questions, Map<String, JsonNode> citations) {
-        require(questions.isArray() && !questions.isEmpty());
-        questions.forEach(question -> {
+        rejectUnless(questions.isArray(), "QUESTIONS_TYPE", "quizQuestions");
+        rejectUnless(!questions.isEmpty(), "QUESTIONS_COUNT", "quizQuestions", 1, questions.size());
+        for (int index = 0; index < questions.size(); index++) {
+            JsonNode question = questions.get(index);
+            String base = "quizQuestions[" + index + "]";
+            rejectUnless(question.isObject(), "QUESTION_OBJECT", base);
             String type = question.path("type").asText();
-            require(type.equals("true_false") || type.equals("multiple_choice"));
+            rejectUnless(type.equals("true_false") || type.equals("multiple_choice"),
+                    "QUESTION_TYPE", base + ".type");
             JsonNode prompt = question.path("question");
-            require(nonblank(prompt, "text"));
-            resolveRefs(prompt, citations);
+            rejectUnless(nonblank(prompt, "text"), "TEXT_NONBLANK", base + ".question.text");
+            resolveRefs(prompt, citations, Integer.MAX_VALUE, base + ".question");
+            if (type.equals("multiple_choice")) {
+                JsonNode options = prompt.path("options");
+                rejectUnless(options.isArray(), "OPTIONS_COUNT", base + ".question.options", 4, 0);
+                rejectUnless(options.size() == 4, "OPTIONS_COUNT", base + ".question.options", 4,
+                        options.size());
+                for (int option = 0; option < options.size(); option++) {
+                    rejectUnless(options.get(option).isTextual() && !options.get(option).asText().isBlank(),
+                            "OPTION_NONBLANK", base + ".question.options[" + option + "]");
+                }
+            }
             JsonNode answer = question.path("answer");
-            require(answer.hasNonNull("value"));
-            resolveRefs(answer, citations);
+            rejectUnless(answer.isObject(), "ANSWER_REQUIRED", base + ".answer");
+            rejectUnless(answer.hasNonNull("value"), "ANSWER_VALUE_REQUIRED", base + ".answer.value");
+            JsonNode value = answer.path("value");
+            if (type.equals("true_false")) {
+                rejectUnless(value.isBoolean(), "ANSWER_TYPE", base + ".answer.value");
+            } else {
+                rejectUnless(value.isIntegralNumber() && value.canConvertToInt(),
+                        "ANSWER_TYPE", base + ".answer.value");
+                rejectUnless(value.intValue() >= 0 && value.intValue() <= 3,
+                        "ANSWER_RANGE", base + ".answer.value", 3, value.intValue());
+            }
+            resolveRefs(answer, citations, Integer.MAX_VALUE, base + ".answer");
             JsonNode explanation = question.path("explanation");
-            require(nonblank(explanation, "text"));
-            resolveRefs(explanation, citations);
-            if (type.equals("multiple_choice")) require(prompt.path("options").size() == 4);
-        });
+            rejectUnless(nonblank(explanation, "text"),
+                    "TEXT_NONBLANK", base + ".explanation.text");
+            resolveRefs(explanation, citations, Integer.MAX_VALUE, base + ".explanation");
+        }
     }
 
     private static void resolveRefs(JsonNode node, Map<String, JsonNode> citations) {
@@ -114,18 +146,29 @@ final class GenerationOutputValidator {
     }
 
     private static void resolveRefs(JsonNode node, Map<String, JsonNode> citations, int maxSourceIds) {
-        require(node.isObject());
+        resolveRefs(node, citations, maxSourceIds, "$");
+    }
+
+    private static void resolveRefs(JsonNode node, Map<String, JsonNode> citations,
+                                    int maxSourceIds, String path) {
+        if (!node.isObject()) throw new InvalidSourceReferenceException(
+                details("SOURCE_OBJECT", path));
         ObjectNode grounded = (ObjectNode) node;
         JsonNode sourceIds = grounded.path("sourceIds");
-        if (!sourceIds.isArray() || sourceIds.isEmpty()) throw new InvalidSourceReferenceException();
+        if (!sourceIds.isArray() || sourceIds.isEmpty()) throw new InvalidSourceReferenceException(
+                details("SOURCE_IDS_REQUIRED", path + ".sourceIds"));
         require(sourceIds.size() <= maxSourceIds);
         ArrayNode sourceRefs = grounded.putArray("sourceRefs");
-        sourceIds.forEach(sourceId -> {
-            require(sourceId.isTextual());
+        for (int index = 0; index < sourceIds.size(); index++) {
+            JsonNode sourceId = sourceIds.get(index);
+            String sourcePath = path + ".sourceIds[" + index + "]";
+            if (!sourceId.isTextual()) throw new InvalidSourceReferenceException(
+                    details("SOURCE_IDS_TEXT", sourcePath));
             JsonNode sourceReference = citations.get(sourceId.asText());
-            if (sourceReference == null) throw new InvalidSourceReferenceException();
+            if (sourceReference == null) throw new InvalidSourceReferenceException(
+                    details("SOURCE_ID_UNKNOWN", sourcePath));
             sourceRefs.add(sourceReference.deepCopy());
-        });
+        }
         grounded.remove("sourceIds");
     }
 
@@ -141,20 +184,52 @@ final class GenerationOutputValidator {
     }
 
     private static void require(boolean condition) {
-        if (!condition) throw new IllegalArgumentException("Invalid grounded generation output.");
+        rejectUnless(condition, "STRUCTURE", "$");
     }
 
-    private static JobHandler.JobExecutionException invalidSourceReferences() {
+    private static void rejectUnless(boolean condition, String rule, String path) {
+        rejectUnless(condition, rule, path, null, null);
+    }
+
+    private static void rejectUnless(boolean condition, String rule, String path,
+                                     Integer expectedCount, Integer actualCount) {
+        if (!condition) throw new ValidationException(details(rule, path, expectedCount, actualCount));
+    }
+
+    private static JobHandler.ValidationDetails details(String rule, String path) {
+        return details(rule, path, null, null);
+    }
+
+    private static JobHandler.ValidationDetails details(String rule, String path,
+                                                        Integer expectedCount, Integer actualCount) {
+        return new JobHandler.ValidationDetails(rule, path, expectedCount, actualCount);
+    }
+
+    private static JobHandler.JobExecutionException invalidSourceReferences(JobHandler.ValidationDetails details) {
         return new JobHandler.JobExecutionException("INVALID_SOURCE_REFERENCES",
-                "Generated content did not resolve to the current source snapshot.", false);
+                "Generated content did not resolve to the current source snapshot.", false, details);
     }
 
-    private static JobHandler.JobExecutionException invalidGenerationOutput() {
+    private static JobHandler.JobExecutionException invalidGenerationOutput(JobHandler.ValidationDetails details) {
         return new JobHandler.JobExecutionException("INVALID_GENERATION_OUTPUT",
-                "Generated content was invalid.", false);
+                "Generated content was invalid.", false, details);
     }
 
-    private static final class InvalidSourceReferenceException extends IllegalArgumentException {}
+    private static final class ValidationException extends IllegalArgumentException {
+        private final JobHandler.ValidationDetails details;
+
+        private ValidationException(JobHandler.ValidationDetails details) {
+            this.details = details;
+        }
+    }
+
+    private static final class InvalidSourceReferenceException extends IllegalArgumentException {
+        private final JobHandler.ValidationDetails details;
+
+        private InvalidSourceReferenceException(JobHandler.ValidationDetails details) {
+            this.details = details;
+        }
+    }
 
     record Output(JsonNode summary, JsonNode mindmapNodes, JsonNode mindmapEdges,
                   JsonNode questions, List<JsonNode> sourceReferences) {}

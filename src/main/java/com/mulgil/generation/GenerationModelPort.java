@@ -1,6 +1,7 @@
 package com.mulgil.generation;
 
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 public interface GenerationModelPort {
@@ -52,12 +53,18 @@ public interface GenerationModelPort {
     }
 
     record GenerationUsage(Long promptTokenCount, Long candidateTokenCount, Long totalTokenCount,
-                           Long cachedContentTokenCount) {
+                           Long cachedContentTokenCount, Long thoughtsTokenCount) {
+        public GenerationUsage(Long promptTokenCount, Long candidateTokenCount, Long totalTokenCount,
+                               Long cachedContentTokenCount) {
+            this(promptTokenCount, candidateTokenCount, totalTokenCount, cachedContentTokenCount, null);
+        }
+
         public GenerationUsage {
             requireNonNegative(promptTokenCount);
             requireNonNegative(candidateTokenCount);
             requireNonNegative(totalTokenCount);
             requireNonNegative(cachedContentTokenCount);
+            requireNonNegative(thoughtsTokenCount);
         }
 
         private static void requireNonNegative(Long value) {
@@ -67,6 +74,11 @@ public interface GenerationModelPort {
 
     record GenerationResult(String rawJson, GenerationUsage usage, Long firstResponseLatencyMs,
                             String finishReason, String contextCacheStatus, Long contextCacheTokenCount) {
+        private static final Set<String> FINISH_REASONS = Set.of(
+                "FINISH_REASON_UNSPECIFIED", "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER",
+                "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "MODEL_ARMOR",
+                "UNRECOGNIZED");
+
         public GenerationResult(String rawJson, GenerationUsage usage, Long firstResponseLatencyMs,
                                 String finishReason) {
             this(rawJson, usage, firstResponseLatencyMs, finishReason, null, null);
@@ -75,6 +87,9 @@ public interface GenerationModelPort {
         public GenerationResult {
             Objects.requireNonNull(rawJson);
             Objects.requireNonNull(finishReason);
+            if (!FINISH_REASONS.contains(finishReason)) {
+                throw new IllegalArgumentException("Finish reason must be a supported provider enum value.");
+            }
             if (firstResponseLatencyMs != null && firstResponseLatencyMs < 0) {
                 throw new IllegalArgumentException("First response latency must not be negative.");
             }

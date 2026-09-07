@@ -1,6 +1,7 @@
 package com.mulgil.common.config;
 
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Max;
@@ -70,12 +71,18 @@ public record MulgilProperties(
             @Min(1) @Max(1) int candidateCount,
             @Min(1) @Max(65535) int summaryMaxOutputTokens,
             @Min(1) @Max(65535) int mindmapMaxOutputTokens,
+            @Min(0) @Max(24576) int mindmapThinkingBudget,
             @Min(1) @Max(65535) int quizMaxOutputTokens,
             @Min(1) @Max(600) long totalTimeoutSeconds,
             @Min(1) int inputSoftTokenLimit,
             boolean contextCacheEnabled,
             @Min(60) long contextCacheTtlSeconds
-    ) {}
+    ) {
+        @AssertTrue(message = "mindmap thinking budget must be less than mindmap max output tokens")
+        public boolean isMindmapThinkingBudgetBelowOutputLimit() {
+            return mindmapThinkingBudget < mindmapMaxOutputTokens;
+        }
+    }
 
     public record ModelBenchmark(
             boolean enabled,
