@@ -172,6 +172,7 @@ public final class AiProviderUsageLedger {
                     unit_count=:units,estimated_cost_microusd=:cost,
                     prompt_token_count=:promptTokens,candidate_token_count=:candidateTokens,
                     total_token_count=:totalTokens,cached_content_token_count=:cachedTokens,
+                    thoughts_token_count=:thoughtsTokens,finish_reason=:finishReason,
                     context_cache_status=:cacheStatus,context_cache_token_count=:cacheTokenCount,
                     first_response_latency_ms=:firstResponse,
                     latency_ms=GREATEST(0,CAST(EXTRACT(EPOCH FROM (:now-started_at))*1000 AS bigint)),
@@ -184,6 +185,8 @@ public final class AiProviderUsageLedger {
                 .param("candidateTokens", metadata == null ? null : metadata.candidateTokenCount())
                 .param("totalTokens", metadata == null ? null : metadata.totalTokenCount())
                 .param("cachedTokens", metadata == null ? null : metadata.cachedContentTokenCount())
+                .param("thoughtsTokens", metadata == null ? null : metadata.thoughtsTokenCount())
+                .param("finishReason", result == null ? null : result.finishReason())
                 .param("cacheStatus", result == null ? null : result.contextCacheStatus())
                 .param("cacheTokenCount", result == null ? null : result.contextCacheTokenCount())
                 .param("firstResponse", result == null ? null : result.firstResponseLatencyMs())

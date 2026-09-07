@@ -95,7 +95,7 @@ class GenerationContextCacheLifecycleTest {
                         "gemini-pro", "us-central1"),
                 lifecycle.prepare(request(OWNER, "a".repeat(64), "source-grounded-v2"),
                         "gemini", "europe-west4"),
-                lifecycle.prepare(request(OWNER, "a".repeat(64), "source-grounded-v3"),
+                lifecycle.prepare(request(OWNER, "a".repeat(64), GenerationScheduler.PROMPT_VERSION),
                         "gemini", "us-central1"));
 
         assertThat(mismatches).extracting(GenerationContextCacheLifecycle.Prepared::status)

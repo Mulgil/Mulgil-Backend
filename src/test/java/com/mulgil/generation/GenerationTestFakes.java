@@ -120,6 +120,8 @@ final class FakeGenerationModel implements GenerationModelPort {
     volatile String outputText;
     volatile String outputFieldName;
     volatile JsonNode outputScalar;
+    volatile boolean includeMultipleChoice;
+    volatile int multipleChoiceOptions = 4;
 
     FakeGenerationModel(ObjectMapper json) {
         this.json = json;
@@ -157,13 +159,26 @@ final class FakeGenerationModel implements GenerationModelPort {
                     root.withObject("mindmap").putArray("edges");
                 }
                 case QUIZ -> {
-                    var question = root.putArray("quizQuestions").addObject();
+                    var questions = root.putArray("quizQuestions");
+                    var question = questions.addObject();
                     question.put("type", "true_false");
                     question.putObject("question").put("text", "Grounded question")
                             .set("sourceIds", sourceIds.deepCopy());
                     question.putObject("answer").put("value", true).set("sourceIds", sourceIds.deepCopy());
                     question.putObject("explanation").put("text", "Grounded explanation")
                             .set("sourceIds", sourceIds.deepCopy());
+                    if (includeMultipleChoice) {
+                        var choice = questions.addObject().put("type", "multiple_choice");
+                        var options = choice.putObject("question").put("text", "Grounded choice")
+                                .putArray("options");
+                        for (int index = 0; index < multipleChoiceOptions; index++) {
+                            options.add(String.valueOf((char) ('A' + index)));
+                        }
+                        choice.withObject("question").set("sourceIds", sourceIds.deepCopy());
+                        choice.putObject("answer").put("value", 2).set("sourceIds", sourceIds.deepCopy());
+                        choice.putObject("explanation").put("text", "Grounded choice explanation")
+                                .set("sourceIds", sourceIds.deepCopy());
+                    }
                 }
             }
             if (providerPayloadMarker != null) root.put("providerPayload", providerPayloadMarker);

@@ -59,7 +59,7 @@ class FlywaySchemaIT {
     }
 
     @Test
-    void appliesV001ThroughV021_whenDatabaseIsFresh() {
+    void appliesV001ThroughV022_whenDatabaseIsFresh() {
         List<String> versions = jdbc.sql("SELECT version FROM flyway_schema_history ORDER BY installed_rank")
                 .query(String.class).list();
         Integer requiredTables = jdbc.sql("""
@@ -129,7 +129,7 @@ class FlywaySchemaIT {
                             'ai_jobs_cache_fingerprint_default')
                         """).query(Integer.class).single();
 
-        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015", "016", "017", "018", "019", "020", "021");
+        assertThat(versions).containsExactly("001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015", "016", "017", "018", "019", "020", "021", "022");
         assertThat(requiredTables).isEqualTo(24);
         assertThat(requiredIndexes).hasSize(14);
         assertThat(jobColumns).isEqualTo(7);
@@ -318,6 +318,74 @@ class FlywaySchemaIT {
         assertThat(upgrade.sql("SELECT count(*) FROM information_schema.tables "
                 + "WHERE table_schema=:schema AND table_name='selected_topic_generations'")
                 .param("schema", schema).query(Integer.class).single()).isOne();
+    }
+
+    @Test
+    void addsV022UsageMetadataWithoutChangingExistingRowsOrOldAppSql() {
+        String schema = "generation_usage_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+        String url = POSTGRES.getJdbcUrl() + "&currentSchema=" + schema + ",public";
+        Flyway throughV021 = Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).target(MigrationVersion.fromVersion("021")).load();
+        throughV021.migrate();
+        JdbcClient upgrade = JdbcClient.create(new DriverManagerDataSource(
+                url, POSTGRES.getUsername(), POSTGRES.getPassword()));
+        SchemaFixture oldFixture = new SchemaFixture(upgrade);
+        UUID usageId = UUID.randomUUID();
+        UUID benchmarkId = UUID.randomUUID();
+        upgrade.sql("""
+                INSERT INTO ai_provider_usage
+                    (id,owner_id,operation,provider,model_id,status,unit_type,unit_count,started_at)
+                VALUES (:id,:owner,'vertex.generate','vertex','model','started','unicode_code_point',1,now())
+                """).param("id", usageId).param("owner", oldFixture.ownerId()).update();
+        upgrade.sql("""
+                INSERT INTO generation_model_benchmarks
+                    (id,owner_id,model_id,artifact,prompt_version,schema_version,source_hash,
+                     provider_latency_ms,valid_output,retention_expires_at,created_at)
+                VALUES (:id,:owner,'model','mindmap','v3','v3',:hash,1,false,now()+interval '1 day',now())
+                """).param("id", benchmarkId).param("owner", oldFixture.ownerId())
+                .param("hash", "d".repeat(64)).update();
+
+        Flyway.configure().dataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword())
+                .schemas(schema).defaultSchema(schema).load().migrate();
+
+        assertThat(upgrade.sql("""
+                SELECT count(*) FROM ai_provider_usage
+                WHERE id=:id AND thoughts_token_count IS NULL AND finish_reason IS NULL
+                """).param("id", usageId).query(Integer.class).single()).isOne();
+        assertThat(upgrade.sql("""
+                SELECT count(*) FROM generation_model_benchmarks
+                WHERE id=:id AND thoughts_token_count IS NULL AND finish_reason IS NULL
+                """).param("id", benchmarkId).query(Integer.class).single()).isOne();
+        UUID oldSqlId = UUID.randomUUID();
+        upgrade.sql("""
+                INSERT INTO ai_provider_usage
+                    (id,owner_id,operation,provider,model_id,status,unit_type,unit_count,started_at)
+                VALUES (:id,:owner,'vertex.generate','vertex','model','started','unicode_code_point',1,now())
+                """).param("id", oldSqlId).param("owner", oldFixture.ownerId()).update();
+        upgrade.sql("""
+                UPDATE ai_provider_usage SET thoughts_token_count=0,finish_reason='STOP' WHERE id=:id
+                """).param("id", usageId).update();
+        upgrade.sql("""
+                UPDATE generation_model_benchmarks
+                SET thoughts_token_count=7861,finish_reason='MAX_TOKENS' WHERE id=:id
+                """).param("id", benchmarkId).update();
+        assertThatThrownBy(() -> upgrade.sql(
+                "UPDATE ai_provider_usage SET thoughts_token_count=-1 WHERE id=:id")
+                .param("id", usageId).update()).isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> upgrade.sql(
+                "UPDATE generation_model_benchmarks SET thoughts_token_count=-1 WHERE id=:id")
+                .param("id", benchmarkId).update()).isInstanceOf(DataIntegrityViolationException.class);
+        String values = upgrade.sql("""
+                SELECT usage.thoughts_token_count||':'||usage.finish_reason||':'
+                    ||benchmark.thoughts_token_count||':'||benchmark.finish_reason
+                FROM ai_provider_usage usage CROSS JOIN generation_model_benchmarks benchmark
+                WHERE usage.id=:usage AND benchmark.id=:benchmark
+                """).param("usage", usageId).param("benchmark", benchmarkId).query(String.class).single();
+        assertThat(values).isEqualTo("0:STOP:7861:MAX_TOKENS");
+        assertThat(upgrade.sql("SELECT count(*) FROM ai_provider_usage WHERE id=:id")
+                .param("id", oldSqlId).query(Integer.class).single()).isOne();
+        System.out.printf("USAGE_METADATA_DB values=%s existingRows=preserved oldAppSql=accepted "
+                + "negativeCounts=rejected rollback=no-down-migration result=PASS%n", values);
     }
 
     @Test

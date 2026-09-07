@@ -41,6 +41,8 @@ public class JobQueue {
     private static final Set<String> REPLAY_SAFE_TERMINAL_TYPES = Set.of(
             "preview_mindmap_generate", "review_mindmap_generate",
             "preview_quiz_generate", "review_quiz_generate");
+    private static final Set<String> INVALID_OUTPUT_RETRYABLE_QUIZ_TYPES = Set.of(
+            "preview_quiz_generate", "review_quiz_generate", "exam_quiz_generate");
 
     private final JdbcClient jdbc;
     private final MulgilProperties properties;
@@ -364,21 +366,34 @@ public class JobQueue {
                 .param("workerId", claimed.claimedBy()).update();
     }
 
+    @Transactional
     public AiJob retry(UUID ownerId, UUID jobId) {
-        AiJob result = jdbc.sql("""
-                        UPDATE ai_jobs job SET status = 'queued', error_code = NULL, error_message = NULL,
-                            finished_at = NULL, progress_stage = NULL, progress_updated_at = NULL
-                        FROM courses course
-                        WHERE job.owner_id = :ownerId AND job.id = :id AND job.status = 'failed'
-                          AND job.attempt_count < job.max_attempts AND job.error_code IN (:errors)
-                          AND course.id=job.course_id AND course.owner_id=job.owner_id
-                          AND course.deleted_at IS NULL
-                        RETURNING job.*
-                        """).param("ownerId", ownerId).param("id", jobId).param("errors", RETRYABLE_ERRORS)
-                .query((row, ignored) -> job(row)).optional().orElse(null);
-        if (result != null) return result;
-        if (find(ownerId, jobId) == null) throw notFound();
-        throw new ApiException(HttpStatus.CONFLICT, "JOB_NOT_RETRYABLE", "Job is not retryable.");
+        AiJob job = jdbc.sql("""
+                        SELECT job.* FROM ai_jobs job
+                        JOIN courses course ON course.id=job.course_id AND course.owner_id=job.owner_id
+                        WHERE job.owner_id=:owner AND job.id=:id AND course.deleted_at IS NULL
+                        FOR UPDATE OF job
+                        """)
+                .param("owner", ownerId).param("id", jobId)
+                .query((row, ignored) -> job(row)).optional().orElseThrow(JobQueue::notFound);
+        if (!job.status().equals("failed") || job.attemptCount() >= job.maxAttempts()) {
+            throw new ApiException(HttpStatus.CONFLICT, "JOB_NOT_RETRYABLE", "Job is not retryable.");
+        }
+        boolean invalidQuizOutput = "INVALID_GENERATION_OUTPUT".equals(job.errorCode())
+                && INVALID_OUTPUT_RETRYABLE_QUIZ_TYPES.contains(job.type());
+        if (!invalidQuizOutput
+                && (job.errorCode() == null || !RETRYABLE_ERRORS.contains(job.errorCode()))) {
+            throw new ApiException(HttpStatus.CONFLICT, "JOB_NOT_RETRYABLE", "Job is not retryable.");
+        }
+        if (invalidQuizOutput && !sourceIsCurrent(job)) {
+            throw new ApiException(HttpStatus.CONFLICT, "STALE_INPUT", "Job input is outdated.");
+        }
+        return jdbc.sql("""
+                        UPDATE ai_jobs SET status='queued', error_code=NULL, error_message=NULL,
+                            finished_at=NULL, progress_stage=NULL, progress_updated_at=NULL
+                        WHERE id=:id AND status='failed'
+                        RETURNING *
+                        """).param("id", job.id()).query((row, ignored) -> job(row)).single();
     }
 
     public AiJob get(UUID ownerId, UUID jobId) {

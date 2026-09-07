@@ -90,6 +90,7 @@ class GenerationWorkflowIT {
 
     @BeforeEach
     void seed() throws Exception {
+        jdbc.sql("TRUNCATE quiz_attempts").update();
         jdbc.sql("DELETE FROM users").update();
         model.valid = true;
         model.lastPromptUnits = 0;
@@ -103,6 +104,8 @@ class GenerationWorkflowIT {
         model.failureResult = null;
         model.countTokensFailureCode = null;
         model.outputText = null;
+        model.includeMultipleChoice = false;
+        model.multipleChoiceOptions = 4;
         token = login("generation-owner-" + UUID.randomUUID());
         owner = jdbc.sql("SELECT id FROM users").query(UUID.class).single();
         course = UUID.fromString(ok(send("POST", "/api/v1/courses", Map.of("name", "Generation")), 201)
@@ -166,7 +169,7 @@ class GenerationWorkflowIT {
                         """).query(UUID.class).single();
         runOne("review_generate");
         assertThat(jobs.get(owner, parentJob).status()).isEqualTo("succeeded");
-        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
+        assertThat(model.lastResponseSchema).isEqualTo(GenerationScheduler.PROMPT_VERSION);
         UUID mindmapJob = jdbc.sql("""
                         SELECT id FROM ai_jobs
                         WHERE job_type='review_mindmap_generate' AND input_version=2
@@ -180,7 +183,7 @@ class GenerationWorkflowIT {
                         SELECT summary_type||':'||input_version||':'||prompt_version FROM summaries
                         WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
                         """).param("owner", owner).param("session", session).query(String.class).single())
-                .isEqualTo("review:2:source-grounded-v3");
+                .isEqualTo("review:2:source-grounded-v4");
 
         model.failureCode = "PROVIDER_OUTPUT_LIMIT";
         model.failureRetryable = false;
@@ -203,14 +206,14 @@ class GenerationWorkflowIT {
         assertThat(failed.status() + ":" + failed.errorCode() + ":" + failed.attemptCount())
                 .isEqualTo("failed:PROVIDER_OUTPUT_LIMIT:1");
         assertThat(failed.inputVersion()).isEqualTo(2);
-        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
+        assertThat(model.lastResponseSchema).isEqualTo(GenerationScheduler.PROMPT_VERSION);
         assertThat(jdbc.sql("SELECT error_message FROM ai_jobs WHERE id=:id").param("id", mindmapJob)
                 .query(String.class).single()).isEqualTo("Generation provider failed.");
         model.failureCode = null;
         runOne("review_quiz_generate");
         assertThat(jobs.get(owner, quizJob).status()).isEqualTo("succeeded");
         assertThat(jobs.get(owner, quizJob).inputVersion()).isEqualTo(2);
-        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
+        assertThat(model.lastResponseSchema).isEqualTo(GenerationScheduler.PROMPT_VERSION);
 
         JsonNode summary = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
         assertThat(summary.path("summary").path("inputVersion").asInt()).isEqualTo(2);
@@ -235,7 +238,7 @@ class GenerationWorkflowIT {
                         SELECT input_version||':'||prompt_version FROM quiz_questions
                         WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
                         """).param("owner", owner).param("session", session).query(String.class).single())
-                .isEqualTo("2:source-grounded-v3");
+                .isEqualTo("2:source-grounded-v4");
 
         JsonNode retry = ok(send("POST", "/api/v1/jobs/" + mindmapJob + "/retry", null), 202);
         assertThat(retry.path("id").asText()).isEqualTo(mindmapJob.toString());
@@ -243,7 +246,7 @@ class GenerationWorkflowIT {
         assertThat(retry.path("attemptCount").asInt()).isOne();
         model.outputText = "Spring HTTP 마인드맵 MAX_TOKENS 복구";
         runOne("review_mindmap_generate");
-        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
+        assertThat(model.lastResponseSchema).isEqualTo(GenerationScheduler.PROMPT_VERSION);
         assertThat(jobs.get(owner, mindmapJob).status() + ":" + jobs.get(owner, mindmapJob).inputVersion())
                 .isEqualTo("succeeded:2");
         JsonNode recovered = ok(send(
@@ -255,7 +258,7 @@ class GenerationWorkflowIT {
                         SELECT input_version||':'||prompt_version FROM mindmaps
                         WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
                         """).param("owner", owner).param("session", session).query(String.class).single())
-                .isEqualTo("2:source-grounded-v3");
+                .isEqualTo("2:source-grounded-v4");
         assertThat(jdbc.sql("""
                         SELECT artifact||':'||input_version||':'||prompt_version FROM (
                             SELECT 'summary' artifact,input_version,prompt_version FROM summaries
@@ -268,8 +271,8 @@ class GenerationWorkflowIT {
                             WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
                         ) artifacts ORDER BY artifact
                         """).param("owner", owner).param("session", session).query(String.class).list())
-                .containsExactly("mindmap:2:source-grounded-v3", "quiz:2:source-grounded-v3",
-                        "summary:2:source-grounded-v3");
+                .containsExactly("mindmap:2:source-grounded-v4", "quiz:2:source-grounded-v4",
+                        "summary:2:source-grounded-v4");
 
         assertThat(providerFailures.list).hasSize(1);
         ILoggingEvent event = providerFailures.list.getFirst();
@@ -284,7 +287,7 @@ class GenerationWorkflowIT {
         assertThat(event.getFormattedMessage() + event.getKeyValuePairs() + event.getMDCPropertyMap())
                 .doesNotContain(sourceSentinel, "PRIVATE_PROVIDER_SENTINEL_6", "Generation provider failed.");
         assertThat(output.getAll()).doesNotContain(sourceSentinel, "PRIVATE_PROVIDER_SENTINEL_6");
-        System.out.println("GENERATION_INCIDENT_QA input_version=2 contract=source-grounded-v3 "
+        System.out.println("GENERATION_INCIDENT_QA input_version=2 contract=source-grounded-v4 "
                 + "parent=succeeded mindmap=failed:PROVIDER_OUTPUT_LIMIT:MAX_TOKENS quiz=succeeded "
                 + "summary_http=200 mindmap_before_retry=null retry_http=202 same_child=true "
                 + "bounded_korean_technical_output=true private_source_absent=true result=PASS");
@@ -533,6 +536,198 @@ class GenerationWorkflowIT {
     }
 
     @Test
+    void publishesAndGradesTypedTrueFalseAndMultipleChoiceOutputs_throughHttp() throws Exception {
+        sources.addReviewNote("synthetic quiz source", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        model.includeMultipleChoice = true;
+        runOne("review_quiz_generate");
+
+        HttpResult fetched = send("GET", "/api/v1/sessions/" + session + "/quiz", null);
+        JsonNode quiz = ok(fetched, 200);
+        JsonNode trueFalse = null;
+        JsonNode multipleChoice = null;
+        for (JsonNode question : quiz) {
+            if (question.path("type").asText().equals("true_false")) trueFalse = question;
+            if (question.path("type").asText().equals("multiple_choice")) multipleChoice = question;
+        }
+        assertThat(trueFalse).isNotNull();
+        assertThat(multipleChoice).isNotNull();
+
+        HttpResult trueFalseAttempt = send("POST", "/api/v1/quiz/questions/"
+                + trueFalse.path("id").asText() + "/attempts", Map.of("answer", true));
+        HttpResult multipleChoiceAttempt = send("POST", "/api/v1/quiz/questions/"
+                + multipleChoice.path("id").asText() + "/attempts", Map.of("answer", 2));
+        JsonNode gradedTrueFalse = ok(trueFalseAttempt, 201);
+        JsonNode gradedMultipleChoice = ok(multipleChoiceAttempt, 201);
+
+        assertThat(quiz).hasSize(2);
+        assertThat(multipleChoice.path("options").toString()).isEqualTo("[\"A\",\"B\",\"C\",\"D\"]");
+        assertThat(gradedTrueFalse.path("isCorrect").asBoolean()).isTrue();
+        assertThat(gradedTrueFalse.path("answer").path("value").isBoolean()).isTrue();
+        assertThat(gradedMultipleChoice.path("isCorrect").asBoolean()).isTrue();
+        assertThat(gradedMultipleChoice.path("answer").path("value").intValue()).isEqualTo(2);
+        assertThat(jdbc.sql("SELECT jsonb_typeof(answer_json->'value') FROM quiz_questions "
+                        + "WHERE session_id=:session ORDER BY question_type")
+                .param("session", session).query(String.class).list()).containsExactly("number", "boolean");
+        System.out.println("TASK4_QUIZ_HTTP publish_status=succeeded get_status=" + fetched.status()
+                + " true_false_submit_status=" + trueFalseAttempt.status()
+                + " multiple_choice_submit_status=" + multipleChoiceAttempt.status()
+                + " grading=true,true synthetic_data=true result=PASS");
+    }
+
+    @Test
+    void retriesHistoricalV3MalformedQuizOnSameJob_thenPublishesV4AndGradesThroughHttp(CapturedOutput output)
+            throws Exception {
+        sources.addReviewNote("과거 v3 퀴즈 복구용 Spring HTTP 근거", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        JobQueue.AiJob scheduled = jdbc.sql("""
+                        SELECT id FROM ai_jobs WHERE job_type='review_quiz_generate'
+                        """).query((row, ignored) -> jobs.get(owner, row.getObject("id", UUID.class))).single();
+        jdbc.sql("DELETE FROM ai_jobs WHERE id=:id").param("id", scheduled.id()).update();
+        JobQueue.EnqueueRequest historicalRequest = new JobQueue.EnqueueRequest(
+                "review_quiz_generate", owner, course, session, null, null, null, null, null,
+                scheduled.inputVersion(), scheduled.sourceHash(), "vertex", "gemini-2.5-flash",
+                "source-grounded-v3");
+        JobQueue.AiJob historicalV3 = jobs.enqueue(historicalRequest);
+
+        model.includeMultipleChoice = true;
+        model.multipleChoiceOptions = 3;
+        runOne("review_quiz_generate");
+
+        JobQueue.AiJob failed = jobs.get(owner, historicalV3.id());
+        assertThat(failed.status() + ":" + failed.errorCode() + ":" + failed.attemptCount())
+                .isEqualTo("failed:INVALID_GENERATION_OUTPUT:1");
+        assertThat(failed.id()).isEqualTo(historicalV3.id());
+        assertThat(failed.inputVersion()).isEqualTo(historicalV3.inputVersion());
+        assertThat(model.lastResponseSchema).isEqualTo(GenerationScheduler.PROMPT_VERSION);
+        assertThat(output.getAll()).contains("event=\"generation.output.rejected\"", "rule=\"OPTIONS_COUNT\"",
+                "path=\"quizQuestions[1].question.options\"", "expectedCount=\"4\"", "actualCount=\"3\"")
+                .doesNotContain("과거 v3 퀴즈 복구용");
+        JobQueue.AiJob duplicateEnqueue = jobs.enqueue(historicalRequest);
+        assertThat(duplicateEnqueue.id()).isEqualTo(historicalV3.id());
+        assertThat(duplicateEnqueue.status() + ":" + duplicateEnqueue.errorCode())
+                .isEqualTo("failed:INVALID_GENERATION_OUTPUT");
+
+        JsonNode retried = ok(send("POST", "/api/v1/jobs/" + historicalV3.id() + "/retry", null), 202);
+        assertThat(retried.path("id").asText()).isEqualTo(historicalV3.id().toString());
+        assertThat(retried.path("inputVersion").asInt()).isEqualTo(historicalV3.inputVersion());
+        error(send("POST", "/api/v1/jobs/" + historicalV3.id() + "/retry", null),
+                409, "JOB_NOT_RETRYABLE");
+
+        model.multipleChoiceOptions = 4;
+        runOne("review_quiz_generate");
+        JsonNode quiz = ok(send("GET", "/api/v1/sessions/" + session + "/quiz", null), 200);
+        JsonNode choice = null;
+        for (JsonNode question : quiz) {
+            if (question.path("type").asText().equals("multiple_choice")) choice = question;
+        }
+        assertThat(choice).isNotNull();
+        JsonNode grade = ok(send("POST", "/api/v1/quiz/questions/" + choice.path("id").asText()
+                + "/attempts", Map.of("answer", 2)), 201);
+        assertThat(grade.path("isCorrect").asBoolean()).isTrue();
+        assertThat(jdbc.sql("""
+                        SELECT input_version||':'||prompt_version FROM quiz_questions
+                        WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
+                        ORDER BY created_at DESC LIMIT 1
+                        """).param("owner", owner).param("session", session).query(String.class).single())
+                .isEqualTo(historicalV3.inputVersion() + ":source-grounded-v4");
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE id=:id")
+                .param("id", historicalV3.id()).query(Integer.class).single()).isOne();
+        System.out.println("TASK6_QUIZ_RECOVERY old_contract=v3 retry_http=202 duplicate_retry_http=409 "
+                + "same_job=true same_input_version=true duplicate_enqueue_requeued=false "
+                + "request_contract=v4 persisted_contract=v4 "
+                + "quiz_get_http=200 grade_http=201 correct=true cache_fingerprint_edited=false result=PASS");
+    }
+
+    @Test
+    void acceptsExplicitInvalidOutputRetryForAllQuizTypes_withOneConcurrentWinner() throws Exception {
+        sources.addPreviewMaterial("preview quiz retry source");
+        runOne("chunk_embed");
+        runOne("preview_generate");
+        UUID preview = jobId("preview_quiz_generate");
+
+        sources.addReviewNote("review quiz retry source", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        UUID review = jobId("review_quiz_generate");
+
+        UUID exam = createExam();
+        sources.addPastExam(exam, "exam quiz retry source");
+        runOne("chunk_embed");
+        UUID examQuiz = UUID.fromString(ok(send(
+                "POST", "/api/v1/exams/" + exam + "/predicted-quiz/generate", Map.of()), 202)
+                .path("jobId").asText());
+
+        for (UUID jobId : List.of(preview, review, examQuiz)) failJob(jobId, "INVALID_GENERATION_OUTPUT", 1);
+        assertThat(ok(send("POST", "/api/v1/jobs/" + preview + "/retry", null), 202)
+                .path("status").asText()).isEqualTo("queued");
+        assertThat(ok(send("POST", "/api/v1/jobs/" + examQuiz + "/retry", null), 202)
+                .path("status").asText()).isEqualTo("queued");
+
+        try (var callers = Executors.newFixedThreadPool(2)) {
+            Future<HttpResult> first = callers.submit(() -> send("POST", "/api/v1/jobs/" + review + "/retry", null));
+            Future<HttpResult> second = callers.submit(() -> send("POST", "/api/v1/jobs/" + review + "/retry", null));
+            assertThat(List.of(first.get(10, TimeUnit.SECONDS).status(), second.get(10, TimeUnit.SECONDS).status()))
+                    .containsExactlyInAnyOrder(202, 409);
+        }
+        assertThat(jdbc.sql("SELECT count(*) FROM ai_jobs WHERE id IN (:ids) AND status='queued'")
+                .param("ids", List.of(preview, review, examQuiz)).query(Integer.class).single()).isEqualTo(3);
+        System.out.println("TASK6_QUIZ_ALLOWLIST preview=202 review_concurrent=202,409 exam=202 "
+                + "single_rows_queued=3 result=PASS");
+    }
+
+    @Test
+    void rejectsInvalidOutputRetryAcrossOwnershipStateAttemptsArtifactErrorAndSourceFences() throws Exception {
+        sources.addReviewNote("retry fence source", 0);
+        runOne("chunk_embed");
+        runOne("review_generate");
+        UUID quiz = jobId("review_quiz_generate");
+        failJob(quiz, "INVALID_GENERATION_OUTPUT", 1);
+        int callsBeforeRetry = model.generationCalls;
+
+        String ownerToken = token;
+        String foreignToken = login("generation-foreign-" + UUID.randomUUID());
+        token = foreignToken;
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 404, "JOB_NOT_FOUND");
+        token = ownerToken;
+
+        jdbc.sql("UPDATE ai_jobs SET attempt_count=max_attempts WHERE id=:id").param("id", quiz).update();
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 409, "JOB_NOT_RETRYABLE");
+        jdbc.sql("UPDATE ai_jobs SET attempt_count=1,job_type='review_mindmap_generate' WHERE id=:id")
+                .param("id", quiz).update();
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 409, "JOB_NOT_RETRYABLE");
+        jdbc.sql("UPDATE ai_jobs SET job_type='target_generate' WHERE id=:id").param("id", quiz).update();
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 409, "JOB_NOT_RETRYABLE");
+        jdbc.sql("UPDATE ai_jobs SET job_type='review_generate' WHERE id=:id").param("id", quiz).update();
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 409, "JOB_NOT_RETRYABLE");
+        jdbc.sql("UPDATE ai_jobs SET job_type='review_quiz_generate',error_code='INVALID_SOURCE_REFERENCES' WHERE id=:id")
+                .param("id", quiz).update();
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 409, "JOB_NOT_RETRYABLE");
+        jdbc.sql("UPDATE ai_jobs SET error_code=NULL WHERE id=:id").param("id", quiz).update();
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 409, "JOB_NOT_RETRYABLE");
+        jdbc.sql("UPDATE ai_jobs SET error_code='INVALID_GENERATION_OUTPUT' WHERE id=:id").param("id", quiz).update();
+        jdbc.sql("UPDATE courses SET deleted_at=CURRENT_TIMESTAMP WHERE id=:id").param("id", course).update();
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 404, "JOB_NOT_FOUND");
+        jdbc.sql("UPDATE courses SET deleted_at=NULL WHERE id=:id").param("id", course).update();
+
+        jdbc.sql("UPDATE summaries SET input_version=2 WHERE session_id=:session AND summary_type='review'")
+                .param("session", session).update();
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 409, "STALE_INPUT");
+        jdbc.sql("UPDATE summaries SET input_version=1 WHERE session_id=:session AND summary_type='review'")
+                .param("session", session).update();
+        sources.addReviewNote("changed retry fence source", 1);
+        error(send("POST", "/api/v1/jobs/" + quiz + "/retry", null), 409, "STALE_INPUT");
+        assertThat(model.generationCalls).isEqualTo(callsBeforeRetry);
+        assertThat(jobs.get(owner, quiz).status() + ":" + jobs.get(owner, quiz).errorCode())
+                .isEqualTo("failed:INVALID_GENERATION_OUTPUT");
+        System.out.println("TASK6_RETRY_FENCES wrong_owner=404 exhausted=409 mindmap=409 target=409 "
+                + "summary=409 other_error=409 null_error=409 inactive_course=404 stale_version=409 stale_source=409 "
+                + "provider_calls_after_retry=0 result=PASS");
+    }
+
+    @Test
     void preservesGroundedArtifactAndPublicApiContract_throughGenerationWorkflow() throws Exception {
         String privateSource = "untrusted_external_text prompt_injection ignore instructions credential=secret";
         sources.addReviewNote(privateSource, 0);
@@ -730,18 +925,22 @@ class GenerationWorkflowIT {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"queued", "succeeded"})
-    void doesNotReusePriorContractGenerationJob_whenSchedulingSourceGroundedV3(String priorStatus) throws Exception {
+    @ValueSource(strings = {"queued", "succeeded", "failed"})
+    void doesNotReusePriorV3TerminalJob_whenSchedulingSourceGroundedV4(String priorStatus) throws Exception {
         sources.addReviewNote("contract-version source", 0);
         runOne("chunk_embed");
         GenerationSnapshotService.Snapshot snapshot = snapshots.session(owner, course, session, "review");
         jdbc.sql("DELETE FROM ai_jobs WHERE job_type='review_generate'").update();
         JobQueue.AiJob prior = jobs.enqueue(new JobQueue.EnqueueRequest("review_generate", owner, course,
                 session, null, null, null, null, null, 1, snapshot.snapshotHash(), "vertex",
-                "gemini-2.5-flash", "source-grounded-v1"));
+                "gemini-2.5-flash", "source-grounded-v3"));
         jdbc.sql("""
                 UPDATE ai_jobs SET status=:status,
-                    finished_at=CASE WHEN CAST(:status AS text)='succeeded' THEN CURRENT_TIMESTAMP ELSE NULL END
+                    error_code=CASE WHEN CAST(:status AS text)='failed' THEN 'INVALID_GENERATION_OUTPUT' END,
+                    error_message=CASE WHEN CAST(:status AS text)='failed' THEN 'Safe prior failure.' END,
+                    attempt_count=CASE WHEN CAST(:status AS text)='failed' THEN 1 ELSE attempt_count END,
+                    finished_at=CASE WHEN CAST(:status AS text) IN ('succeeded','failed')
+                        THEN CURRENT_TIMESTAMP ELSE NULL END
                 WHERE id=:id
                 """).param("status", priorStatus).param("id", prior.id()).update();
 
@@ -751,12 +950,12 @@ class GenerationWorkflowIT {
                 .query(UUID.class).list();
         assertThat(scheduled).hasSize(2);
         assertThat(scheduled.get(1)).isNotEqualTo(prior.id());
-        JobQueue.AiJob exactV3 = jobs.enqueue(new JobQueue.EnqueueRequest("review_generate", owner, course,
+        JobQueue.AiJob exactV4 = jobs.enqueue(new JobQueue.EnqueueRequest("review_generate", owner, course,
                 session, null, null, null, null, null, 2, snapshot.snapshotHash(), "vertex",
                 "gemini-2.5-flash", GenerationScheduler.PROMPT_VERSION));
-        assertThat(exactV3.id()).isEqualTo(scheduled.get(1));
-        System.out.println("GENERATION_PHASE2_QA prior_contract=v1 prior_status=" + priorStatus
-                + " current_contract=v3 observable=distinct_jobs result=PASS");
+        assertThat(exactV4.id()).isEqualTo(scheduled.get(1));
+        System.out.println("TASK6_CONTRACT_FENCE prior_contract=v3 prior_status=" + priorStatus
+                + " current_contract=v4 observable=distinct_jobs result=PASS");
     }
 
     @Test
@@ -1063,6 +1262,19 @@ class GenerationWorkflowIT {
     private int jobCount(String type) {
         return jdbc.sql("SELECT count(*) FROM ai_jobs WHERE job_type=:type")
                 .param("type", type).query(Integer.class).single();
+    }
+
+    private UUID jobId(String type) {
+        return jdbc.sql("SELECT id FROM ai_jobs WHERE job_type=:type ORDER BY created_at DESC LIMIT 1")
+                .param("type", type).query(UUID.class).single();
+    }
+
+    private void failJob(UUID jobId, String errorCode, int attemptCount) {
+        jdbc.sql("""
+                        UPDATE ai_jobs SET status='failed',error_code=:error,error_message='Safe test failure.',
+                            attempt_count=:attempt,finished_at=CURRENT_TIMESTAMP
+                        WHERE id=:id
+                        """).param("error", errorCode).param("attempt", attemptCount).param("id", jobId).update();
     }
 
     private String login(String subject) throws Exception {

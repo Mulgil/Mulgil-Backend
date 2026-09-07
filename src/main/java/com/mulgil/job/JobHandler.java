@@ -13,11 +13,18 @@ public interface JobHandler {
     final class JobExecutionException extends Exception {
         private final String code;
         private final boolean retryable;
+        private final ValidationDetails validationDetails;
 
         public JobExecutionException(String code, String message, boolean retryable) {
+            this(code, message, retryable, null);
+        }
+
+        public JobExecutionException(String code, String message, boolean retryable,
+                                     ValidationDetails validationDetails) {
             super(message);
             this.code = code;
             this.retryable = retryable;
+            this.validationDetails = validationDetails;
         }
 
         public String code() {
@@ -27,5 +34,11 @@ public interface JobHandler {
         public boolean retryable() {
             return retryable;
         }
+
+        public ValidationDetails validationDetails() {
+            return validationDetails;
+        }
     }
+
+    record ValidationDetails(String rule, String path, Integer expectedCount, Integer actualCount) {}
 }

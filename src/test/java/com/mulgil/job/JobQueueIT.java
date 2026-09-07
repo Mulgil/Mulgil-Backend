@@ -244,16 +244,17 @@ class JobQueueIT {
         JobQueue.AiJob job = queue.enqueue(request());
         JobQueue.ClaimedJob claimed = queue.claim("usage-worker", Set.of("pdf_extract"));
         GenerationModelPort.GenerationResult result = new GenerationModelPort.GenerationResult(
-                "{}", new GenerationModelPort.GenerationUsage(101L, 23L, 124L, 17L), 45L, "STOP");
+                "{}", new GenerationModelPort.GenerationUsage(101L, 23L, 124L, 17L, 0L), 45L, "STOP");
 
         usage.observeGeneration(claimed, "generation-v1", 7L, () -> result);
 
         assertThat(jdbc.sql("""
                         SELECT unit_type||':'||unit_count||':'||prompt_token_count||':'||candidate_token_count
-                            ||':'||total_token_count||':'||cached_content_token_count||':'||first_response_latency_ms
+                            ||':'||total_token_count||':'||cached_content_token_count||':'||thoughts_token_count
+                            ||':'||finish_reason||':'||first_response_latency_ms
                         FROM ai_provider_usage WHERE job_id=:job
                         """).param("job", job.id()).query(String.class).single())
-                .isEqualTo("unicode_code_point:9:101:23:124:17:45");
+                .isEqualTo("unicode_code_point:9:101:23:124:17:0:STOP:45");
     }
 
     @Test
@@ -261,7 +262,7 @@ class JobQueueIT {
         JobQueue.AiJob job = queue.enqueue(request());
         JobQueue.ClaimedJob claimed = queue.claim("failed-usage-worker", Set.of("pdf_extract"));
         GenerationModelPort.GenerationResult result = new GenerationModelPort.GenerationResult(
-                "{", new GenerationModelPort.GenerationUsage(20L, 8L, 28L, 0L), 12L, "MAX_TOKENS");
+                "{", new GenerationModelPort.GenerationUsage(20L, 8L, 28L, 0L, 13L), 12L, "MAX_TOKENS");
 
         assertThatThrownBy(() -> usage.observeGeneration(claimed, "generation-v1", 1L,
                 () -> { throw new GenerationModelPort.GenerationModelException(
@@ -270,10 +271,10 @@ class JobQueueIT {
 
         assertThat(jdbc.sql("""
                         SELECT status||':'||error_code||':'||unit_count||':'||total_token_count
-                            ||':'||first_response_latency_ms
+                            ||':'||thoughts_token_count||':'||finish_reason||':'||first_response_latency_ms
                         FROM ai_provider_usage WHERE job_id=:job
                         """).param("job", job.id()).query(String.class).single())
-                .isEqualTo("failed:PROVIDER_OUTPUT_LIMIT:2:28:12");
+                .isEqualTo("failed:PROVIDER_OUTPUT_LIMIT:2:28:13:MAX_TOKENS:12");
     }
 
     @Test
@@ -287,6 +288,7 @@ class JobQueueIT {
         assertThat(jdbc.sql("""
                         SELECT prompt_token_count IS NULL AND candidate_token_count IS NULL
                             AND total_token_count IS NULL AND cached_content_token_count IS NULL
+                            AND thoughts_token_count IS NULL AND finish_reason='STOP'
                             AND first_response_latency_ms IS NULL
                         FROM ai_provider_usage WHERE job_id=:job
                         """).param("job", job.id()).query(Boolean.class).single()).isTrue();
@@ -515,10 +517,11 @@ class JobQueueIT {
 
         assertThat(defaults.temperature()).isEqualTo(0.1);
         assertThat(defaults.candidateCount()).isOne();
+        assertThat(defaults.mindmapThinkingBudget()).isEqualTo(1024);
         assertThat(defaults.totalTimeoutSeconds()).isEqualTo(180);
         assertThat(defaults.contextCacheEnabled()).isFalse();
         assertThat(validator.validate(new MulgilProperties.Generation(
-                -0.1, 2, 0, 0, 0, 0, 0, false, 1))).isNotEmpty();
+                -0.1, 2, 0, 0, 0, 0, 0, 0, false, 1))).isNotEmpty();
         assertThat(validator.validate(defaults)).isEmpty();
     }
 

@@ -12,6 +12,10 @@ spring:
   flyway:
     enabled: true
 
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %5p [%thread] %-40.40logger{39} : %msg %kvp%n%wEx"
+
 mulgil:
   jwt:
     secret-base64: ${JWT_HS256_SECRET_BASE64}
@@ -43,6 +47,7 @@ mulgil:
     candidate-count: ${VERTEX_GENERATION_CANDIDATE_COUNT:1}
     summary-max-output-tokens: ${VERTEX_GENERATION_SUMMARY_MAX_OUTPUT_TOKENS:8192}
     mindmap-max-output-tokens: ${VERTEX_GENERATION_MINDMAP_MAX_OUTPUT_TOKENS:8192}
+    mindmap-thinking-budget: ${VERTEX_GENERATION_MINDMAP_THINKING_BUDGET:1024}
     quiz-max-output-tokens: ${VERTEX_GENERATION_QUIZ_MAX_OUTPUT_TOKENS:8192}
     total-timeout-seconds: ${VERTEX_GENERATION_TOTAL_TIMEOUT_SECONDS:180}
     input-soft-token-limit: ${VERTEX_GENERATION_INPUT_SOFT_TOKEN_LIMIT:100000}

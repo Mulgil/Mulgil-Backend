@@ -165,6 +165,11 @@ class SelectedTopicGenerationService {
         } catch (GenerationModelPort.GenerationModelException exception) {
             throw new JobHandler.JobExecutionException(
                     exception.code(), "Generation provider failed.", exception.retryable());
+        } catch (JobHandler.JobExecutionException exception) {
+            if (exception.validationDetails() != null) {
+                GenerationJobHandler.logOutputRejected(job, request.intent().artifact, exception);
+            }
+            throw exception;
         } catch (RuntimeException exception) {
             throw new JobHandler.JobExecutionException(
                     "PROVIDER_UNAVAILABLE", "Generation provider failed.", true);

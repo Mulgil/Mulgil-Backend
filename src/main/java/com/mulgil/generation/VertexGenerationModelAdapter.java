@@ -85,7 +85,8 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
                 : new GenerationContextCacheLifecycle.Prepared("disabled", null, null);
         GenerateContentRequest request = providerRequest(generation, model,
                 generationConfig(properties.generation().temperature(), properties.generation().candidateCount(),
-                        outputLimit(generation.artifact()), generation.artifact()), cache);
+                        outputLimit(generation.artifact()), generation.artifact(), modelId,
+                        properties.generation().mindmapThinkingBudget()), cache);
         long started = System.nanoTime();
         GenerationResult result = null;
         String outcome = "succeeded";
@@ -158,7 +159,9 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
         return switch (artifact) {
             case SUMMARY -> "\nReturn one JSON object containing only summary.items as a non-empty array of {text, sourceIds}; summary.tables is optional.";
             case MINDMAP -> "\nReturn one JSON object containing only mindmap.nodes as a non-empty array of {id, label, sourceIds} and mindmap.edges as an array of {from, to}.";
-            case QUIZ -> "\nReturn one JSON object containing only quizQuestions as a non-empty array with type, grounded question, answer, and explanation fields.";
+            case QUIZ -> "\nReturn one JSON object containing only quizQuestions as a non-empty array. "
+                    + "For true_false, answer.value is a boolean. For multiple_choice, question.options is exactly four non-blank strings and answer.value is the zero-based integer index from 0 through 3. "
+                    + "Every question and explanation is grounded with sourceIds.";
         };
     }
 
@@ -176,8 +179,12 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
             StringBuilder chunk = new StringBuilder();
             if (response.getCandidatesCount() > 0) {
                 Candidate candidate = response.getCandidates(0);
-                finishReason = candidate.getFinishReason();
-                for (Part part : candidate.getContent().getPartsList()) chunk.append(part.getText());
+                if (candidate.getFinishReason() != Candidate.FinishReason.FINISH_REASON_UNSPECIFIED) {
+                    finishReason = candidate.getFinishReason();
+                }
+                for (Part part : candidate.getContent().getPartsList()) {
+                    if (!part.getThought()) chunk.append(part.getText());
+                }
             }
             if (firstResponseLatencyMs == null && !chunk.toString().isBlank()) {
                 firstResponseLatencyMs = TimeUnit.NANOSECONDS.toMillis(
@@ -185,7 +192,7 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
                 onFirstResponse.run();
             }
             raw.append(chunk);
-            usage = response.hasUsageMetadata() ? usage(response.getUsageMetadata()) : null;
+            if (response.hasUsageMetadata()) usage = usage(response.getUsageMetadata());
         }
         GenerationResult result = new GenerationResult(raw.toString().strip(), usage,
                 firstResponseLatencyMs, finishReason.name());
@@ -221,11 +228,17 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
 
     static GenerationConfig generationConfig(double temperature, int candidateCount, int maxOutputTokens,
                                              Artifact artifact) {
+        return generationConfig(temperature, candidateCount, maxOutputTokens, artifact, null, 0);
+    }
+
+    static GenerationConfig generationConfig(double temperature, int candidateCount, int maxOutputTokens,
+                                             Artifact artifact, String modelId, int mindmapThinkingBudget) {
         Schema sourceIds = array(scalar(Type.STRING)).toBuilder().setMinItems(1).build();
         Schema mindmapSourceIds = sourceIds.toBuilder()
                 .setMaxItems(GenerationOutputValidator.MAX_MINDMAP_SOURCE_IDS).build();
+        Schema nonemptyText = scalar(Type.STRING).toBuilder().setMinLength(1).build();
         Schema groundedText = object()
-                .putProperties("text", scalar(Type.STRING))
+                .putProperties("text", nonemptyText)
                 .putProperties("sourceIds", sourceIds)
                 .addRequired("text").addRequired("sourceIds").build();
         Schema summary = object().putProperties("items", array(groundedText))
@@ -244,24 +257,32 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
                 .putProperties("edges", array(edge).toBuilder()
                         .setMaxItems(GenerationOutputValidator.MAX_MINDMAP_EDGES).build())
                 .addRequired("nodes").addRequired("edges").build();
-        Schema prompt = groundedText.toBuilder().putProperties("options", array(scalar(Type.STRING))).build();
-        Schema answer = object().putProperties("value", Schema.newBuilder()
-                        .addAnyOf(scalar(Type.STRING)).addAnyOf(scalar(Type.BOOLEAN)).build())
+        Schema trueFalseAnswer = object().putProperties("value", scalar(Type.BOOLEAN))
                 .putProperties("sourceIds", sourceIds).addRequired("value").addRequired("sourceIds").build();
-        Schema question = object().putProperties("type", Schema.newBuilder().setType(Type.STRING)
-                        .addEnum("true_false").addEnum("multiple_choice").build())
-                .putProperties("question", prompt).putProperties("answer", answer)
-                .putProperties("explanation", groundedText).addRequired("type").addRequired("question")
-                .addRequired("answer").addRequired("explanation").build();
+        Schema trueFalseQuestion = quizQuestion("true_false", groundedText, trueFalseAnswer, groundedText);
+        Schema options = array(nonemptyText).toBuilder().setMinItems(4).setMaxItems(4).build();
+        Schema multipleChoicePrompt = groundedText.toBuilder().putProperties("options", options)
+                .addRequired("options").build();
+        Schema choiceValue = scalar(Type.INTEGER).toBuilder().setMinimum(0).setMaximum(3).build();
+        Schema multipleChoiceAnswer = object().putProperties("value", choiceValue)
+                .putProperties("sourceIds", sourceIds).addRequired("value").addRequired("sourceIds").build();
+        Schema multipleChoiceQuestion = quizQuestion(
+                "multiple_choice", multipleChoicePrompt, multipleChoiceAnswer, groundedText);
+        Schema question = Schema.newBuilder().addAnyOf(trueFalseQuestion).addAnyOf(multipleChoiceQuestion).build();
         Schema response = switch (artifact) {
             case SUMMARY -> object().putProperties("summary", summary).addRequired("summary").build();
             case MINDMAP -> object().putProperties("mindmap", mindmap).addRequired("mindmap").build();
-            case QUIZ -> object().putProperties("quizQuestions", array(question))
+            case QUIZ -> object().putProperties("quizQuestions", array(question).toBuilder().setMinItems(1).build())
                     .addRequired("quizQuestions").build();
         };
-        return GenerationConfig.newBuilder().setResponseMimeType("application/json")
+        GenerationConfig.Builder config = GenerationConfig.newBuilder().setResponseMimeType("application/json")
                 .setResponseSchema(response).setTemperature((float) temperature)
-                .setCandidateCount(candidateCount).setMaxOutputTokens(maxOutputTokens).build();
+                .setCandidateCount(candidateCount).setMaxOutputTokens(maxOutputTokens);
+        if (artifact == Artifact.MINDMAP && "gemini-2.5-flash".equals(modelId)) {
+            config.setThinkingConfig(GenerationConfig.ThinkingConfig.newBuilder()
+                    .setThinkingBudget(mindmapThinkingBudget));
+        }
+        return config.build();
     }
 
     private int outputLimit(Artifact artifact) {
@@ -298,11 +319,20 @@ final class VertexGenerationModelAdapter implements GenerationModelPort {
 
     private static GenerationUsage usage(GenerateContentResponse.UsageMetadata value) {
         return new GenerationUsage((long) value.getPromptTokenCount(), (long) value.getCandidatesTokenCount(),
-                (long) value.getTotalTokenCount(), (long) value.getCachedContentTokenCount());
+                (long) value.getTotalTokenCount(), (long) value.getCachedContentTokenCount(),
+                (long) value.getThoughtsTokenCount());
     }
 
     private static Schema.Builder object() {
         return Schema.newBuilder().setType(Type.OBJECT);
+    }
+
+    private static Schema quizQuestion(String type, Schema prompt, Schema answer, Schema explanation) {
+        Schema discriminator = Schema.newBuilder().setType(Type.STRING).addEnum(type).build();
+        return object().putProperties("type", discriminator).putProperties("question", prompt)
+                .putProperties("answer", answer).putProperties("explanation", explanation)
+                .addRequired("type").addRequired("question").addRequired("answer")
+                .addRequired("explanation").build();
     }
 
     private static Schema scalar(Type type) {

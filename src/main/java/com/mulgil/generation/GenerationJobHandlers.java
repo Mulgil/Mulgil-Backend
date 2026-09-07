@@ -76,13 +76,11 @@ abstract class GenerationJobHandler implements JobHandler {
             result = usage.observeGeneration(job, properties.vertex().generationModel(),
                     input.text().codePoints().count(), () -> model.generate(request));
         } catch (GenerationModelPort.GenerationModelException exception) {
-            log.atWarn().addKeyValue("event", "generation.provider.failed")
-                    .addKeyValue("jobId", job.id()).addKeyValue("operation", job.type())
-                    .addKeyValue("artifact", artifact(job).metricValue()).addKeyValue("errorCode", exception.code())
-                    .addKeyValue("finishReason", exception.result() == null ? null : exception.result().finishReason())
-                    .log("generation provider failure handled");
+            logProviderFailure(job, artifact(job), exception.code(),
+                    exception.result() == null ? null : exception.result().finishReason());
             throw new JobExecutionException(exception.code(), "Generation provider failed.", exception.retryable());
         } catch (RuntimeException exception) {
+            logProviderFailure(job, artifact(job), "PROVIDER_UNAVAILABLE", null);
             throw new JobExecutionException("PROVIDER_UNAVAILABLE", "Generation provider failed.", true);
         }
         queue.updateProgress(job, "validating");
@@ -93,9 +91,7 @@ abstract class GenerationJobHandler implements JobHandler {
             metrics.counter("mulgil.generation.validation.failures",
                     "model", properties.vertex().generationModel(), "artifact", artifact(job).metricValue(),
                     "result", "rejected", "cache", Boolean.toString(cacheHit(result))).increment();
-            log.atWarn().addKeyValue("event", "generation.output.rejected")
-                    .addKeyValue("jobId", job.id()).addKeyValue("operation", job.type())
-                    .addKeyValue("status", "rejected").log("generation output rejected");
+            logOutputRejected(job, artifact(job), exception);
             throw exception;
         }
         queue.updateProgress(job, "publishing");
@@ -117,6 +113,28 @@ abstract class GenerationJobHandler implements JobHandler {
     private static boolean cacheHit(GenerationModelPort.GenerationResult result) {
         return result.usage() != null && result.usage().cachedContentTokenCount() != null
                 && result.usage().cachedContentTokenCount() > 0;
+    }
+
+    private static void logProviderFailure(JobQueue.ClaimedJob job, GenerationModelPort.Artifact artifact,
+                                           String errorCode, String finishReason) {
+        log.atWarn().addKeyValue("event", "generation.provider.failed")
+                .addKeyValue("jobId", job.id()).addKeyValue("operation", job.type())
+                .addKeyValue("artifact", artifact.metricValue()).addKeyValue("errorCode", errorCode)
+                .addKeyValue("finishReason", finishReason).log("generation provider failure handled");
+    }
+
+    static void logOutputRejected(JobQueue.ClaimedJob job, GenerationModelPort.Artifact artifact,
+                                  JobExecutionException exception) {
+        var event = log.atWarn().addKeyValue("event", "generation.output.rejected")
+                .addKeyValue("jobId", job.id()).addKeyValue("operation", job.type())
+                .addKeyValue("artifact", artifact.metricValue()).addKeyValue("errorCode", exception.code());
+        JobHandler.ValidationDetails details = exception.validationDetails();
+        if (details != null) {
+            event.addKeyValue("rule", details.rule()).addKeyValue("path", details.path());
+            if (details.expectedCount() != null) event.addKeyValue("expectedCount", details.expectedCount());
+            if (details.actualCount() != null) event.addKeyValue("actualCount", details.actualCount());
+        }
+        event.log("generation output rejected");
     }
 
     private GenerationSnapshotService.Snapshot load(JobQueue.ClaimedJob job) {
