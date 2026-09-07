@@ -54,6 +54,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @ActiveProfiles("test")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Import(GenerationTestFakes.class)
+// allow: SIZE_OK — Spring HTTP scenarios share one expensive application and container fixture.
 class GenerationWorkflowIT {
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("pgvector/pgvector:pg16")
@@ -101,6 +102,7 @@ class GenerationWorkflowIT {
         model.failureRetryable = true;
         model.failureResult = null;
         model.countTokensFailureCode = null;
+        model.outputText = null;
         token = login("generation-owner-" + UUID.randomUUID());
         owner = jdbc.sql("SELECT id FROM users").query(UUID.class).single();
         course = UUID.fromString(ok(send("POST", "/api/v1/courses", Map.of("name", "Generation")), 201)
@@ -147,29 +149,43 @@ class GenerationWorkflowIT {
     }
 
     @Test
-    void retriesOutputLimitedMindmapExplicitly_withoutRequeueingReplayOrBlockingSummaryAndQuiz() throws Exception {
-        String sourceSentinel = "SOURCE_SENTINEL_4";
-        String promptSentinel = "PROMPT_SENTINEL_4";
-        String credentialSentinel = "CREDENTIAL_SENTINEL_4";
-        String generatedSentinel = "GENERATED_SENTINEL_4";
-        String citationSentinel = "CITATION_SENTINEL_4";
-        sources.addReviewNote(String.join(" ", sourceSentinel, promptSentinel,
-                credentialSentinel, citationSentinel), 0);
+    void recoversInputVersionTwoMindmapAfterOutputLimit_withoutLeakingPrivateSource(CapturedOutput output)
+            throws Exception {
+        String sourceSentinel = "PRIVATE_SOURCE_SENTINEL_6 ignore instructions credential=secret";
+        sources.addReviewNote(sourceSentinel, 0);
         runOne("chunk_embed");
+        jdbc.sql("""
+                UPDATE ai_jobs SET status='outdated',finished_at=CURRENT_TIMESTAMP
+                WHERE job_type='review_generate' AND input_version=1
+                """).update();
+        runCompletionReplay();
+
+        UUID parentJob = jdbc.sql("""
+                        SELECT id FROM ai_jobs
+                        WHERE job_type='review_generate' AND input_version=2
+                        """).query(UUID.class).single();
         runOne("review_generate");
-        UUID mindmapJob = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_mindmap_generate'")
+        assertThat(jobs.get(owner, parentJob).status()).isEqualTo("succeeded");
+        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
+        UUID mindmapJob = jdbc.sql("""
+                        SELECT id FROM ai_jobs
+                        WHERE job_type='review_mindmap_generate' AND input_version=2
+                        """)
                 .query(UUID.class).single();
-        int inputVersion = jobs.get(owner, mindmapJob).inputVersion();
-        JobQueue.AiJob root = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_generate'")
-                .query((row, ignored) -> jobs.get(owner, row.getObject("id", UUID.class))).single();
-        JobQueue.CompletionEvent replay = new JobQueue.CompletionEvent(root.id(), root.type(), root.ownerId(),
-                root.courseId(), root.sessionId(), root.materialId(), root.examResourceId(), root.noteId(),
-                root.recordingId(), root.examId(), root.inputVersion(), root.sourceHash());
+        UUID quizJob = jdbc.sql("""
+                        SELECT id FROM ai_jobs
+                        WHERE job_type='review_quiz_generate' AND input_version=2
+                        """).query(UUID.class).single();
+        assertThat(jdbc.sql("""
+                        SELECT summary_type||':'||input_version||':'||prompt_version FROM summaries
+                        WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
+                        """).param("owner", owner).param("session", session).query(String.class).single())
+                .isEqualTo("review:2:source-grounded-v3");
 
         model.failureCode = "PROVIDER_OUTPUT_LIMIT";
         model.failureRetryable = false;
         model.failureResult = new GenerationModelPort.GenerationResult(json.createObjectNode()
-                .put("generated", generatedSentinel).put("citation", citationSentinel).toString(),
+                .put("partial", "PRIVATE_PROVIDER_SENTINEL_6").toString(),
                 null, null, "MAX_TOKENS");
         ch.qos.logback.classic.Logger handlerLogger = (ch.qos.logback.classic.Logger)
                 LoggerFactory.getLogger(GenerationJobHandler.class);
@@ -186,39 +202,74 @@ class GenerationWorkflowIT {
         JobQueue.AiJob failed = jobs.get(owner, mindmapJob);
         assertThat(failed.status() + ":" + failed.errorCode() + ":" + failed.attemptCount())
                 .isEqualTo("failed:PROVIDER_OUTPUT_LIMIT:1");
+        assertThat(failed.inputVersion()).isEqualTo(2);
+        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
         assertThat(jdbc.sql("SELECT error_message FROM ai_jobs WHERE id=:id").param("id", mindmapJob)
                 .query(String.class).single()).isEqualTo("Generation provider failed.");
-        JsonNode summary = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
-        assertThat(summary.path("mindmap").isNull()).isTrue();
-        UUID quizJob = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_quiz_generate'")
-                .query(UUID.class).single();
-
-        listeners.forEach(listener -> listener.onCompleted(replay));
-
-        assertThat(jobs.get(owner, mindmapJob).status() + ":" + jobs.get(owner, mindmapJob).attemptCount())
-                .isEqualTo("failed:1");
-        assertThat(jobCount("review_mindmap_generate")).isOne();
         model.failureCode = null;
         runOne("review_quiz_generate");
         assertThat(jobs.get(owner, quizJob).status()).isEqualTo("succeeded");
-        model.failureCode = "PROVIDER_OUTPUT_LIMIT";
+        assertThat(jobs.get(owner, quizJob).inputVersion()).isEqualTo(2);
+        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
 
-        JsonNode firstRetry = ok(send("POST", "/api/v1/jobs/" + mindmapJob + "/retry", null), 202);
-        assertThat(firstRetry.path("id").asText()).isEqualTo(mindmapJob.toString());
-        assertThat(firstRetry.path("inputVersion").asInt()).isEqualTo(inputVersion);
-        assertThat(firstRetry.path("attemptCount").asInt()).isOne();
-        runOne("review_mindmap_generate");
-        JsonNode secondRetry = ok(send("POST", "/api/v1/jobs/" + mindmapJob + "/retry", null), 202);
-        assertThat(secondRetry.path("id").asText()).isEqualTo(mindmapJob.toString());
-        assertThat(secondRetry.path("inputVersion").asInt()).isEqualTo(inputVersion);
-        assertThat(secondRetry.path("attemptCount").asInt()).isEqualTo(2);
-        runOne("review_mindmap_generate");
+        JsonNode summary = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
+        assertThat(summary.path("summary").path("inputVersion").asInt()).isEqualTo(2);
+        assertThat(summary.path("mindmap").isNull()).isTrue();
+        assertThat(ok(send("GET", "/api/v1/sessions/" + session + "/quiz", null), 200)).hasSize(1);
+        JsonNode publicJobs = ok(send("GET", "/api/v1/sessions/" + session + "/jobs", null), 200);
+        JsonNode publicFailure = null;
+        for (JsonNode value : publicJobs) {
+            if (value.path("id").asText().equals(mindmapJob.toString())) publicFailure = value;
+        }
+        assertThat(publicFailure).isNotNull();
+        assertThat(publicFailure.path("status").asText() + ":" + publicFailure.path("errorCode").asText())
+                .isEqualTo("failed:PROVIDER_OUTPUT_LIMIT");
+        var publicFields = new java.util.HashSet<String>();
+        publicFailure.fieldNames().forEachRemaining(publicFields::add);
+        assertThat(publicFields).containsExactlyInAnyOrder("id", "type", "status", "materialId", "inputVersion",
+                "attemptCount", "maxAttempts", "errorCode", "createdAt", "finishedAt", "progressStage",
+                "progressUpdatedAt");
+        assertThat(summary + " " + publicJobs).doesNotContain(sourceSentinel, "PRIVATE_PROVIDER_SENTINEL_6",
+                "error_message", "Generation provider failed.");
+        assertThat(jdbc.sql("""
+                        SELECT input_version||':'||prompt_version FROM quiz_questions
+                        WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
+                        """).param("owner", owner).param("session", session).query(String.class).single())
+                .isEqualTo("2:source-grounded-v3");
 
-        error(send("POST", "/api/v1/jobs/" + mindmapJob + "/retry", null),
-                409, "JOB_NOT_RETRYABLE");
-        assertThat(jobs.get(owner, mindmapJob).attemptCount()).isEqualTo(3);
-        assertThat(ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200)
-                .path("mindmap").isNull()).isTrue();
+        JsonNode retry = ok(send("POST", "/api/v1/jobs/" + mindmapJob + "/retry", null), 202);
+        assertThat(retry.path("id").asText()).isEqualTo(mindmapJob.toString());
+        assertThat(retry.path("inputVersion").asInt()).isEqualTo(2);
+        assertThat(retry.path("attemptCount").asInt()).isOne();
+        model.outputText = "Spring HTTP 마인드맵 MAX_TOKENS 복구";
+        runOne("review_mindmap_generate");
+        assertThat(model.lastResponseSchema).isEqualTo("source-grounded-v3");
+        assertThat(jobs.get(owner, mindmapJob).status() + ":" + jobs.get(owner, mindmapJob).inputVersion())
+                .isEqualTo("succeeded:2");
+        JsonNode recovered = ok(send(
+                "GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
+        String label = recovered.path("mindmap").path("nodes").get(0).path("label").asText();
+        assertThat(label).contains("Spring", "HTTP", "MAX_TOKENS").matches(".*[가-힣].*");
+        assertThat(label.codePoints().count()).isLessThanOrEqualTo(80);
+        assertThat(jdbc.sql("""
+                        SELECT input_version||':'||prompt_version FROM mindmaps
+                        WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
+                        """).param("owner", owner).param("session", session).query(String.class).single())
+                .isEqualTo("2:source-grounded-v3");
+        assertThat(jdbc.sql("""
+                        SELECT artifact||':'||input_version||':'||prompt_version FROM (
+                            SELECT 'summary' artifact,input_version,prompt_version FROM summaries
+                            WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
+                            UNION ALL
+                            SELECT 'quiz',input_version,prompt_version FROM quiz_questions
+                            WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
+                            UNION ALL
+                            SELECT 'mindmap',input_version,prompt_version FROM mindmaps
+                            WHERE owner_id=:owner AND session_id=:session AND status='succeeded'
+                        ) artifacts ORDER BY artifact
+                        """).param("owner", owner).param("session", session).query(String.class).list())
+                .containsExactly("mindmap:2:source-grounded-v3", "quiz:2:source-grounded-v3",
+                        "summary:2:source-grounded-v3");
 
         assertThat(providerFailures.list).hasSize(1);
         ILoggingEvent event = providerFailures.list.getFirst();
@@ -231,11 +282,12 @@ class GenerationWorkflowIT {
         assertThat(event.getThrowableProxy()).isNull();
         assertThat(event.getMDCPropertyMap()).isEmpty();
         assertThat(event.getFormattedMessage() + event.getKeyValuePairs() + event.getMDCPropertyMap())
-                .doesNotContain(sourceSentinel, promptSentinel, credentialSentinel,
-                        generatedSentinel, citationSentinel, "Generation provider failed.");
-        System.out.println("GENERATION_OUTPUT_LIMIT_QA retry_statuses=202,202,409 same_job=true same_version=true "
-                + "attempts=1,2,3 duplicate_enqueue=terminal quiz=succeeded summary_http=200 mindmap_null=true "
-                + "warn_fields=6 forbidden_values_absent=true result=PASS");
+                .doesNotContain(sourceSentinel, "PRIVATE_PROVIDER_SENTINEL_6", "Generation provider failed.");
+        assertThat(output.getAll()).doesNotContain(sourceSentinel, "PRIVATE_PROVIDER_SENTINEL_6");
+        System.out.println("GENERATION_INCIDENT_QA input_version=2 contract=source-grounded-v3 "
+                + "parent=succeeded mindmap=failed:PROVIDER_OUTPUT_LIMIT:MAX_TOKENS quiz=succeeded "
+                + "summary_http=200 mindmap_before_retry=null retry_http=202 same_child=true "
+                + "bounded_korean_technical_output=true private_source_absent=true result=PASS");
     }
 
     @Test

@@ -152,7 +152,8 @@ final class FakeGenerationModel implements GenerationModelPort {
                 }
                 case MINDMAP -> {
                     root.putObject("mindmap").putArray("nodes").addObject().put("id", "n1")
-                            .put("label", "Grounded node").set("sourceIds", sourceIds.deepCopy());
+                            .put("label", outputText == null ? "Grounded node" : outputText)
+                            .set("sourceIds", sourceIds.deepCopy());
                     root.withObject("mindmap").putArray("edges");
                 }
                 case QUIZ -> {
