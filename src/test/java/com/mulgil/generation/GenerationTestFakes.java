@@ -116,6 +116,7 @@ final class FakeGenerationModel implements GenerationModelPort {
     volatile String providerPayloadMarker;
     volatile String outputText;
     volatile String outputFieldName;
+    volatile JsonNode outputScalar;
 
     FakeGenerationModel(ObjectMapper json) {
         this.json = json;
@@ -143,6 +144,7 @@ final class FakeGenerationModel implements GenerationModelPort {
                             .put("text", outputText == null ? "Grounded summary" : outputText);
                     item.set("sourceIds", sourceIds.deepCopy());
                     if (outputFieldName != null) item.put(outputFieldName, "provider metadata");
+                    if (outputScalar != null) item.set("providerEcho", outputScalar.deepCopy());
                 }
                 case MINDMAP -> {
                     root.putObject("mindmap").putArray("nodes").addObject().put("id", "n1")
