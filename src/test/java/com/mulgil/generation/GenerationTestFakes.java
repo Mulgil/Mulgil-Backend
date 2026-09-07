@@ -112,6 +112,7 @@ final class FakeGenerationModel implements GenerationModelPort {
     volatile String failureCode;
     volatile String countTokensFailureCode;
     volatile String benchmarkModel;
+    volatile String lastResponseSchema;
     volatile int benchmarkCalls;
     volatile String providerPayloadMarker;
     volatile String outputText;
@@ -130,6 +131,7 @@ final class FakeGenerationModel implements GenerationModelPort {
 
     private GenerationResult result(GenerationRequest request) {
         try {
+            lastResponseSchema = request.responseSchema();
             if (failureCode != null) {
                 throw new GenerationModelException(failureCode, true, null);
             }

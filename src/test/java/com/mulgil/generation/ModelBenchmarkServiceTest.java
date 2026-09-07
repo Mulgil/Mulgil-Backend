@@ -5,6 +5,7 @@ import com.mulgil.common.config.MulgilProperties;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.mockito.ArgumentCaptor;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -76,7 +77,10 @@ class ModelBenchmarkServiceTest {
                 .validOutput()).isTrue();
         verify(model, never()).generate(any());
         assertThat(service.operationallyApproved("gemini-candidate")).isFalse();
-        verify(model).benchmark(any(), eq("gemini-candidate"));
+        ArgumentCaptor<GenerationModelPort.GenerationRequest> requests = ArgumentCaptor.forClass(
+                GenerationModelPort.GenerationRequest.class);
+        verify(model).benchmark(requests.capture(), eq("gemini-candidate"));
+        assertThat(requests.getValue().responseSchema()).isEqualTo("source-grounded-v3");
         verify(jdbc).sql(org.mockito.ArgumentMatchers.argThat(sql ->
                 sql.contains("generation_model_approvals") && sql.contains("generation_model_benchmarks")
                         && sql.contains("valid_output")));

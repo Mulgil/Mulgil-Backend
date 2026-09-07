@@ -127,7 +127,7 @@ abstract class GenerationJobHandler implements JobHandler {
     }
 
     private String schema() {
-        return "source-grounded-v2";
+        return GenerationScheduler.PROMPT_VERSION;
     }
 
     private void publish(JobQueue.ClaimedJob job, GenerationOutputValidator.Output output) {

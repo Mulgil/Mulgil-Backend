@@ -61,6 +61,23 @@ class GenerationContextCacheLifecycleTest {
     }
 
     @Test
+    void startsFreshEntry_whenProductionContractReplacesV2() {
+        FakeRepository repository = new FakeRepository();
+        FakeProvider provider = new FakeProvider();
+        GenerationContextCacheLifecycle lifecycle = lifecycle(true, repository, provider,
+                Clock.fixed(NOW, ZoneOffset.UTC), new SimpleMeterRegistry());
+        lifecycle.prepare(request(OWNER, "a".repeat(64), "source-grounded-v2"),
+                "gemini", "us-central1");
+
+        GenerationContextCacheLifecycle.Prepared current = lifecycle.prepare(request(OWNER,
+                "a".repeat(64), GenerationScheduler.PROMPT_VERSION), "gemini", "us-central1");
+
+        assertThat(current.status()).isEqualTo("miss");
+        assertThat(provider.creates).hasValue(2);
+        assertThat(repository.entries).hasSize(2);
+    }
+
+    @Test
     void misses_whenAnyOwnerSnapshotModelLocationOrContractPartDiffers() {
         FakeRepository repository = new FakeRepository();
         FakeProvider provider = new FakeProvider();
