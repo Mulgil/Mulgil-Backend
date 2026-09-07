@@ -110,6 +110,8 @@ final class FakeGenerationModel implements GenerationModelPort {
     volatile long countedTokens = 100;
     volatile long contextTokenLimit = 1_048_576;
     volatile String failureCode;
+    volatile boolean failureRetryable = true;
+    volatile GenerationResult failureResult;
     volatile String countTokensFailureCode;
     volatile String benchmarkModel;
     volatile String lastResponseSchema;
@@ -133,7 +135,7 @@ final class FakeGenerationModel implements GenerationModelPort {
         try {
             lastResponseSchema = request.responseSchema();
             if (failureCode != null) {
-                throw new GenerationModelException(failureCode, true, null);
+                throw new GenerationModelException(failureCode, failureRetryable, failureResult);
             }
             String prompt = request.input().text();
             request.onFirstResponse().run();

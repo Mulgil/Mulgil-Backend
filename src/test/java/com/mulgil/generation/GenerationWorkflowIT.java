@@ -1,5 +1,8 @@
 package com.mulgil.generation;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulgil.indexing.ContentIndexingService;
@@ -25,6 +28,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -94,6 +98,8 @@ class GenerationWorkflowIT {
         model.countedTokens = 100;
         model.contextTokenLimit = 1_048_576;
         model.failureCode = null;
+        model.failureRetryable = true;
+        model.failureResult = null;
         model.countTokensFailureCode = null;
         token = login("generation-owner-" + UUID.randomUUID());
         owner = jdbc.sql("SELECT id FROM users").query(UUID.class).single();
@@ -141,30 +147,95 @@ class GenerationWorkflowIT {
     }
 
     @Test
-    void retriesFailedMindmapIndependently_withoutBlockingSummaryOrQuiz() throws Exception {
-        sources.addReviewNote("independent artifact source", 0);
+    void retriesOutputLimitedMindmapExplicitly_withoutRequeueingReplayOrBlockingSummaryAndQuiz() throws Exception {
+        String sourceSentinel = "SOURCE_SENTINEL_4";
+        String promptSentinel = "PROMPT_SENTINEL_4";
+        String credentialSentinel = "CREDENTIAL_SENTINEL_4";
+        String generatedSentinel = "GENERATED_SENTINEL_4";
+        String citationSentinel = "CITATION_SENTINEL_4";
+        sources.addReviewNote(String.join(" ", sourceSentinel, promptSentinel,
+                credentialSentinel, citationSentinel), 0);
         runOne("chunk_embed");
         runOne("review_generate");
         UUID mindmapJob = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_mindmap_generate'")
                 .query(UUID.class).single();
+        int inputVersion = jobs.get(owner, mindmapJob).inputVersion();
+        JobQueue.AiJob root = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_generate'")
+                .query((row, ignored) -> jobs.get(owner, row.getObject("id", UUID.class))).single();
+        JobQueue.CompletionEvent replay = new JobQueue.CompletionEvent(root.id(), root.type(), root.ownerId(),
+                root.courseId(), root.sessionId(), root.materialId(), root.examResourceId(), root.noteId(),
+                root.recordingId(), root.examId(), root.inputVersion(), root.sourceHash());
 
-        model.failureCode = "PROVIDER_UNAVAILABLE";
-        runOne("review_mindmap_generate");
+        model.failureCode = "PROVIDER_OUTPUT_LIMIT";
+        model.failureRetryable = false;
+        model.failureResult = new GenerationModelPort.GenerationResult(json.createObjectNode()
+                .put("generated", generatedSentinel).put("citation", citationSentinel).toString(),
+                null, null, "MAX_TOKENS");
+        ch.qos.logback.classic.Logger handlerLogger = (ch.qos.logback.classic.Logger)
+                LoggerFactory.getLogger(GenerationJobHandler.class);
+        ListAppender<ILoggingEvent> providerFailures = new ListAppender<>();
+        providerFailures.start();
+        handlerLogger.addAppender(providerFailures);
+        try {
+            runOne("review_mindmap_generate");
+        } finally {
+            handlerLogger.detachAppender(providerFailures);
+            providerFailures.stop();
+        }
 
-        assertThat(jobs.get(owner, mindmapJob).status()).isEqualTo("failed");
+        JobQueue.AiJob failed = jobs.get(owner, mindmapJob);
+        assertThat(failed.status() + ":" + failed.errorCode() + ":" + failed.attemptCount())
+                .isEqualTo("failed:PROVIDER_OUTPUT_LIMIT:1");
+        assertThat(jdbc.sql("SELECT error_message FROM ai_jobs WHERE id=:id").param("id", mindmapJob)
+                .query(String.class).single()).isEqualTo("Generation provider failed.");
         JsonNode summary = ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200);
         assertThat(summary.path("mindmap").isNull()).isTrue();
-        assertThat(jobs.get(owner, jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_quiz_generate'")
-                .query(UUID.class).single()).status()).isEqualTo("queued");
+        UUID quizJob = jdbc.sql("SELECT id FROM ai_jobs WHERE job_type='review_quiz_generate'")
+                .query(UUID.class).single();
 
+        listeners.forEach(listener -> listener.onCompleted(replay));
+
+        assertThat(jobs.get(owner, mindmapJob).status() + ":" + jobs.get(owner, mindmapJob).attemptCount())
+                .isEqualTo("failed:1");
+        assertThat(jobCount("review_mindmap_generate")).isOne();
         model.failureCode = null;
-        assertThat(jobs.retry(owner, mindmapJob).status()).isEqualTo("queued");
-        runOne("review_mindmap_generate");
         runOne("review_quiz_generate");
+        assertThat(jobs.get(owner, quizJob).status()).isEqualTo("succeeded");
+        model.failureCode = "PROVIDER_OUTPUT_LIMIT";
 
+        JsonNode firstRetry = ok(send("POST", "/api/v1/jobs/" + mindmapJob + "/retry", null), 202);
+        assertThat(firstRetry.path("id").asText()).isEqualTo(mindmapJob.toString());
+        assertThat(firstRetry.path("inputVersion").asInt()).isEqualTo(inputVersion);
+        assertThat(firstRetry.path("attemptCount").asInt()).isOne();
+        runOne("review_mindmap_generate");
+        JsonNode secondRetry = ok(send("POST", "/api/v1/jobs/" + mindmapJob + "/retry", null), 202);
+        assertThat(secondRetry.path("id").asText()).isEqualTo(mindmapJob.toString());
+        assertThat(secondRetry.path("inputVersion").asInt()).isEqualTo(inputVersion);
+        assertThat(secondRetry.path("attemptCount").asInt()).isEqualTo(2);
+        runOne("review_mindmap_generate");
+
+        error(send("POST", "/api/v1/jobs/" + mindmapJob + "/retry", null),
+                409, "JOB_NOT_RETRYABLE");
+        assertThat(jobs.get(owner, mindmapJob).attemptCount()).isEqualTo(3);
         assertThat(ok(send("GET", "/api/v1/sessions/" + session + "/summaries?type=review", null), 200)
-                .path("mindmap").path("nodes")).hasSize(1);
-        assertThat(ok(send("GET", "/api/v1/sessions/" + session + "/quiz", null), 200)).hasSize(1);
+                .path("mindmap").isNull()).isTrue();
+
+        assertThat(providerFailures.list).hasSize(1);
+        ILoggingEvent event = providerFailures.list.getFirst();
+        assertThat(event.getLevel()).isEqualTo(Level.WARN);
+        assertThat(event.getKeyValuePairs()).extracting(pair -> pair.key)
+                .containsExactly("event", "jobId", "operation", "artifact", "errorCode", "finishReason");
+        assertThat(event.getKeyValuePairs()).extracting(pair -> String.valueOf(pair.value))
+                .containsExactly("generation.provider.failed", mindmapJob.toString(),
+                        "review_mindmap_generate", "mindmap", "PROVIDER_OUTPUT_LIMIT", "MAX_TOKENS");
+        assertThat(event.getThrowableProxy()).isNull();
+        assertThat(event.getMDCPropertyMap()).isEmpty();
+        assertThat(event.getFormattedMessage() + event.getKeyValuePairs() + event.getMDCPropertyMap())
+                .doesNotContain(sourceSentinel, promptSentinel, credentialSentinel,
+                        generatedSentinel, citationSentinel, "Generation provider failed.");
+        System.out.println("GENERATION_OUTPUT_LIMIT_QA retry_statuses=202,202,409 same_job=true same_version=true "
+                + "attempts=1,2,3 duplicate_enqueue=terminal quiz=succeeded summary_http=200 mindmap_null=true "
+                + "warn_fields=6 forbidden_values_absent=true result=PASS");
     }
 
     @Test

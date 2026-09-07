@@ -28,8 +28,8 @@ import java.util.UUID;
 @Service
 public class JobQueue {
     private static final Set<String> RETRYABLE_ERRORS = Set.of(
-            "PROVIDER_TIMEOUT", "PROVIDER_RATE_LIMIT", "PROVIDER_UNAVAILABLE", "LEASE_EXPIRED",
-            "DATABASE_DEADLOCK");
+            "PROVIDER_TIMEOUT", "PROVIDER_RATE_LIMIT", "PROVIDER_UNAVAILABLE", "PROVIDER_OUTPUT_LIMIT",
+            "LEASE_EXPIRED", "DATABASE_DEADLOCK");
     private static final String PDF_PROVIDER = "pdfbox";
     private static final String PDF_MODEL = "pdfbox-3";
     private static final String NO_PROMPT = "none";

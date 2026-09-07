@@ -76,6 +76,11 @@ abstract class GenerationJobHandler implements JobHandler {
             result = usage.observeGeneration(job, properties.vertex().generationModel(),
                     input.text().codePoints().count(), () -> model.generate(request));
         } catch (GenerationModelPort.GenerationModelException exception) {
+            log.atWarn().addKeyValue("event", "generation.provider.failed")
+                    .addKeyValue("jobId", job.id()).addKeyValue("operation", job.type())
+                    .addKeyValue("artifact", artifact(job).metricValue()).addKeyValue("errorCode", exception.code())
+                    .addKeyValue("finishReason", exception.result() == null ? null : exception.result().finishReason())
+                    .log("generation provider failure handled");
             throw new JobExecutionException(exception.code(), "Generation provider failed.", exception.retryable());
         } catch (RuntimeException exception) {
             throw new JobExecutionException("PROVIDER_UNAVAILABLE", "Generation provider failed.", true);
