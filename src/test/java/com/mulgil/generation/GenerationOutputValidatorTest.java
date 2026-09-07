@@ -59,6 +59,27 @@ class GenerationOutputValidatorTest {
     }
 
     @Test
+    void rejectsMissingCitationSourceIds_asInvalidSourceReferences() throws Exception {
+        assertInvalidSourceReferences("""
+                {"summary":{"items":[{"text":"Ungrounded summary"}]}}
+                """);
+    }
+
+    @Test
+    void rejectsNonArrayCitationSourceIds_asInvalidSourceReferences() throws Exception {
+        assertInvalidSourceReferences("""
+                {"summary":{"items":[{"text":"Ungrounded summary","sourceIds":"s1"}]}}
+                """);
+    }
+
+    @Test
+    void rejectsEmptyCitationSourceIds_asInvalidSourceReferences() throws Exception {
+        assertInvalidSourceReferences("""
+                {"summary":{"items":[{"text":"Ungrounded summary","sourceIds":[]}]}}
+                """);
+    }
+
+    @Test
     void acceptsMindmapBoundsAndRehydratesEverySourceId_whenOutputIsAtLimits() throws Exception {
         JsonNode sourceReference = json.readTree("{\"sourceType\":\"pdf\"}");
         ObjectNode raw = mindmapAtLimits();
@@ -151,6 +172,14 @@ class GenerationOutputValidatorTest {
                     assertThat(exception.getMessage()).isEqualTo("Generated content was invalid.");
                     assertThat(exception.retryable()).isFalse();
                 });
+    }
+
+    private void assertInvalidSourceReferences(String raw) throws Exception {
+        assertThatThrownBy(() -> validator.parse(raw, compiler.compile(snapshot(
+                json.createObjectNode().put("sourceType", "pdf"))), GenerationModelPort.Artifact.SUMMARY))
+                .isInstanceOf(JobHandler.JobExecutionException.class)
+                .satisfies(failure -> assertThat(((JobHandler.JobExecutionException) failure).code())
+                        .isEqualTo("INVALID_SOURCE_REFERENCES"));
     }
 
     private ObjectNode mindmapAtLimits() {

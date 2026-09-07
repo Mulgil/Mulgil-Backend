@@ -117,7 +117,8 @@ final class GenerationOutputValidator {
         require(node.isObject());
         ObjectNode grounded = (ObjectNode) node;
         JsonNode sourceIds = grounded.path("sourceIds");
-        require(sourceIds.isArray() && !sourceIds.isEmpty() && sourceIds.size() <= maxSourceIds);
+        if (!sourceIds.isArray() || sourceIds.isEmpty()) throw new InvalidSourceReferenceException();
+        require(sourceIds.size() <= maxSourceIds);
         ArrayNode sourceRefs = grounded.putArray("sourceRefs");
         sourceIds.forEach(sourceId -> {
             require(sourceId.isTextual());

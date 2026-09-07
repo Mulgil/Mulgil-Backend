@@ -639,7 +639,7 @@ class GenerationWorkflowIT {
 
     @ParameterizedTest
     @ValueSource(strings = {"queued", "succeeded"})
-    void doesNotReusePriorContractGenerationJob_whenSchedulingSourceGroundedV2(String priorStatus) throws Exception {
+    void doesNotReusePriorContractGenerationJob_whenSchedulingSourceGroundedV3(String priorStatus) throws Exception {
         sources.addReviewNote("contract-version source", 0);
         runOne("chunk_embed");
         GenerationSnapshotService.Snapshot snapshot = snapshots.session(owner, course, session, "review");
@@ -659,12 +659,12 @@ class GenerationWorkflowIT {
                 .query(UUID.class).list();
         assertThat(scheduled).hasSize(2);
         assertThat(scheduled.get(1)).isNotEqualTo(prior.id());
-        JobQueue.AiJob exactV2 = jobs.enqueue(new JobQueue.EnqueueRequest("review_generate", owner, course,
+        JobQueue.AiJob exactV3 = jobs.enqueue(new JobQueue.EnqueueRequest("review_generate", owner, course,
                 session, null, null, null, null, null, 2, snapshot.snapshotHash(), "vertex",
-                "gemini-2.5-flash", "source-grounded-v2"));
-        assertThat(exactV2.id()).isEqualTo(scheduled.get(1));
+                "gemini-2.5-flash", GenerationScheduler.PROMPT_VERSION));
+        assertThat(exactV3.id()).isEqualTo(scheduled.get(1));
         System.out.println("GENERATION_PHASE2_QA prior_contract=v1 prior_status=" + priorStatus
-                + " current_contract=v2 observable=distinct_jobs result=PASS");
+                + " current_contract=v3 observable=distinct_jobs result=PASS");
     }
 
     @Test
